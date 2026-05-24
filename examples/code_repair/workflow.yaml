@@ -1,0 +1,20 @@
+workflow:
+  name: "自动代码修复（Demo）"
+  agents:
+    - name: planner
+      role: 架构师
+    - name: coder
+      role: 开发者
+    - name: tester
+      role: 测试员
+    - name: reviewer
+      role: 审查员
+  flow:
+    - agent: planner
+      input: "分析需求并制定修复计划"
+    - agent: coder
+      input: "根据计划编写代码补丁"
+    - agent: tester
+      input: "运行测试并输出结果"
+    - agent: reviewer
+      input: "审查代码质量"
