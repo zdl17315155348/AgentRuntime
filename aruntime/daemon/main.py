@@ -8,6 +8,44 @@ from pydantic import BaseModel
 
 from aruntime.core.models import AgentSpec, TaskSpec, TaskStatus
 
+import os
+from aruntime.llm.gateway import LLMGateway
+
+import json
+import os
+
+# 配置路径：优先使用环境变量指定的路径，默认从项目根目录的 configs/ 下加载
+CONFIG_PATH = os.getenv("RUNTIME_CONFIG", 
+    os.path.join(os.path.dirname(__file__), "..", "..", "configs", "runtime.json"))
+
+
+def load_config():
+    """加载 JSON 配置文件"""
+    config_path = CONFIG_PATH
+    if not os.path.exists(config_path):
+        # 如果配置文件不存在，使用默认配置（mock 模式）
+        return {
+            "llm": {
+                "backend": "mock",
+                "api_key": "",
+                "model": "deepseek-chat",
+                "temperature": 0.1,
+                "max_tokens": 2048
+            }
+        }
+    with open(config_path, "r") as f:
+        return json.load(f)
+
+
+# 加载配置
+config = load_config()
+llm_config = config.get("llm", {})
+
+# 初始化 LLM 网关
+LLM_BACKEND = os.getenv("LLM_BACKEND", llm_config.get("backend", "deepseek"))
+LLM_API_KEY = os.getenv("LLM_API_KEY", llm_config.get("api_key", ""))
+llm_gateway = LLMGateway(backend=LLM_BACKEND, api_key=LLM_API_KEY)
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("agentd")
 
@@ -55,14 +93,35 @@ async def submit_task(req: SubmitTaskRequest):
     tasks[task.task_id] = task
     logger.info(f"Task {task.task_id} → {req.agent_name}")
 
-    # 模拟执行：等待 1 秒
-    await asyncio.sleep(1)
+    # 调用 LLM 获取真实回复
+    agent = agents[req.agent_name]
+    system_prompt = agent.system_prompt or f"你是一个{agent.role}"
+    user_message = str(req.task_input)
 
-    task.status = TaskStatus.SUCCESS
-    task.result = {
-        "role": agents[req.agent_name].role,
-        "output": f"[模拟] {req.agent_name} 已完成，输入：{req.task_input}",
-    }
+    try:
+    	output = llm_gateway.chat(system_prompt, user_message)
+    	task.status = TaskStatus.SUCCESS
+    	task.result = {
+       		"role": agent.role,
+       		"output": output,
+    	}
+    except Exception as e:
+    	task.status = TaskStatus.FAILED
+    	task.error = str(e)
+    	logger.error(f"Task {task.task_id} LLM 调用失败: {e}")
+    	task.result = {
+        	"role": agent.role,
+        	"output": f"[错误] {str(e)}",
+    	}
+
+    # # 模拟执行：等待 1 秒
+    # await asyncio.sleep(1)
+
+    # task.status = TaskStatus.SUCCESS
+    # task.result = {
+    #     "role": agents[req.agent_name].role,
+    #     "output": f"[模拟] {req.agent_name} 已完成，输入：{req.task_input}",
+    # }
     task.completed_at = datetime.now()
     logger.info(f"Task {task.task_id} ✓")
 
