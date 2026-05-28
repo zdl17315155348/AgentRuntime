@@ -1,0 +1,21 @@
+#!/bin/bash
+# 运行单元测试（不依赖 agentd）
+# 用法：./scripts/test_unit.sh
+
+set -e
+
+cd "$(cd "$(dirname "$0")/.." && pwd)"
+
+echo "=========================================="
+echo "  单元测试（不依赖 agentd）"
+echo "=========================================="
+
+# 清理缓存
+rm -rf .pytest_cache
+find testing/ -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
+
+# 运行 core 目录下的测试
+python3 -m pytest testing/unittest/core/ -v
+
+echo ""
+echo "✅ 单元测试完成"
