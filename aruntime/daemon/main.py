@@ -10,6 +10,8 @@ from pydantic import BaseModel
 from aruntime.core.models import AgentSpec, TaskSpec, TaskStatus, AgentStatus
 from aruntime.core.lifecycle import transition_to, InvalidTransitionError
 from aruntime.scheduler.fifo import FIFOScheduler
+from aruntime.scheduler.dag import DAGScheduler
+from aruntime.scheduler.base import BaseScheduler
 import os
 from aruntime.llm.gateway import LLMGateway
 
@@ -41,19 +43,26 @@ def load_config():
 # 加载配置
 config = load_config()
 llm_config = config.get("llm", {})
+scheduler_config = config.get("scheduler", {})
 
 # 初始化 LLM 网关
 LLM_BACKEND = os.getenv("LLM_BACKEND", llm_config.get("backend", "deepseek"))
 LLM_API_KEY = os.getenv("LLM_API_KEY", llm_config.get("api_key", ""))
 llm_gateway = LLMGateway(backend=LLM_BACKEND, api_key=LLM_API_KEY)
 
-scheduler = FIFOScheduler()
+# 初始化调度器
+SCHEDULER_TYPE = os.getenv("SCHEDULER_TYPE", scheduler_config.get("type", "fifo"))
+if SCHEDULER_TYPE == "dag":
+    scheduler: BaseScheduler = DAGScheduler()
+else:
+    scheduler: BaseScheduler = FIFOScheduler()
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("agentd")
 
 agents: Dict[str, AgentSpec] = {}
 tasks: Dict[str, TaskSpec] = {}
+agent_inflight_tasks: Dict[str, int] = {}
 
 app = FastAPI(title="Agent Runtime Daemon", version="0.1.0")
 
@@ -67,6 +76,15 @@ class CreateAgentRequest(BaseModel):
 class SubmitTaskRequest(BaseModel):
     agent_name: str
     task_input: dict
+    context_id: str = ""
+    priority: int = 0
+    dependencies: list[str] = []
+
+
+class SubmitDynamicTaskRequest(BaseModel):
+    agent_name: str
+    task_input: dict
+    parent_task_id: str = ""
     context_id: str = ""
     priority: int = 0
 
@@ -106,23 +124,78 @@ async def submit_task(req: SubmitTaskRequest):
         raise HTTPException(status_code=404, detail=f"Agent '{req.agent_name}' 不存在")
 
     agent = agents[req.agent_name]
+    if agent_inflight_tasks.get(req.agent_name, 0) > 0:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Agent '{req.agent_name}' 当前已有未完成任务，无法接受新任务",
+        )
     if agent.status not in (AgentStatus.READY, AgentStatus.COMPLETED, AgentStatus.FAILED):
         raise HTTPException(
             status_code=409,
             detail=f"Agent '{req.agent_name}' 当前状态为 {agent.status}，无法接受新任务"
         )
+    if agent.status in (AgentStatus.COMPLETED, AgentStatus.FAILED):
+        transition_to(agent, AgentStatus.READY)
+
+    # 验证依赖任务是否存在
+    for dep_id in req.dependencies:
+        if dep_id not in tasks:
+            raise HTTPException(status_code=404, detail=f"依赖任务 '{dep_id}' 不存在")
 
     task = TaskSpec(
         agent_name=req.agent_name,
         task_input=req.task_input,
         context_id=req.context_id,
         priority=req.priority,
+        dependencies=req.dependencies,
     )
     tasks[task.task_id] = task
     scheduler.enqueue(task)
-    logger.info(f"任务 {task.task_id} 已入队（等待前面 {scheduler.pending_count - 1} 个任务）")
+    agent_inflight_tasks[req.agent_name] = agent_inflight_tasks.get(req.agent_name, 0) + 1
+    logger.info(f"任务 {task.task_id} 已入队（依赖: {req.dependencies}，等待前面 {scheduler.pending_count - 1} 个任务）")
 
     return {"task_id": task.task_id, "status": task.status, "message": "任务已加入调度队列"}
+
+
+@app.post("/tasks/dynamic")
+async def submit_dynamic_task(req: SubmitDynamicTaskRequest):
+    """
+    动态提交任务（由运行中的任务生成）
+    """
+    if req.agent_name not in agents:
+        raise HTTPException(status_code=404, detail=f"Agent '{req.agent_name}' 不存在")
+
+    if agent_inflight_tasks.get(req.agent_name, 0) > 0:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Agent '{req.agent_name}' 当前已有未完成任务，无法接受新任务",
+        )
+    agent = agents[req.agent_name]
+    if agent.status in (AgentStatus.COMPLETED, AgentStatus.FAILED):
+        transition_to(agent, AgentStatus.READY)
+    
+    # 验证父任务是否存在
+    if req.parent_task_id and req.parent_task_id not in tasks:
+        raise HTTPException(status_code=404, detail=f"父任务 '{req.parent_task_id}' 不存在")
+
+    task = TaskSpec(
+        agent_name=req.agent_name,
+        task_input=req.task_input,
+        context_id=req.context_id,
+        priority=req.priority,
+        dependencies=[req.parent_task_id] if req.parent_task_id else [],
+    )
+    tasks[task.task_id] = task
+    
+    # 如果是 DAG 调度器，使用 add_dynamic_task
+    if hasattr(scheduler, 'add_dynamic_task'):
+        scheduler.add_dynamic_task(task, req.parent_task_id)
+    else:
+        scheduler.enqueue(task)
+    agent_inflight_tasks[req.agent_name] = agent_inflight_tasks.get(req.agent_name, 0) + 1
+    
+    logger.info(f"动态任务 {task.task_id} 已入队（父任务: {req.parent_task_id}）")
+    return {"task_id": task.task_id, "status": task.status, "message": "动态任务已加入调度队列"}
 
 @app.get("/tasks/{task_id}")
 async def get_task(task_id: str):
@@ -145,8 +218,11 @@ async def scheduling_loop():
             agent = agents.get(task.agent_name)
             if agent is None:
                 task.status = TaskStatus.CANCELLED
+                agent_inflight_tasks[task.agent_name] = max(agent_inflight_tasks.get(task.agent_name, 0) - 1, 0)
                 continue
 
+            if agent.status in (AgentStatus.COMPLETED, AgentStatus.FAILED):
+                transition_to(agent, AgentStatus.READY)
             transition_to(agent, AgentStatus.RUNNING)
             agent.current_task_id = task.task_id
             logger.info(f"调度：任务 {task.task_id} → Agent '{task.agent_name}'")
@@ -155,15 +231,27 @@ async def scheduling_loop():
             user_message = str(task.task_input)
 
             try:
+                if llm_gateway.backend == "mock" and isinstance(task.task_input, dict):
+                    test_cfg = task.task_input.get("__test", {})
+                    if isinstance(test_cfg, dict):
+                        sleep_ms = test_cfg.get("sleep_ms")
+                        if isinstance(sleep_ms, (int, float)) and sleep_ms > 0:
+                            await asyncio.sleep(float(sleep_ms) / 1000.0)
+                        if test_cfg.get("force_error") is True:
+                            raise RuntimeError("forced error")
                 output = llm_gateway.chat(system_prompt, user_message)
                 task.status = TaskStatus.SUCCESS
                 task.result = {"role": agent.role, "output": output}
                 transition_to(agent, AgentStatus.COMPLETED)
+                scheduler.complete_task(task.task_id)
+                agent_inflight_tasks[task.agent_name] = max(agent_inflight_tasks.get(task.agent_name, 0) - 1, 0)
                 logger.info(f"任务 {task.task_id} ✓")
             except Exception as e:
                 task.status = TaskStatus.FAILED
                 task.error = str(e)
                 transition_to(agent, AgentStatus.FAILED)
+                scheduler.fail_task(task.task_id)
+                agent_inflight_tasks[task.agent_name] = max(agent_inflight_tasks.get(task.agent_name, 0) - 1, 0)
                 logger.error(f"任务 {task.task_id} ✗: {e}")
                 task.result = {"role": agent.role, "output": f"[错误] {str(e)}"}
 

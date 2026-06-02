@@ -4,6 +4,21 @@
 
 import pytest
 import httpx
+import time
+
+
+def wait_task_done(client, task_id: str, timeout_s: float = 10.0) -> dict:
+    start = time.time()
+    while time.time() - start < timeout_s:
+        resp = client.get(f"/tasks/{task_id}")
+        if resp.status_code != 200:
+            time.sleep(0.2)
+            continue
+        data = resp.json()
+        if data["status"] in ("SUCCESS", "FAILED"):
+            return data
+        time.sleep(0.2)
+    raise AssertionError(f"任务未在 {timeout_s}s 内完成: {task_id}")
 
 class TestAgentLifecycleAPI:
     """测试 Agent 在 agentd 中的完整生命周期"""
@@ -45,13 +60,7 @@ class TestAgentLifecycleAPI:
         })
         assert resp.status_code == 200
         task_id = resp.json()["task_id"]
-        # 轮询等待任务完成
-        import time
-        for _ in range(10):
-            time.sleep(1)
-            resp = client.get(f"/tasks/{task_id}")
-            if resp.json()["status"] in ("SUCCESS", "FAILED"):
-                break
+        wait_task_done(client, task_id, timeout_s=10.0)
         # 检查 Agent 状态
         resp = client.get("/agents")
         agents = resp.json()["agents"]
@@ -63,16 +72,26 @@ class TestAgentLifecycleAPI:
 
     def test_submit_task_to_busy_agent(self, client):
         """Agent 正在执行时提交新任务应该返回 409"""
-        # 先创建自己的 Agent
         client.post("/agents", json={
             "agent_name": "lifecycle_test_busy",
             "role": "测试员",
         })
-        # 提交一个任务
+
         resp = client.post("/tasks", json={
+            "agent_name": "lifecycle_test_busy",
+            "task_input": {"request": "第一个任务", "__test": {"sleep_ms": 2000}},
+        })
+        assert resp.status_code == 200
+        task_id = resp.json()["task_id"]
+
+        resp2 = client.post("/tasks", json={
             "agent_name": "lifecycle_test_busy",
             "task_input": {"request": "第二个任务"},
         })
+        assert resp2.status_code == 409
+
+        data = wait_task_done(client, task_id, timeout_s=10.0)
+        assert data["status"] == "SUCCESS"
 
     def test_submit_task_to_nonexistent_agent(self, client):
         """提交给不存在的 Agent 返回 404"""
@@ -80,6 +99,10 @@ class TestAgentLifecycleAPI:
             "agent_name": "nonexistent_agent",
             "task_input": {},
         })
+        assert resp.status_code == 404
+
+    def test_get_task_not_found(self, client):
+        resp = client.get("/tasks/not_exist_task_id")
         assert resp.status_code == 404
 
     def test_metrics_show_correct_counts(self, client):
@@ -91,6 +114,43 @@ class TestAgentLifecycleAPI:
         assert data["agents"]["total"] >= 1
         assert "COMPLETED" in data["agents"]["by_status"]
         assert data["tasks"]["success"] >= 1
+
+    def test_failed_task_sets_agent_failed_and_can_retry(self, client):
+        agent_name = "lifecycle_test_fail"
+        client.post("/agents", json={
+            "agent_name": agent_name,
+            "role": "测试员",
+        })
+
+        before = client.get("/metrics").json()
+        before_failed = before["tasks"]["failed"]
+
+        resp = client.post("/tasks", json={
+            "agent_name": agent_name,
+            "task_input": {"request": "强制失败", "__test": {"force_error": True}},
+        })
+        assert resp.status_code == 200
+        task_id = resp.json()["task_id"]
+
+        data = wait_task_done(client, task_id, timeout_s=10.0)
+        assert data["status"] == "FAILED"
+        assert data["error"]
+
+        agents = client.get("/agents").json()["agents"]
+        a = [x for x in agents if x["name"] == agent_name][0]
+        assert a["status"] == "FAILED"
+
+        after = client.get("/metrics").json()
+        assert after["tasks"]["failed"] == before_failed + 1
+
+        resp2 = client.post("/tasks", json={
+            "agent_name": agent_name,
+            "task_input": {"request": "重试任务"},
+        })
+        assert resp2.status_code == 200
+        task_id2 = resp2.json()["task_id"]
+        data2 = wait_task_done(client, task_id2, timeout_s=10.0)
+        assert data2["status"] == "SUCCESS"
 
 
 class TestAgentDuplicateAndKill:

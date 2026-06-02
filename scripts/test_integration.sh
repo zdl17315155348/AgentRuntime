@@ -6,6 +6,17 @@ set -e
 
 cd "$(cd "$(dirname "$0")/.." && pwd)"
 
+cleanup() {
+  if [[ -n "${AGENTD_PID:-}" ]]; then
+    echo ""
+    echo "  停止 agentd..."
+    kill "$AGENTD_PID" 2>/dev/null || true
+    wait "$AGENTD_PID" 2>/dev/null || true
+  fi
+}
+
+trap cleanup EXIT INT TERM
+
 echo "=========================================="
 echo "  集成测试（需要启动 agentd）"
 echo "=========================================="
@@ -24,19 +35,17 @@ sleep 1
 
 # ───── 启动新的 agentd ─────
 echo "  启动 agentd..."
-python3 -m aruntime.daemon.main &
+if [[ "${USE_REAL_LLM:-0}" == "1" ]]; then
+  python3 -m aruntime.daemon.main &
+else
+  LLM_BACKEND=mock LLM_API_KEY="" python3 -m aruntime.daemon.main &
+fi
 AGENTD_PID=$!
 sleep 2
 
 # ───── 运行测试 ─────
 echo ""
 python3 -m pytest testing/unittest/daemon/ -v
-
-# ───── 杀掉 agentd ─────
-echo ""
-echo "  停止 agentd..."
-kill $AGENTD_PID 2>/dev/null || true
-wait $AGENTD_PID 2>/dev/null || true
 
 echo ""
 echo "✅ 集成测试完成"

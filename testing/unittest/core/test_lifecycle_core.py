@@ -78,11 +78,11 @@ class TestLifecycleInvalidTransitions:
         with pytest.raises(InvalidTransitionError):
             transition_to(agent, AgentStatus.COMPLETED)
 
-    def test_completed_to_ready_not_allowed(self):
-        """COMPLETED → READY 非法（终态不可回退）"""
+    def test_completed_to_running_not_allowed(self):
+        """COMPLETED → RUNNING 非法（必须先回到 READY）"""
         agent = _make_agent(AgentStatus.COMPLETED)
         with pytest.raises(InvalidTransitionError):
-            transition_to(agent, AgentStatus.READY)
+            transition_to(agent, AgentStatus.RUNNING)
 
     def test_killed_to_ready_not_allowed(self):
         """KILLED → READY 非法（终态不可回退）"""
@@ -111,11 +111,10 @@ class TestLifecycleCanTransition:
         assert can_transition_to(agent, AgentStatus.RUNNING) is False
         assert can_transition_to(agent, AgentStatus.COMPLETED) is False
 
-    def test_completed_cannot_transition(self):
-        """终态 COMPLETED 不能转换到任何状态"""
+    def test_completed_can_transition_to_ready_and_killed(self):
         agent = _make_agent(AgentStatus.COMPLETED)
-        for status in AgentStatus:
-            assert can_transition_to(agent, status) is False
+        assert can_transition_to(agent, AgentStatus.READY) is True
+        assert can_transition_to(agent, AgentStatus.KILLED) is True
 
     def test_killed_cannot_transition(self):
         """终态 KILLED 不能转换到任何状态"""

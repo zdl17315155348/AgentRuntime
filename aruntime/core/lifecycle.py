@@ -13,7 +13,7 @@ ALLOWED_TRANSITIONS = {
     AgentStatus.RUNNING:   {AgentStatus.COMPLETED, AgentStatus.FAILED, AgentStatus.WAITING, AgentStatus.KILLED},
     AgentStatus.WAITING:   {AgentStatus.READY, AgentStatus.KILLED},
     AgentStatus.FAILED:    {AgentStatus.READY, AgentStatus.KILLED},   # 失败后可重试回到 READY
-    AgentStatus.COMPLETED: set(),        # 终态，不可转换
+    AgentStatus.COMPLETED: {AgentStatus.READY, AgentStatus.KILLED},
     AgentStatus.KILLED:    set(),        # 终态，不可转换
 }
 
