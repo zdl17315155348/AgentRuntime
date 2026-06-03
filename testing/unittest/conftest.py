@@ -14,6 +14,14 @@ def agentd_server():
     env = os.environ.copy()
     env["LLM_BACKEND"] = "mock"
     env["LLM_API_KEY"] = ""
+    env["SCHEDULER_TYPE"] = "dag"
+
+    subprocess.run(
+        ["fuser", "-k", "8234/tcp"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
 
     proc = subprocess.Popen(
         [sys.executable, "-m", "aruntime.daemon.main"],

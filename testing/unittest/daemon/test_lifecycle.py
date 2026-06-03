@@ -152,6 +152,84 @@ class TestAgentLifecycleAPI:
         data2 = wait_task_done(client, task_id2, timeout_s=10.0)
         assert data2["status"] == "SUCCESS"
 
+    def test_dag_dependency_blocks_execution(self, client):
+        suffix = str(int(time.time() * 1000))
+        agent_a = f"dag_dep_a_{suffix}"
+        agent_b = f"dag_dep_b_{suffix}"
+        client.post("/agents", json={"agent_name": agent_a, "role": "测试员"})
+        client.post("/agents", json={"agent_name": agent_b, "role": "测试员"})
+
+        resp_a = client.post("/tasks", json={
+            "agent_name": agent_a,
+            "task_input": {"request": "任务A", "__test": {"sleep_ms": 1200}},
+        })
+        assert resp_a.status_code == 200
+        task_a = resp_a.json()["task_id"]
+
+        resp_b = client.post("/tasks", json={
+            "agent_name": agent_b,
+            "task_input": {"request": "任务B", "__test": {"sleep_ms": 800}},
+            "dependencies": [task_a],
+        })
+        assert resp_b.status_code == 200
+        task_b = resp_b.json()["task_id"]
+
+        deadline = time.time() + 10.0
+        task_a_status = None
+        while time.time() < deadline:
+            ra = client.get(f"/tasks/{task_a}")
+            rb = client.get(f"/tasks/{task_b}")
+            assert ra.status_code == 200
+            assert rb.status_code == 200
+            task_a_status = ra.json()["status"]
+            task_b_status = rb.json()["status"]
+
+            if task_a_status in ("SUCCESS", "FAILED"):
+                break
+            assert task_b_status not in ("RUNNING", "SUCCESS")
+            time.sleep(0.1)
+
+        assert task_a_status == "SUCCESS"
+        data_b = wait_task_done(client, task_b, timeout_s=10.0)
+        assert data_b["status"] == "SUCCESS"
+
+    def test_dag_dependency_failure_cascades(self, client):
+        suffix = str(int(time.time() * 1000))
+        agent_a = f"dag_fail_a_{suffix}"
+        agent_b = f"dag_fail_b_{suffix}"
+        client.post("/agents", json={"agent_name": agent_a, "role": "测试员"})
+        client.post("/agents", json={"agent_name": agent_b, "role": "测试员"})
+
+        resp_a = client.post("/tasks", json={
+            "agent_name": agent_a,
+            "task_input": {"request": "任务A失败", "__test": {"sleep_ms": 800, "force_error": True}},
+        })
+        assert resp_a.status_code == 200
+        task_a = resp_a.json()["task_id"]
+
+        resp_b = client.post("/tasks", json={
+            "agent_name": agent_b,
+            "task_input": {"request": "任务B依赖A", "__test": {"sleep_ms": 800}},
+            "dependencies": [task_a],
+        })
+        assert resp_b.status_code == 200
+        task_b = resp_b.json()["task_id"]
+
+        data_a = wait_task_done(client, task_a, timeout_s=10.0)
+        assert data_a["status"] == "FAILED"
+
+        deadline = time.time() + 10.0
+        while time.time() < deadline:
+            rb = client.get(f"/tasks/{task_b}")
+            assert rb.status_code == 200
+            task_b_status = rb.json()["status"]
+            assert task_b_status != "RUNNING"
+            if task_b_status == "FAILED":
+                return
+            time.sleep(0.1)
+
+        raise AssertionError("依赖任务失败后，未观察到下游任务进入 FAILED")
+
 
 class TestAgentDuplicateAndKill:
     """测试重复创建和终止相关场景"""

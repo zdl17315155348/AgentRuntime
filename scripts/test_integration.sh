@@ -36,9 +36,9 @@ sleep 1
 # ───── 启动新的 agentd ─────
 echo "  启动 agentd..."
 if [[ "${USE_REAL_LLM:-0}" == "1" ]]; then
-  python3 -m aruntime.daemon.main &
+  SCHEDULER_TYPE=dag python3 -m aruntime.daemon.main &
 else
-  LLM_BACKEND=mock LLM_API_KEY="" python3 -m aruntime.daemon.main &
+  LLM_BACKEND=mock LLM_API_KEY="" SCHEDULER_TYPE=dag python3 -m aruntime.daemon.main &
 fi
 AGENTD_PID=$!
 sleep 2
