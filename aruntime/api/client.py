@@ -1,6 +1,6 @@
 """Agent Runtime 客户端 SDK"""
 import httpx
-from typing import Optional, Dict, Any
+from typing import Optional
 
 
 class AgentRuntimeClient:
@@ -34,14 +34,52 @@ class AgentRuntimeClient:
         agent_name: str,
         task_input: dict,
         context_id: str = "",
+        priority: int = 0,
+        dependencies: Optional[list[str]] = None,
     ) -> dict:
+        payload: dict = {
+            "agent_name": agent_name,
+            "task_input": task_input,
+            "context_id": context_id,
+            "priority": priority,
+        }
+        if dependencies is not None:
+            payload["dependencies"] = dependencies
         resp = self.client.post(
             f"{self.base_url}/tasks",
+            json=payload,
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    def get_task(self, task_id: str) -> dict:
+        resp = self.client.get(f"{self.base_url}/tasks/{task_id}")
+        resp.raise_for_status()
+        return resp.json()
+
+    def send_message(
+        self,
+        from_agent: str,
+        to_agent: str,
+        payload: dict,
+        topic: str = "",
+    ) -> dict:
+        resp = self.client.post(
+            f"{self.base_url}/messages",
             json={
-                "agent_name": agent_name,
-                "task_input": task_input,
-                "context_id": context_id,
+                "from_agent": from_agent,
+                "to_agent": to_agent,
+                "payload": payload,
+                "topic": topic,
             },
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    def recv_messages(self, agent_name: str, limit: int = 50) -> dict:
+        resp = self.client.get(
+            f"{self.base_url}/messages/{agent_name}",
+            params={"limit": limit},
         )
         resp.raise_for_status()
         return resp.json()

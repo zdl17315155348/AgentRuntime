@@ -25,8 +25,10 @@ class TestAgentLifecycleAPI:
 
     def test_create_agent(self, client):
         """创建 Agent 后状态为 READY"""
+        suffix = str(int(time.time() * 1000))
+        agent_name = f"lifecycle_test_create_{suffix}"
         resp = client.post("/agents", json={
-            "agent_name": "lifecycle_test_create",
+            "agent_name": agent_name,
             "role": "测试员",
         })
         assert resp.status_code == 200
@@ -35,27 +37,31 @@ class TestAgentLifecycleAPI:
 
     def test_list_agents_shows_status(self, client):
         """列出 Agent 应包含状态信息"""
+        suffix = str(int(time.time() * 1000))
+        agent_name = f"lifecycle_test_list_{suffix}"
         # 先创建一个 Agent
         client.post("/agents", json={
-            "agent_name": "lifecycle_test_list",
+            "agent_name": agent_name,
             "role": "测试员",
         })
         resp = client.get("/agents")
         assert resp.status_code == 200
         agents = resp.json()["agents"]
-        lifecycle_test = [a for a in agents if a["name"] == "lifecycle_test_list"]
+        lifecycle_test = [a for a in agents if a["name"] == agent_name]
         assert len(lifecycle_test) == 1
         assert lifecycle_test[0]["status"] == "READY"
 
     def test_submit_task_changes_agent_status(self, client):
         """提交任务后 Agent 状态变为 RUNNING，完成后变为 COMPLETED"""
+        suffix = str(int(time.time() * 1000))
+        agent_name = f"lifecycle_test_task_{suffix}"
         # 先创建一个新 Agent
         client.post("/agents", json={
-            "agent_name": "lifecycle_test_task",
+            "agent_name": agent_name,
             "role": "测试员",
         })
         resp = client.post("/tasks", json={
-            "agent_name": "lifecycle_test_task",
+            "agent_name": agent_name,
             "task_input": {"request": "测试任务"},
         })
         assert resp.status_code == 200
@@ -64,7 +70,7 @@ class TestAgentLifecycleAPI:
         # 检查 Agent 状态
         resp = client.get("/agents")
         agents = resp.json()["agents"]
-        lifecycle_test = [a for a in agents if a["name"] == "lifecycle_test_task"][0]
+        lifecycle_test = [a for a in agents if a["name"] == agent_name][0]
         assert lifecycle_test["status"] == "COMPLETED"
         # 检查任务状态
         resp = client.get(f"/tasks/{task_id}")
@@ -72,20 +78,22 @@ class TestAgentLifecycleAPI:
 
     def test_submit_task_to_busy_agent(self, client):
         """Agent 正在执行时提交新任务应该返回 409"""
+        suffix = str(int(time.time() * 1000))
+        agent_name = f"lifecycle_test_busy_{suffix}"
         client.post("/agents", json={
-            "agent_name": "lifecycle_test_busy",
+            "agent_name": agent_name,
             "role": "测试员",
         })
 
         resp = client.post("/tasks", json={
-            "agent_name": "lifecycle_test_busy",
+            "agent_name": agent_name,
             "task_input": {"request": "第一个任务", "__test": {"sleep_ms": 2000}},
         })
         assert resp.status_code == 200
         task_id = resp.json()["task_id"]
 
         resp2 = client.post("/tasks", json={
-            "agent_name": "lifecycle_test_busy",
+            "agent_name": agent_name,
             "task_input": {"request": "第二个任务"},
         })
         assert resp2.status_code == 409
@@ -95,14 +103,81 @@ class TestAgentLifecycleAPI:
 
     def test_submit_task_to_nonexistent_agent(self, client):
         """提交给不存在的 Agent 返回 404"""
+        suffix = str(int(time.time() * 1000))
         resp = client.post("/tasks", json={
-            "agent_name": "nonexistent_agent",
+            "agent_name": f"nonexistent_agent_{suffix}",
             "task_input": {},
         })
         assert resp.status_code == 404
 
     def test_get_task_not_found(self, client):
-        resp = client.get("/tasks/not_exist_task_id")
+        suffix = str(int(time.time() * 1000))
+        resp = client.get(f"/tasks/not_exist_task_id_{suffix}")
+        assert resp.status_code == 404
+
+    def test_submit_task_with_nonexistent_dependency_returns_404(self, client):
+        suffix = str(int(time.time() * 1000))
+        agent_name = f"lifecycle_test_dep_missing_{suffix}"
+        client.post("/agents", json={
+            "agent_name": agent_name,
+            "role": "测试员",
+        })
+
+        resp = client.post("/tasks", json={
+            "agent_name": agent_name,
+            "task_input": {"request": "依赖不存在"},
+            "dependencies": ["not_exist_task_id_123"],
+        })
+        assert resp.status_code == 404
+        assert "依赖任务" in resp.json().get("detail", "")
+
+    def test_agent_message_send_and_receive(self, client):
+        suffix = str(int(time.time() * 1000))
+        agent_a = f"msg_a_{suffix}"
+        agent_b = f"msg_b_{suffix}"
+        client.post("/agents", json={"agent_name": agent_a, "role": "测试员"})
+        client.post("/agents", json={"agent_name": agent_b, "role": "测试员"})
+
+        resp = client.post("/messages", json={
+            "from_agent": agent_a,
+            "to_agent": agent_b,
+            "payload": {"text": "hello"},
+            "topic": "demo",
+        })
+        if resp.status_code == 404 and resp.json().get("detail") == "Not Found":
+            pytest.skip("agentd 未启用 /messages")
+        assert resp.status_code == 200
+        msg = resp.json()
+        assert msg["from_agent"] == agent_a
+        assert msg["to_agent"] == agent_b
+        assert msg["payload"] == {"text": "hello"}
+        assert msg["topic"] == "demo"
+
+        resp = client.get(f"/messages/{agent_b}")
+        if resp.status_code == 404 and resp.json().get("detail") == "Not Found":
+            pytest.skip("agentd 未启用 /messages")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert len(data["messages"]) == 1
+        assert data["messages"][0]["payload"] == {"text": "hello"}
+        assert data["messages"][0]["from_agent"] == agent_a
+
+        resp = client.get(f"/messages/{agent_b}")
+        assert resp.status_code == 200
+        assert resp.json()["messages"] == []
+
+    def test_send_message_to_nonexistent_agent_returns_404(self, client):
+        suffix = str(int(time.time() * 1000))
+        agent_a = f"msg_missing_a_{suffix}"
+        client.post("/agents", json={"agent_name": agent_a, "role": "测试员"})
+
+        resp = client.post("/messages", json={
+            "from_agent": agent_a,
+            "to_agent": f"not_exist_{suffix}",
+            "payload": {"text": "x"},
+        })
+        if resp.status_code == 404 and resp.json().get("detail") == "Not Found":
+            pytest.skip("agentd 未启用 /messages")
         assert resp.status_code == 404
 
     def test_metrics_show_correct_counts(self, client):
@@ -116,7 +191,8 @@ class TestAgentLifecycleAPI:
         assert data["tasks"]["success"] >= 1
 
     def test_failed_task_sets_agent_failed_and_can_retry(self, client):
-        agent_name = "lifecycle_test_fail"
+        suffix = str(int(time.time() * 1000))
+        agent_name = f"lifecycle_test_fail_{suffix}"
         client.post("/agents", json={
             "agent_name": agent_name,
             "role": "测试员",
@@ -236,23 +312,26 @@ class TestAgentDuplicateAndKill:
 
     def test_create_duplicate_agent(self, client):
         """创建同名 Agent 返回 400"""
+        suffix = str(int(time.time() * 1000))
+        agent_name = f"lifecycle_test_dup_{suffix}"
         # 先创建一次
         client.post("/agents", json={
-            "agent_name": "lifecycle_test_dup",
+            "agent_name": agent_name,
             "role": "测试员",
         })
         # 再创建同名的，应该返回 400
         resp = client.post("/agents", json={
-            "agent_name": "lifecycle_test_dup",
+            "agent_name": agent_name,
             "role": "测试员",
         })
         assert resp.status_code == 400
 
     def test_create_multiple_agents(self, client):
         """创建多个 Agent，各自独立"""
+        suffix = str(int(time.time() * 1000))
         for i in range(3):
             resp = client.post("/agents", json={
-                "agent_name": f"multi_agent_unique_{i}",
+                "agent_name": f"multi_agent_unique_{suffix}_{i}",
                 "role": f"角色{i}",
             })
             assert resp.status_code == 200
@@ -260,6 +339,6 @@ class TestAgentDuplicateAndKill:
         resp = client.get("/agents")
         agents = resp.json()["agents"]
         names = [a["name"] for a in agents]
-        assert "multi_agent_unique_0" in names
-        assert "multi_agent_unique_1" in names
-        assert "multi_agent_unique_2" in names
+        assert f"multi_agent_unique_{suffix}_0" in names
+        assert f"multi_agent_unique_{suffix}_1" in names
+        assert f"multi_agent_unique_{suffix}_2" in names

@@ -14,6 +14,8 @@ from aruntime.scheduler.dag import DAGScheduler
 from aruntime.scheduler.base import BaseScheduler
 import os
 from aruntime.llm.gateway import LLMGateway
+from aruntime.comm.message import Message
+from aruntime.comm.router import MessageRouter
 
 import json
 
@@ -63,6 +65,7 @@ logger = logging.getLogger("agentd")
 agents: Dict[str, AgentSpec] = {}
 tasks: Dict[str, TaskSpec] = {}
 agent_inflight_tasks: Dict[str, int] = {}
+message_router = MessageRouter()
 
 app = FastAPI(title="Agent Runtime Daemon", version="0.1.0")
 
@@ -87,6 +90,13 @@ class SubmitDynamicTaskRequest(BaseModel):
     parent_task_id: str = ""
     context_id: str = ""
     priority: int = 0
+
+
+class SendMessageRequest(BaseModel):
+    from_agent: str
+    to_agent: str
+    payload: dict
+    topic: str = ""
 
 @app.post("/agents")
 async def create_agent(req: CreateAgentRequest):
@@ -203,6 +213,36 @@ async def get_task(task_id: str):
         raise HTTPException(status_code=404, detail="Task not found")
     t = tasks[task_id]
     return {"task_id": t.task_id, "status": t.status, "result": t.result, "error": t.error}
+
+
+@app.post("/messages")
+async def send_message(req: SendMessageRequest):
+    if req.from_agent not in agents:
+        raise HTTPException(status_code=404, detail=f"Agent '{req.from_agent}' 不存在")
+    if req.to_agent not in agents:
+        raise HTTPException(status_code=404, detail=f"Agent '{req.to_agent}' 不存在")
+
+    msg = Message(
+        from_agent=req.from_agent,
+        to_agent=req.to_agent,
+        payload=req.payload,
+        topic=req.topic or None,
+    )
+    message_router.send(msg)
+    return msg.model_dump()
+
+
+@app.get("/messages/{agent_name}")
+async def receive_messages(agent_name: str, limit: int = 50):
+    if agent_name not in agents:
+        raise HTTPException(status_code=404, detail=f"Agent '{agent_name}' 不存在")
+    if limit < 1:
+        limit = 1
+    if limit > 200:
+        limit = 200
+
+    messages = message_router.receive(agent_name, limit=limit)
+    return {"messages": [m.model_dump() for m in messages]}
 
 # ───── 调度循环（后台任务） ─────
 

@@ -10,11 +10,18 @@ workflow:
     - name: reviewer
       role: 审查员
   flow:
-    - agent: planner
+    - id: plan
+      agent: planner
       input: "分析需求并制定修复计划"
-    - agent: coder
+    - id: code
+      agent: coder
+      dependencies: ["plan"]
       input: "根据计划编写代码补丁"
-    - agent: tester
+    - id: test
+      agent: tester
+      dependencies: ["code"]
       input: "运行测试并输出结果"
-    - agent: reviewer
+    - id: review
+      agent: reviewer
+      dependencies: ["test"]
       input: "审查代码质量"

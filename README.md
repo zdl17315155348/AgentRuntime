@@ -101,9 +101,13 @@ curl -s http://127.0.0.1:8234/tasks/<task_id>
 成功判定：`status` 为 `SUCCESS`，并且 `result.output` 为真实模型输出（例如 `OK`）。
 
 ## 当前进度
-agentd接入真实LLM：模型deepseek-v4，能够调用多agent进行对话。
+agentd 接入 LLM：支持 mock / deepseek，可由 configs/runtime.json 或环境变量切换。
 
-agent生命周期管理：
+调度器：支持 fifo / dag。dag 支持任务依赖、动态任务、失败级联。
+
+Agent 生命周期管理：支持注册、提交任务、查询任务状态。
+
+Agent 间通信：agentd 中转的消息邮箱模型（POST /messages，GET /messages/{agent_name} 拉取并消费）。
 
 ## 测试
 ### 单元测试(testing/unittest/)
@@ -112,10 +116,16 @@ core/test_lifecycle_core.py:测试Agent生命周期状态。
 
 验证状态转换的合法性（如CREATED->READY->RUNNING->COMPLETED）以及非法转换能否正确拦截
 
+scheduler/test_dag.py:DAG 调度器单元测试（依赖、动态任务、失败级联、拓扑排序）。
+
+api/test_client.py:SDK（AgentRuntimeClient）单元测试。
+
+comm/test_router.py:消息路由器（mailbox）单元测试。
+
 
 daemon/test_lifecycle.py:测试通过agentd API操作时Agent生命周期是否按预期流转。
 
-验证创建Agent、提交任务后状态变化、重复注册、不存在的Agent等场景。
+覆盖创建 Agent、提交任务、依赖任务校验、DAG 依赖阻塞与失败级联、消息收发等场景。
 
 
 daemon/test_api.py:测试agentd各API端点的正确性。

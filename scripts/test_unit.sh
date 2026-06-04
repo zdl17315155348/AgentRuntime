@@ -15,7 +15,7 @@ rm -rf .pytest_cache
 find testing/ -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
 
 # 运行 core 目录下的测试
-python3 -m pytest testing/unittest/core/ testing/unittest/scheduler/ -v
+python3 -m pytest testing/unittest/core/ testing/unittest/scheduler/ testing/unittest/api/ testing/unittest/comm/ -v
 
 echo ""
 echo "✅ 单元测试完成"
