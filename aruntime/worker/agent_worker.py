@@ -62,14 +62,29 @@ async def _run() -> None:
                 status = "FAILED"
                 error = str(e)
 
-            writer.write(_encode_line({
+            result_msg = {
                 "type": "task_result",
                 "task_id": task_id,
                 "status": status,
                 "output": output,
                 "error": error,
-            }))
-            await writer.drain()
+            }
+
+            for _ in range(3):
+                writer.write(_encode_line(result_msg))
+                await writer.drain()
+                try:
+                    ack = await asyncio.wait_for(reader.readline(), timeout=2.0)
+                except Exception:
+                    continue
+                if not ack:
+                    continue
+                try:
+                    ack_data = _decode_line(ack)
+                except Exception:
+                    continue
+                if ack_data.get("type") == "ack" and ack_data.get("task_id") == task_id:
+                    break
     finally:
         writer.close()
         await writer.wait_closed()
@@ -84,4 +99,3 @@ if __name__ == "__main__":
         main()
     except Exception:
         sys.exit(1)
-

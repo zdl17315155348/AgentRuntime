@@ -58,6 +58,7 @@ echo "== unit =="
 bash scripts/test_unit.sh
 
 echo "== integration =="
+fuser -k 8234/tcp >/dev/null 2>&1 || true
 LLM_BACKEND=mock LLM_API_KEY="" SCHEDULER_TYPE=dag python3 -m aruntime.daemon.main >/tmp/agentd.log 2>&1 &
 AGENTD_PID=$!
 cleanup() {
@@ -67,14 +68,35 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 for _ in $(seq 1 60); do
-  if python3 -c "import httpx; r=httpx.get('http://127.0.0.1:8234/metrics', timeout=1); raise SystemExit(0 if r.status_code==200 else 1)" >/dev/null 2>&1; then
+  if ! kill -0 "$AGENTD_PID" >/dev/null 2>&1; then
+    break
+  fi
+  if python3 -c "import httpx; r=httpx.get('http://127.0.0.1:8234/metrics', timeout=1, trust_env=False); raise SystemExit(0 if r.status_code==200 else 1)" >/dev/null 2>&1; then
     break
   fi
   sleep 0.25
 done
 
-if ! python3 -c "import httpx; r=httpx.get('http://127.0.0.1:8234/metrics', timeout=1); raise SystemExit(0 if r.status_code==200 else 1)" >/dev/null 2>&1; then
+if ! python3 -c "import httpx; r=httpx.get('http://127.0.0.1:8234/metrics', timeout=1, trust_env=False); raise SystemExit(0 if r.status_code==200 else 1)" >/dev/null 2>&1; then
   echo "agentd 未就绪，日志如下："
+  if kill -0 "$AGENTD_PID" >/dev/null 2>&1; then
+    echo "agentd 进程仍在运行："
+    ps -p "$AGENTD_PID" -o pid,cmd || true
+    python3 - <<'PY' || true
+import os, httpx
+print("http_proxy:", os.getenv("http_proxy"))
+print("https_proxy:", os.getenv("https_proxy"))
+try:
+    r = httpx.get("http://127.0.0.1:8234/metrics", timeout=2, trust_env=False)
+    print("status:", r.status_code)
+    print("body:", r.text[:200])
+except Exception as e:
+    print("exc:", repr(e))
+PY
+  else
+    echo "agentd 进程已退出："
+    wait "$AGENTD_PID" || true
+  fi
   cat /tmp/agentd.log || true
   exit 1
 fi

@@ -58,6 +58,10 @@ async def _handle_uds_client(
                 continue
             if msg_type == "task_result" and task_result_handler is not None:
                 await task_result_handler(agent_name, data)
+                task_id = data.get("task_id")
+                if task_id:
+                    writer.write(_encode_line({"type": "ack", "task_id": task_id}))
+                    await writer.drain()
     finally:
         if agent_name:
             await router.unregister(agent_name)

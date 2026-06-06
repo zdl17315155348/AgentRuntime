@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 from collections import defaultdict, deque
 from threading import Lock
 from typing import Deque
@@ -14,10 +15,14 @@ class MessageRouter:
         self._conn_locks: dict[str, asyncio.Lock] = {}
         self._connected_events: dict[str, asyncio.Event] = {}
         self._lock = Lock()
+        self._mailbox_max = int(os.getenv("AGENTD_MAILBOX_MAX", "1000"))
 
     def send(self, message: Message) -> None:
         with self._lock:
-            self._mailboxes[message.to_agent].append(message)
+            mailbox = self._mailboxes[message.to_agent]
+            if self._mailbox_max > 0 and len(mailbox) >= self._mailbox_max:
+                mailbox.popleft()
+            mailbox.append(message)
 
     def receive(self, agent_name: str, limit: int = 50) -> list[Message]:
         if limit <= 0:

@@ -89,5 +89,15 @@ class AgentRuntimeClient:
         resp.raise_for_status()
         return resp.json()
 
+    def kill_agent(self, agent_name: str) -> dict:
+        resp = self.client.post(f"{self.base_url}/agents/{agent_name}/kill", json={})
+        resp.raise_for_status()
+        return resp.json()
+
+    def restart_agent(self, agent_name: str) -> dict:
+        resp = self.client.post(f"{self.base_url}/agents/{agent_name}/restart", json={})
+        resp.raise_for_status()
+        return resp.json()
+
     def close(self):
         self.client.close()

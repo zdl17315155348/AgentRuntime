@@ -25,3 +25,11 @@ def test_message_router_limit():
     got2 = r.receive("b", limit=10)
     assert len(got2) == 1
 
+
+def test_message_router_mailbox_max_drops_oldest(monkeypatch):
+    monkeypatch.setenv("AGENTD_MAILBOX_MAX", "1")
+    r = MessageRouter()
+    r.send(Message(from_agent="a", to_agent="b", payload={"i": 1}))
+    r.send(Message(from_agent="a", to_agent="b", payload={"i": 2}))
+    got = r.receive("b", limit=10)
+    assert [m.payload for m in got] == [{"i": 2}]

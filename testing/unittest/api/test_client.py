@@ -23,6 +23,8 @@ class _HTTP:
         self.last_post = {"url": url, "json": json}
         if url.endswith("/messages"):
             return _Resp({"message_id": "m1", "from_agent": json["from_agent"], "to_agent": json["to_agent"], "payload": json["payload"], "topic": json.get("topic") or None})
+        if url.endswith("/kill") or url.endswith("/restart"):
+            return _Resp({"agent_name": "a", "status": "READY"})
         return _Resp({"task_id": "t1", "status": "PENDING"})
 
     def get(self, url: str, params: dict | None = None):
@@ -85,3 +87,15 @@ def test_recv_messages_hits_messages_endpoint_with_limit():
     assert resp["messages"][0]["message_id"] == "m1"
     assert http.last_get["url"] == "http://example/messages/b"
     assert http.last_get["params"] == {"limit": 7}
+
+
+def test_kill_and_restart_agent_hit_endpoints():
+    c = AgentRuntimeClient(base_url="http://example")
+    http = _HTTP()
+    c.client = http
+
+    c.kill_agent("a")
+    assert http.last_post["url"] == "http://example/agents/a/kill"
+
+    c.restart_agent("a")
+    assert http.last_post["url"] == "http://example/agents/a/restart"

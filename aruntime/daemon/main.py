@@ -19,6 +19,7 @@ from aruntime.llm.gateway import LLMGateway
 from aruntime.comm.message import Message
 from aruntime.comm.router import MessageRouter
 from aruntime.comm.transport import start_uds_server
+from aruntime.resource.cgroup import apply_cgroup_v2
 
 import json
 
@@ -75,12 +76,60 @@ pending_task_results: Dict[str, asyncio.Future] = {}
 
 app = FastAPI(title="Agent Runtime Daemon", version="0.1.0")
 
+def _start_worker(agent_name: str) -> subprocess.Popen:
+    uds_path = os.getenv("AGENTD_UDS_PATH", "/tmp/agent-runtime-agentd.sock")
+    env = os.environ.copy()
+    env["AGENT_NAME"] = agent_name
+    env["AGENTD_UDS_PATH"] = uds_path
+    env["LLM_BACKEND"] = llm_gateway.backend
+    env["LLM_API_KEY"] = llm_gateway.api_key or ""
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "aruntime.worker.agent_worker"],
+        cwd=os.path.join(os.path.dirname(__file__), "..", ".."),
+        env=env,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    agent_workers[agent_name] = proc
+    agent = agents.get(agent_name)
+    if agent is not None:
+        cg = apply_cgroup_v2(
+            pid=proc.pid,
+            group_name=agent_name,
+            memory_max_bytes=agent.memory_max_bytes,
+            cpu_max=agent.cpu_max,
+        )
+        if cg.get("ok") is not True and cg.get("error"):
+            logger.info(f"cgroup 未生效: {cg.get('error')}")
+    return proc
+
+
+def _stop_worker(agent_name: str) -> None:
+    proc = agent_workers.get(agent_name)
+    if proc is None:
+        return
+    try:
+        proc.terminate()
+    except Exception:
+        pass
+    try:
+        proc.wait(timeout=2)
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+    agent_workers.pop(agent_name, None)
+
+
 class CreateAgentRequest(BaseModel):
     agent_name: str
     role: str
     system_prompt: str = ""
     model: str = "gpt-4o-mini"
     max_retries: int = 3
+    memory_max_bytes: int | None = None
+    cpu_max: str = ""
 
 class SubmitTaskRequest(BaseModel):
     agent_name: str
@@ -115,23 +164,12 @@ async def create_agent(req: CreateAgentRequest):
         system_prompt=req.system_prompt,
         model=req.model,
         max_retries=req.max_retries,
+        memory_max_bytes=req.memory_max_bytes,
+        cpu_max=req.cpu_max or None,
     )
     agents[agent.agent_name] = agent
     transition_to(agent, AgentStatus.READY)
-    uds_path = os.getenv("AGENTD_UDS_PATH", "/tmp/agent-runtime-agentd.sock")
-    env = os.environ.copy()
-    env["AGENT_NAME"] = agent.agent_name
-    env["AGENTD_UDS_PATH"] = uds_path
-    env["LLM_BACKEND"] = llm_gateway.backend
-    env["LLM_API_KEY"] = llm_gateway.api_key or ""
-    proc = subprocess.Popen(
-        [sys.executable, "-m", "aruntime.worker.agent_worker"],
-        cwd=os.path.join(os.path.dirname(__file__), "..", ".."),
-        env=env,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    agent_workers[agent.agent_name] = proc
+    _start_worker(agent.agent_name)
     logger.info(f"Agent created: {agent.agent_name} (status: {agent.status})")
     return {"agent_name": agent.agent_name, "status": agent.status}
 
@@ -143,10 +181,40 @@ async def list_agents():
                 "role": agent.role,
                 "status": agent.status,
                 "current_task": agent.current_task_id,
+                "worker_pid": (agent_workers.get(name).pid if name in agent_workers else None),
             }
             for name, agent in agents.items()
         ]
     }
+
+
+@app.post("/agents/{agent_name}/kill")
+async def kill_agent(agent_name: str):
+    if agent_name not in agents:
+        raise HTTPException(status_code=404, detail=f"Agent '{agent_name}' 不存在")
+    _stop_worker(agent_name)
+    agent = agents[agent_name]
+    if agent.status != AgentStatus.KILLED:
+        try:
+            transition_to(agent, AgentStatus.KILLED)
+        except Exception:
+            agent.status = AgentStatus.KILLED
+    agent_inflight_tasks[agent_name] = 0
+    return {"agent_name": agent_name, "status": agent.status}
+
+
+@app.post("/agents/{agent_name}/restart")
+async def restart_agent(agent_name: str):
+    if agent_name not in agents:
+        raise HTTPException(status_code=404, detail=f"Agent '{agent_name}' 不存在")
+    agent = agents[agent_name]
+    if agent.status == AgentStatus.KILLED:
+        raise HTTPException(status_code=409, detail=f"Agent '{agent_name}' 已 KILLED")
+    _stop_worker(agent_name)
+    _start_worker(agent_name)
+    if agent.status in (AgentStatus.COMPLETED, AgentStatus.FAILED, AgentStatus.WAITING):
+        transition_to(agent, AgentStatus.READY)
+    return {"agent_name": agent_name, "status": agent.status}
 
 @app.post("/tasks")
 async def submit_task(req: SubmitTaskRequest):
@@ -291,37 +359,68 @@ async def scheduling_loop():
             user_message = str(task.task_input)
 
             try:
-                ok = await message_router.wait_connected(task.agent_name, timeout_s=5.0)
-                if not ok:
-                    raise RuntimeError("agent worker not connected")
+                max_attempts = int(getattr(agent, "max_retries", 1) or 1)
+                if max_attempts < 1:
+                    max_attempts = 1
 
-                loop = asyncio.get_running_loop()
-                fut = loop.create_future()
-                pending_task_results[task.task_id] = fut
-                sent = await message_router.send_event(task.agent_name, {
-                    "type": "exec_task",
-                    "task_id": task.task_id,
-                    "system_prompt": system_prompt,
-                    "user_message": user_message,
-                    "task_input": task.task_input,
-                })
-                if not sent:
-                    pending_task_results.pop(task.task_id, None)
-                    raise RuntimeError("failed to send exec_task")
+                last_error = ""
+                success_output = None
 
-                result = await asyncio.wait_for(fut, timeout=120.0)
-                status = result.get("status")
-                output = result.get("output") or ""
-                error = result.get("error") or ""
-                if status == "SUCCESS":
+                for attempt in range(max_attempts):
+                    loop = asyncio.get_running_loop()
+                    fut = loop.create_future()
+                    pending_task_results[task.task_id] = fut
+                    try:
+                        ok = await message_router.wait_connected(task.agent_name, timeout_s=5.0)
+                        if not ok:
+                            proc = agent_workers.get(task.agent_name)
+                            if proc is not None and proc.poll() is not None:
+                                _stop_worker(task.agent_name)
+                                _start_worker(task.agent_name)
+                                ok = await message_router.wait_connected(task.agent_name, timeout_s=5.0)
+                            if not ok:
+                                raise RuntimeError("agent worker not connected")
+
+                        sent = await message_router.send_event(task.agent_name, {
+                            "type": "exec_task",
+                            "task_id": task.task_id,
+                            "system_prompt": system_prompt,
+                            "user_message": user_message,
+                            "task_input": task.task_input,
+                        })
+                        if not sent:
+                            raise RuntimeError("failed to send exec_task")
+
+                        try:
+                            result = await asyncio.wait_for(fut, timeout=120.0)
+                        except asyncio.TimeoutError:
+                            raise RuntimeError("task timeout")
+
+                        status = result.get("status")
+                        output = result.get("output") or ""
+                        error = result.get("error") or ""
+                        if status == "SUCCESS":
+                            success_output = output
+                            break
+                        raise RuntimeError(error or "worker error")
+                    except Exception as e:
+                        last_error = str(e)
+                        _stop_worker(task.agent_name)
+                        _start_worker(task.agent_name)
+                        if attempt < max_attempts - 1:
+                            await asyncio.sleep(0.2 * (attempt + 1))
+                    finally:
+                        pending_task_results.pop(task.task_id, None)
+
+                if success_output is not None:
                     task.status = TaskStatus.SUCCESS
-                    task.result = {"role": agent.role, "output": output}
+                    task.result = {"role": agent.role, "output": success_output}
                     transition_to(agent, AgentStatus.COMPLETED)
                     scheduler.complete_task(task.task_id)
                     logger.info(f"任务 {task.task_id} ✓")
                 else:
                     task.status = TaskStatus.FAILED
-                    task.error = error or "worker error"
+                    task.error = last_error or "worker error"
                     transition_to(agent, AgentStatus.FAILED)
                     scheduler.fail_task(task.task_id)
                     logger.error(f"任务 {task.task_id} ✗: {task.error}")
@@ -334,7 +433,6 @@ async def scheduling_loop():
                 logger.error(f"任务 {task.task_id} ✗: {e}")
                 task.result = {"role": agent.role, "output": f"[错误] {str(e)}"}
             finally:
-                pending_task_results.pop(task.task_id, None)
                 agent_inflight_tasks[task.agent_name] = max(agent_inflight_tasks.get(task.agent_name, 0) - 1, 0)
 
             task.completed_at = datetime.now()
@@ -370,6 +468,24 @@ async def startup():
     except Exception as e:
         logger.error(f"UDS server 启动失败: {e}")
 
+    async def worker_monitor_loop():
+        while True:
+            try:
+                for name, agent in list(agents.items()):
+                    if agent.status == AgentStatus.KILLED:
+                        continue
+                    proc = agent_workers.get(name)
+                    if proc is None:
+                        continue
+                    if proc.poll() is not None:
+                        _stop_worker(name)
+                        _start_worker(name)
+            except Exception:
+                pass
+            await asyncio.sleep(1.0)
+
+    asyncio.create_task(worker_monitor_loop())
+
 
 @app.on_event("shutdown")
 async def shutdown():
@@ -388,12 +504,8 @@ async def shutdown():
             proc.terminate()
         except Exception:
             pass
-    for proc in list(agent_workers.values()):
-        try:
-            proc.wait(timeout=2)
-        except Exception:
-            pass
-    agent_workers.clear()
+    for name in list(agent_workers.keys()):
+        _stop_worker(name)
 
 @app.get("/metrics")
 async def metrics():
@@ -406,6 +518,11 @@ async def metrics():
         "agents": {
             "total": len(agents),
             "by_status": status_counts,
+        },
+        "workers": {
+            "total": len(agent_workers),
+            "alive": sum(1 for p in agent_workers.values() if p.poll() is None),
+            "dead": sum(1 for p in agent_workers.values() if p.poll() is not None),
         },
         "tasks": {
             "total": len(tasks),

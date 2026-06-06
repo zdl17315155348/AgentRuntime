@@ -48,3 +48,5 @@ class AgentSpec(BaseModel):
     created_at: datetime = Field(default_factory=datetime.now)
     updated_at: datetime = Field(default_factory=datetime.now)
     max_retries: int = 3
+    memory_max_bytes: Optional[int] = None
+    cpu_max: Optional[str] = None
