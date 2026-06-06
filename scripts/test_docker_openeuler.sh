@@ -23,11 +23,6 @@ else
   exit 1
 fi
 
-if [ ! -f "$CONFIG_PATH" ]; then
-  echo "未找到配置文件: $CONFIG_PATH"
-  exit 1
-fi
-
 if ! $DOCKER image inspect "$BASE_IMAGE" >/dev/null 2>&1; then
   echo "未找到 openEuler 基础镜像: $BASE_IMAGE"
   echo "请先下载并导入（示例）："
@@ -37,22 +32,33 @@ if ! $DOCKER image inspect "$BASE_IMAGE" >/dev/null 2>&1; then
   exit 1
 fi
 
-$DOCKER build -t "$IMAGE_TAG" .
+$DOCKER build --build-arg BASE_IMAGE="$BASE_IMAGE" -t "$IMAGE_TAG" .
 
-$DOCKER run --rm \
-  -v "$CONFIG_PATH:/app/configs/runtime.json:ro" \
-  -e RUNTIME_CONFIG=/app/configs/runtime.json \
-  "$IMAGE_TAG" \
-  bash -lc '
+RUN_ARGS=(--rm)
+if [ -f "$CONFIG_PATH" ]; then
+  RUN_ARGS+=(-v "$CONFIG_PATH:/app/configs/runtime.json:ro" -e RUNTIME_CONFIG=/app/configs/runtime.json)
+fi
+if [ -n "${SMOKE_LLM_BACKEND:-}" ]; then
+  RUN_ARGS+=(-e "SMOKE_LLM_BACKEND=$SMOKE_LLM_BACKEND")
+fi
+if [ -n "${SMOKE_LLM_API_KEY:-}" ]; then
+  RUN_ARGS+=(-e "SMOKE_LLM_API_KEY=$SMOKE_LLM_API_KEY")
+fi
+
+$DOCKER run "${RUN_ARGS[@]}" \
+  "$IMAGE_TAG" bash -lc '
 set -euo pipefail
+unset http_proxy https_proxy all_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY
+export NO_PROXY=127.0.0.1,localhost
+export no_proxy=127.0.0.1,localhost
 
 python3 -m pip install --no-cache-dir -q pytest
 
 echo "== unit =="
-python3 -m pytest testing/unittest/core/ testing/unittest/scheduler/ -v
+bash scripts/test_unit.sh
 
 echo "== integration =="
-LLM_BACKEND=mock LLM_API_KEY="" python3 -m aruntime.daemon.main >/tmp/agentd.log 2>&1 &
+LLM_BACKEND=mock LLM_API_KEY="" SCHEDULER_TYPE=dag python3 -m aruntime.daemon.main >/tmp/agentd.log 2>&1 &
 AGENTD_PID=$!
 cleanup() {
   kill "$AGENTD_PID" >/dev/null 2>&1 || true
@@ -78,6 +84,18 @@ cleanup
 trap - EXIT INT TERM
 
 echo "== smoke =="
-SMOKE_LLM_BACKEND=deepseek SMOKE_LLM_API_KEY="$(python3 -c "import json;print(json.load(open(\"configs/runtime.json\"))[\"llm\"][\"api_key\"])")" \
-  python3 -m pytest testing/smoke/test_smoke.py -v
+SMOKE_LLM_BACKEND="${SMOKE_LLM_BACKEND:-}"
+SMOKE_LLM_API_KEY="${SMOKE_LLM_API_KEY:-}"
+if [ -z "$SMOKE_LLM_API_KEY" ] && [ -f configs/runtime.json ]; then
+  SMOKE_LLM_API_KEY="$(python3 -c "import json;print(json.load(open(\"configs/runtime.json\")).get(\"llm\",{}).get(\"api_key\",\"\") )")"
+fi
+if [ -z "$SMOKE_LLM_BACKEND" ]; then
+  SMOKE_LLM_BACKEND=deepseek
+fi
+if [ -n "$SMOKE_LLM_API_KEY" ]; then
+  SMOKE_LLM_BACKEND="$SMOKE_LLM_BACKEND" SMOKE_LLM_API_KEY="$SMOKE_LLM_API_KEY" \
+    python3 -m pytest testing/smoke/test_smoke.py -v
+else
+  echo "跳过 smoke（未提供真实 LLM key）"
+fi
 '

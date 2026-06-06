@@ -3,6 +3,8 @@ import asyncio
 import logging
 from datetime import datetime
 from typing import Dict
+import subprocess
+import sys
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -16,6 +18,7 @@ import os
 from aruntime.llm.gateway import LLMGateway
 from aruntime.comm.message import Message
 from aruntime.comm.router import MessageRouter
+from aruntime.comm.transport import start_uds_server
 
 import json
 
@@ -66,6 +69,9 @@ agents: Dict[str, AgentSpec] = {}
 tasks: Dict[str, TaskSpec] = {}
 agent_inflight_tasks: Dict[str, int] = {}
 message_router = MessageRouter()
+uds_server = None
+agent_workers: Dict[str, subprocess.Popen] = {}
+pending_task_results: Dict[str, asyncio.Future] = {}
 
 app = FastAPI(title="Agent Runtime Daemon", version="0.1.0")
 
@@ -112,6 +118,20 @@ async def create_agent(req: CreateAgentRequest):
     )
     agents[agent.agent_name] = agent
     transition_to(agent, AgentStatus.READY)
+    uds_path = os.getenv("AGENTD_UDS_PATH", "/tmp/agent-runtime-agentd.sock")
+    env = os.environ.copy()
+    env["AGENT_NAME"] = agent.agent_name
+    env["AGENTD_UDS_PATH"] = uds_path
+    env["LLM_BACKEND"] = llm_gateway.backend
+    env["LLM_API_KEY"] = llm_gateway.api_key or ""
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "aruntime.worker.agent_worker"],
+        cwd=os.path.join(os.path.dirname(__file__), "..", ".."),
+        env=env,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    agent_workers[agent.agent_name] = proc
     logger.info(f"Agent created: {agent.agent_name} (status: {agent.status})")
     return {"agent_name": agent.agent_name, "status": agent.status}
 
@@ -228,7 +248,7 @@ async def send_message(req: SendMessageRequest):
         payload=req.payload,
         topic=req.topic or None,
     )
-    message_router.send(msg)
+    await message_router.route(msg)
     return msg.model_dump()
 
 
@@ -271,29 +291,51 @@ async def scheduling_loop():
             user_message = str(task.task_input)
 
             try:
-                if llm_gateway.backend == "mock" and isinstance(task.task_input, dict):
-                    test_cfg = task.task_input.get("__test", {})
-                    if isinstance(test_cfg, dict):
-                        sleep_ms = test_cfg.get("sleep_ms")
-                        if isinstance(sleep_ms, (int, float)) and sleep_ms > 0:
-                            await asyncio.sleep(float(sleep_ms) / 1000.0)
-                        if test_cfg.get("force_error") is True:
-                            raise RuntimeError("forced error")
-                output = llm_gateway.chat(system_prompt, user_message)
-                task.status = TaskStatus.SUCCESS
-                task.result = {"role": agent.role, "output": output}
-                transition_to(agent, AgentStatus.COMPLETED)
-                scheduler.complete_task(task.task_id)
-                agent_inflight_tasks[task.agent_name] = max(agent_inflight_tasks.get(task.agent_name, 0) - 1, 0)
-                logger.info(f"任务 {task.task_id} ✓")
+                ok = await message_router.wait_connected(task.agent_name, timeout_s=5.0)
+                if not ok:
+                    raise RuntimeError("agent worker not connected")
+
+                loop = asyncio.get_running_loop()
+                fut = loop.create_future()
+                pending_task_results[task.task_id] = fut
+                sent = await message_router.send_event(task.agent_name, {
+                    "type": "exec_task",
+                    "task_id": task.task_id,
+                    "system_prompt": system_prompt,
+                    "user_message": user_message,
+                    "task_input": task.task_input,
+                })
+                if not sent:
+                    pending_task_results.pop(task.task_id, None)
+                    raise RuntimeError("failed to send exec_task")
+
+                result = await asyncio.wait_for(fut, timeout=120.0)
+                status = result.get("status")
+                output = result.get("output") or ""
+                error = result.get("error") or ""
+                if status == "SUCCESS":
+                    task.status = TaskStatus.SUCCESS
+                    task.result = {"role": agent.role, "output": output}
+                    transition_to(agent, AgentStatus.COMPLETED)
+                    scheduler.complete_task(task.task_id)
+                    logger.info(f"任务 {task.task_id} ✓")
+                else:
+                    task.status = TaskStatus.FAILED
+                    task.error = error or "worker error"
+                    transition_to(agent, AgentStatus.FAILED)
+                    scheduler.fail_task(task.task_id)
+                    logger.error(f"任务 {task.task_id} ✗: {task.error}")
+                    task.result = {"role": agent.role, "output": f"[错误] {task.error}"}
             except Exception as e:
                 task.status = TaskStatus.FAILED
                 task.error = str(e)
                 transition_to(agent, AgentStatus.FAILED)
                 scheduler.fail_task(task.task_id)
-                agent_inflight_tasks[task.agent_name] = max(agent_inflight_tasks.get(task.agent_name, 0) - 1, 0)
                 logger.error(f"任务 {task.task_id} ✗: {e}")
                 task.result = {"role": agent.role, "output": f"[错误] {str(e)}"}
+            finally:
+                pending_task_results.pop(task.task_id, None)
+                agent_inflight_tasks[task.agent_name] = max(agent_inflight_tasks.get(task.agent_name, 0) - 1, 0)
 
             task.completed_at = datetime.now()
             agent.current_task_id = None
@@ -306,6 +348,52 @@ async def scheduling_loop():
 async def startup():
     asyncio.create_task(scheduling_loop())
     logger.info("调度循环已启动")
+    global uds_server
+    uds_path = os.getenv("AGENTD_UDS_PATH", "/tmp/agent-runtime-agentd.sock")
+    try:
+        async def _on_task_result(agent_name: str, data: dict) -> None:
+            task_id = str(data.get("task_id") or "").strip()
+            if not task_id:
+                return
+            fut = pending_task_results.get(task_id)
+            if fut is None or fut.done():
+                return
+            fut.set_result({
+                "agent_name": agent_name,
+                "task_id": task_id,
+                "status": data.get("status"),
+                "output": data.get("output"),
+                "error": data.get("error"),
+            })
+
+        uds_server = await start_uds_server(uds_path, message_router, task_result_handler=_on_task_result)
+    except Exception as e:
+        logger.error(f"UDS server 启动失败: {e}")
+
+
+@app.on_event("shutdown")
+async def shutdown():
+    global uds_server
+    if uds_server is None:
+        pass
+    else:
+        uds_server.close()
+        try:
+            await uds_server.wait_closed()
+        except Exception:
+            pass
+        uds_server = None
+    for proc in list(agent_workers.values()):
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+    for proc in list(agent_workers.values()):
+        try:
+            proc.wait(timeout=2)
+        except Exception:
+            pass
+    agent_workers.clear()
 
 @app.get("/metrics")
 async def metrics():
