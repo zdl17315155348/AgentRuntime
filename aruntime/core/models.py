@@ -50,3 +50,4 @@ class AgentSpec(BaseModel):
     max_retries: int = 3
     memory_max_bytes: Optional[int] = None
     cpu_max: Optional[str] = None
+    llm_max_concurrent: int = 1

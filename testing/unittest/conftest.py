@@ -16,12 +16,15 @@ def agentd_server():
     env["LLM_API_KEY"] = ""
     env["SCHEDULER_TYPE"] = "dag"
 
-    subprocess.run(
-        ["fuser", "-k", "8234/tcp"],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        check=False,
-    )
+    try:
+        subprocess.run(
+            ["fuser", "-k", "8234/tcp"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+    except FileNotFoundError:
+        pass
 
     proc = subprocess.Popen(
         [sys.executable, "-m", "aruntime.daemon.main"],

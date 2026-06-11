@@ -20,6 +20,8 @@ from aruntime.comm.message import Message
 from aruntime.comm.router import MessageRouter
 from aruntime.comm.transport import start_uds_server
 from aruntime.resource.cgroup import apply_cgroup_v2
+from aruntime.resource.monitor import ResourceMonitor
+from aruntime.scheduler.resource_aware import ResourceAwareScheduler
 
 import json
 
@@ -56,18 +58,28 @@ LLM_BACKEND = os.getenv("LLM_BACKEND", llm_config.get("backend", "deepseek"))
 LLM_API_KEY = os.getenv("LLM_API_KEY", llm_config.get("api_key", ""))
 llm_gateway = LLMGateway(backend=LLM_BACKEND, api_key=LLM_API_KEY)
 
+agents: Dict[str, AgentSpec] = {}
+tasks: Dict[str, TaskSpec] = {}
+
 # 初始化调度器
 SCHEDULER_TYPE = os.getenv("SCHEDULER_TYPE", scheduler_config.get("type", "fifo"))
+resource_aware = os.getenv("RESOURCE_AWARE", "").lower() in ("true", "1", "yes") or scheduler_config.get("resource_aware", False)
+resource_monitor: ResourceMonitor | None = None
+
 if SCHEDULER_TYPE == "dag":
-    scheduler: BaseScheduler = DAGScheduler()
+    _inner: BaseScheduler = DAGScheduler()
 else:
-    scheduler: BaseScheduler = FIFOScheduler()
+    _inner: BaseScheduler = FIFOScheduler()
+
+if resource_aware:
+    resource_monitor = ResourceMonitor()
+    scheduler: BaseScheduler = ResourceAwareScheduler(_inner, resource_monitor, agents)
+else:
+    scheduler: BaseScheduler = _inner
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("agentd")
 
-agents: Dict[str, AgentSpec] = {}
-tasks: Dict[str, TaskSpec] = {}
 agent_inflight_tasks: Dict[str, int] = {}
 message_router = MessageRouter()
 uds_server = None
@@ -358,6 +370,8 @@ async def scheduling_loop():
             system_prompt = agent.system_prompt or f"你是一个{agent.role}"
             user_message = str(task.task_input)
 
+            acquired = False
+
             try:
                 max_attempts = int(getattr(agent, "max_retries", 1) or 1)
                 if max_attempts < 1:
@@ -380,6 +394,12 @@ async def scheduling_loop():
                                 ok = await message_router.wait_connected(task.agent_name, timeout_s=5.0)
                             if not ok:
                                 raise RuntimeError("agent worker not connected")
+
+                        # 申请 LLM 资源
+                        if resource_aware and resource_monitor is not None:
+                            if not resource_monitor.acquire_llm(task.agent_name, agent.llm_max_concurrent):
+                                raise RuntimeError("LLM resource not available")
+                            acquired = True
 
                         sent = await message_router.send_event(task.agent_name, {
                             "type": "exec_task",
@@ -433,6 +453,8 @@ async def scheduling_loop():
                 logger.error(f"任务 {task.task_id} ✗: {e}")
                 task.result = {"role": agent.role, "output": f"[错误] {str(e)}"}
             finally:
+                if resource_aware and acquired and resource_monitor is not None:
+                    resource_monitor.release_llm(task.agent_name)
                 agent_inflight_tasks[task.agent_name] = max(agent_inflight_tasks.get(task.agent_name, 0) - 1, 0)
 
             task.completed_at = datetime.now()
@@ -514,7 +536,7 @@ async def metrics():
         s = agent.status.value
         status_counts[s] = status_counts.get(s, 0) + 1
 
-    return {
+    result = {
         "agents": {
             "total": len(agents),
             "by_status": status_counts,
@@ -532,6 +554,11 @@ async def metrics():
             "failed": sum(1 for t in tasks.values() if t.status == TaskStatus.FAILED),
         },
     }
+
+    if resource_aware and resource_monitor is not None:
+        result["resource"] = resource_monitor.get_snapshot()
+
+    return result
 
 def main():
     import uvicorn

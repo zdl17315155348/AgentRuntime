@@ -5,3 +5,5 @@ pyyaml
 rich
 httpx
 pydantic
+psutil
+pytest
