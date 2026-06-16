@@ -19,6 +19,7 @@ from aruntime.llm.gateway import LLMGateway
 from aruntime.comm.message import Message
 from aruntime.comm.router import MessageRouter
 from aruntime.comm.transport import start_uds_server
+from aruntime.context.manager import ContextManager
 from aruntime.resource.cgroup import apply_cgroup_v2
 from aruntime.resource.monitor import ResourceMonitor
 from aruntime.scheduler.resource_aware import ResourceAwareScheduler
@@ -52,11 +53,25 @@ def load_config():
 config = load_config()
 llm_config = config.get("llm", {})
 scheduler_config = config.get("scheduler", {})
+context_config = config.get("context", {})
+if not isinstance(context_config, dict):
+    context_config = {}
+
+
+def _context_compress_threshold() -> int:
+    try:
+        value = int(context_config.get("compress_threshold_chars", 4000))
+    except (TypeError, ValueError):
+        return 4000
+    return value if value > 0 else 4000
 
 # 初始化 LLM 网关
 LLM_BACKEND = os.getenv("LLM_BACKEND", llm_config.get("backend", "deepseek"))
 LLM_API_KEY = os.getenv("LLM_API_KEY", llm_config.get("api_key", ""))
 llm_gateway = LLMGateway(backend=LLM_BACKEND, api_key=LLM_API_KEY)
+context_manager = ContextManager(
+    compress_threshold_chars=_context_compress_threshold()
+)
 
 agents: Dict[str, AgentSpec] = {}
 tasks: Dict[str, TaskSpec] = {}
@@ -165,6 +180,21 @@ class SendMessageRequest(BaseModel):
     payload: dict
     topic: str = ""
 
+
+def _record_task_context(context_id: str, agent_name: str, task_input: dict) -> None:
+    if not context_id:
+        return
+    context = task_input.get("context", {})
+    if not isinstance(context, dict):
+        context = {}
+    shared_data = context.get("shared", {})
+    private_data = context.get("private", {})
+    if not isinstance(shared_data, dict):
+        shared_data = {}
+    if not isinstance(private_data, dict):
+        private_data = {}
+    context_manager.record_task_context(context_id, agent_name, shared_data, private_data)
+
 @app.post("/agents")
 async def create_agent(req: CreateAgentRequest):
     if req.agent_name in agents:
@@ -252,6 +282,8 @@ async def submit_task(req: SubmitTaskRequest):
         if dep_id not in tasks:
             raise HTTPException(status_code=404, detail=f"依赖任务 '{dep_id}' 不存在")
 
+    _record_task_context(req.context_id, req.agent_name, req.task_input)
+
     task = TaskSpec(
         agent_name=req.agent_name,
         task_input=req.task_input,
@@ -287,6 +319,8 @@ async def submit_dynamic_task(req: SubmitDynamicTaskRequest):
     # 验证父任务是否存在
     if req.parent_task_id and req.parent_task_id not in tasks:
         raise HTTPException(status_code=404, detail=f"父任务 '{req.parent_task_id}' 不存在")
+
+    _record_task_context(req.context_id, req.agent_name, req.task_input)
 
     task = TaskSpec(
         agent_name=req.agent_name,
@@ -368,7 +402,11 @@ async def scheduling_loop():
             logger.info(f"调度：任务 {task.task_id} → Agent '{task.agent_name}'")
 
             system_prompt = agent.system_prompt or f"你是一个{agent.role}"
-            user_message = str(task.task_input)
+            task_payload = {}
+            if task.context_id:
+                task_payload["runtime_context"] = context_manager.build_agent_context(task.context_id, task.agent_name)
+            task_payload.update(task.task_input)
+            user_message = str(task_payload)
 
             acquired = False
 
@@ -406,7 +444,7 @@ async def scheduling_loop():
                             "task_id": task.task_id,
                             "system_prompt": system_prompt,
                             "user_message": user_message,
-                            "task_input": task.task_input,
+                            "task_input": task_payload,
                         })
                         if not sent:
                             raise RuntimeError("failed to send exec_task")
@@ -554,6 +592,7 @@ async def metrics():
             "failed": sum(1 for t in tasks.values() if t.status == TaskStatus.FAILED),
         },
     }
+    result["context"] = context_manager.get_metrics()
 
     if resource_aware and resource_monitor is not None:
         result["resource"] = resource_monitor.get_snapshot()

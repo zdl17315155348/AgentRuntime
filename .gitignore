@@ -143,6 +143,7 @@ cython_debug/
 # IDEs
 .vscode/
 .idea/
+.codex-local/
 *.swp
 *.swo
 *~

@@ -54,6 +54,33 @@ def test_submit_task_sends_dependencies_and_priority():
     assert http.last_post["json"]["dependencies"] == ["a", "b"]
 
 
+def test_submit_task_sends_context_payload():
+    c = AgentRuntimeClient(base_url="http://example")
+    http = _HTTP()
+    c.client = http
+
+    resp = c.submit_task(
+        "planner",
+        {
+            "request": "plan",
+            "context": {
+                "shared": {"repo": "agent-runtime-os"},
+                "private": {"note": "planner"},
+            },
+        },
+        context_id="ctx-client",
+    )
+
+    assert resp["task_id"] == "t1"
+    assert http.last_post["url"] == "http://example/tasks"
+    assert http.last_post["json"]["agent_name"] == "planner"
+    assert http.last_post["json"]["context_id"] == "ctx-client"
+    assert http.last_post["json"]["task_input"]["context"] == {
+        "shared": {"repo": "agent-runtime-os"},
+        "private": {"note": "planner"},
+    }
+
+
 def test_get_task_hits_task_endpoint():
     c = AgentRuntimeClient(base_url="http://example")
     http = _HTTP()

@@ -190,6 +190,66 @@ class TestAgentLifecycleAPI:
         assert "COMPLETED" in data["agents"]["by_status"]
         assert data["tasks"]["success"] >= 1
 
+    def test_task_context_is_injected_into_worker_input(self, client):
+        suffix = str(int(time.time() * 1000))
+        agent_name = f"lifecycle_test_context_{suffix}"
+        context_id = f"context_{suffix}"
+        client.post("/agents", json={
+            "agent_name": agent_name,
+            "role": "测试员",
+        })
+
+        resp = client.post("/tasks", json={
+            "agent_name": agent_name,
+            "context_id": context_id,
+            "task_input": {
+                "r": "",
+                "context": {
+                    "shared": {"p": "aros"},
+                    "private": {"n": "wo"},
+                },
+            },
+        })
+        assert resp.status_code == 200
+        task_id = resp.json()["task_id"]
+
+        data = wait_task_done(client, task_id, timeout_s=10.0)
+        assert data["status"] == "SUCCESS"
+        output = data["result"]["output"]
+        assert "runtime_context" in output
+
+    def test_metrics_include_context_snapshot(self, client):
+        suffix = str(int(time.time() * 1000))
+        agent_name = f"lifecycle_test_context_metrics_{suffix}"
+        context_id = f"context_metrics_{suffix}"
+        client.post("/agents", json={
+            "agent_name": agent_name,
+            "role": "测试员",
+        })
+
+        resp = client.post("/tasks", json={
+            "agent_name": agent_name,
+            "context_id": context_id,
+            "task_input": {
+                "request": "上下文指标任务",
+                "context": {
+                    "shared": {"project": "agent-runtime-os"},
+                    "private": {"note": "worker-only"},
+                },
+            },
+        })
+        assert resp.status_code == 200
+        task_id = resp.json()["task_id"]
+
+        data = wait_task_done(client, task_id, timeout_s=10.0)
+        assert data["status"] == "SUCCESS"
+
+        resp = client.get("/metrics")
+        assert resp.status_code == 200
+        context = resp.json()["context"]
+        assert context["total_contexts"] >= 1
+        assert context["build_hits"] >= 1
+
     def test_failed_task_sets_agent_failed_and_can_retry(self, client):
         suffix = str(int(time.time() * 1000))
         agent_name = f"lifecycle_test_fail_{suffix}"
