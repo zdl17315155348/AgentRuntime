@@ -9,10 +9,12 @@ import sys
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
-from aruntime.core.models import AgentSpec, TaskSpec, TaskStatus, AgentStatus
+from aruntime.core.acb import AgentControlBlock
+from aruntime.core.models import AgentSpec, FailurePolicy, TaskSpec, TaskStatus, AgentStatus
 from aruntime.core.lifecycle import transition_to, InvalidTransitionError
 from aruntime.scheduler.fifo import FIFOScheduler
 from aruntime.scheduler.dag import DAGScheduler
+from aruntime.scheduler.kernel import KernelScheduler
 from aruntime.scheduler.base import BaseScheduler
 import os
 from aruntime.llm.gateway import LLMGateway
@@ -74,6 +76,7 @@ context_manager = ContextManager(
 )
 
 agents: Dict[str, AgentSpec] = {}
+agent_controls: Dict[str, AgentControlBlock] = {}
 tasks: Dict[str, TaskSpec] = {}
 
 # 初始化调度器
@@ -81,7 +84,9 @@ SCHEDULER_TYPE = os.getenv("SCHEDULER_TYPE", scheduler_config.get("type", "fifo"
 resource_aware = os.getenv("RESOURCE_AWARE", "").lower() in ("true", "1", "yes") or scheduler_config.get("resource_aware", False)
 resource_monitor: ResourceMonitor | None = None
 
-if SCHEDULER_TYPE == "dag":
+if SCHEDULER_TYPE == "kernel":
+    _inner: BaseScheduler = KernelScheduler()
+elif SCHEDULER_TYPE == "dag":
     _inner: BaseScheduler = DAGScheduler()
 else:
     _inner: BaseScheduler = FIFOScheduler()
@@ -103,6 +108,46 @@ pending_task_results: Dict[str, asyncio.Future] = {}
 
 app = FastAPI(title="Agent Runtime Daemon", version="0.1.0")
 
+
+def _sync_agent_from_acb(agent_name: str) -> None:
+    agent = agents.get(agent_name)
+    acb = agent_controls.get(agent_name)
+    if agent is None or acb is None:
+        return
+    agent.status = acb.status
+    agent.current_task_id = acb.current_task_id
+    agent.updated_at = acb.updated_at
+
+
+def _transition_agent(
+    agent_name: str,
+    new_status: AgentStatus,
+    task_id: str | None = None,
+    reason: str = "",
+) -> None:
+    acb = agent_controls.get(agent_name)
+    if acb is not None:
+        transition_to(acb, new_status, task_id=task_id, reason=reason)
+        _sync_agent_from_acb(agent_name)
+        return
+    agent = agents[agent_name]
+    transition_to(agent, new_status, task_id=task_id, reason=reason)
+
+
+def _set_current_task(agent_name: str, task_id: str | None) -> None:
+    acb = agent_controls.get(agent_name)
+    if acb is not None:
+        acb.set_current_task(task_id)
+    agent = agents.get(agent_name)
+    if agent is not None:
+        agent.current_task_id = task_id
+
+
+def _set_context_handle(agent_name: str, context_id: str | None) -> None:
+    acb = agent_controls.get(agent_name)
+    if acb is not None:
+        acb.set_context(context_id)
+
 def _start_worker(agent_name: str) -> subprocess.Popen:
     uds_path = os.getenv("AGENTD_UDS_PATH", "/tmp/agent-runtime-agentd.sock")
     env = os.environ.copy()
@@ -118,6 +163,11 @@ def _start_worker(agent_name: str) -> subprocess.Popen:
         stderr=subprocess.DEVNULL,
     )
     agent_workers[agent_name] = proc
+    acb = agent_controls.get(agent_name)
+    if acb is not None:
+        acb.ipc_endpoint = uds_path
+        acb.mailbox = agent_name
+        acb.record_event("worker.started", detail={"pid": proc.pid})
     agent = agents.get(agent_name)
     if agent is not None:
         cg = apply_cgroup_v2(
@@ -164,6 +214,7 @@ class SubmitTaskRequest(BaseModel):
     context_id: str = ""
     priority: int = 0
     dependencies: list[str] = []
+    failure_policy: FailurePolicy = FailurePolicy.ISOLATE
 
 
 class SubmitDynamicTaskRequest(BaseModel):
@@ -172,6 +223,7 @@ class SubmitDynamicTaskRequest(BaseModel):
     parent_task_id: str = ""
     context_id: str = ""
     priority: int = 0
+    failure_policy: FailurePolicy = FailurePolicy.ISOLATE
 
 
 class SendMessageRequest(BaseModel):
@@ -210,7 +262,9 @@ async def create_agent(req: CreateAgentRequest):
         cpu_max=req.cpu_max or None,
     )
     agents[agent.agent_name] = agent
-    transition_to(agent, AgentStatus.READY)
+    acb = AgentControlBlock.from_agent_spec(agent)
+    agent_controls[agent.agent_name] = acb
+    _transition_agent(agent.agent_name, AgentStatus.READY, reason="agent.created")
     _start_worker(agent.agent_name)
     logger.info(f"Agent created: {agent.agent_name} (status: {agent.status})")
     return {"agent_name": agent.agent_name, "status": agent.status}
@@ -230,6 +284,16 @@ async def list_agents():
     }
 
 
+@app.get("/agents/{agent_name}/acb")
+async def get_agent_acb(agent_name: str):
+    if agent_name not in agents:
+        raise HTTPException(status_code=404, detail=f"Agent '{agent_name}' 不存在")
+    acb = agent_controls.get(agent_name)
+    if acb is None:
+        raise HTTPException(status_code=404, detail=f"Agent '{agent_name}' 缺少 ACB")
+    return acb.to_dict()
+
+
 @app.post("/agents/{agent_name}/kill")
 async def kill_agent(agent_name: str):
     if agent_name not in agents:
@@ -238,9 +302,13 @@ async def kill_agent(agent_name: str):
     agent = agents[agent_name]
     if agent.status != AgentStatus.KILLED:
         try:
-            transition_to(agent, AgentStatus.KILLED)
+            _transition_agent(agent_name, AgentStatus.KILLED, reason="agent.kill")
         except Exception:
             agent.status = AgentStatus.KILLED
+            acb = agent_controls.get(agent_name)
+            if acb is not None:
+                acb.status = AgentStatus.KILLED
+                acb.record_event("agent.force_killed")
     agent_inflight_tasks[agent_name] = 0
     return {"agent_name": agent_name, "status": agent.status}
 
@@ -255,7 +323,7 @@ async def restart_agent(agent_name: str):
     _stop_worker(agent_name)
     _start_worker(agent_name)
     if agent.status in (AgentStatus.COMPLETED, AgentStatus.FAILED, AgentStatus.WAITING):
-        transition_to(agent, AgentStatus.READY)
+        _transition_agent(agent_name, AgentStatus.READY, reason="agent.restart")
     return {"agent_name": agent_name, "status": agent.status}
 
 @app.post("/tasks")
@@ -275,7 +343,7 @@ async def submit_task(req: SubmitTaskRequest):
             detail=f"Agent '{req.agent_name}' 当前状态为 {agent.status}，无法接受新任务"
         )
     if agent.status in (AgentStatus.COMPLETED, AgentStatus.FAILED):
-        transition_to(agent, AgentStatus.READY)
+        _transition_agent(req.agent_name, AgentStatus.READY, reason="task.submit")
 
     # 验证依赖任务是否存在
     for dep_id in req.dependencies:
@@ -283,6 +351,7 @@ async def submit_task(req: SubmitTaskRequest):
             raise HTTPException(status_code=404, detail=f"依赖任务 '{dep_id}' 不存在")
 
     _record_task_context(req.context_id, req.agent_name, req.task_input)
+    _set_context_handle(req.agent_name, req.context_id or None)
 
     task = TaskSpec(
         agent_name=req.agent_name,
@@ -290,6 +359,7 @@ async def submit_task(req: SubmitTaskRequest):
         context_id=req.context_id,
         priority=req.priority,
         dependencies=req.dependencies,
+        failure_policy=req.failure_policy,
     )
     tasks[task.task_id] = task
     scheduler.enqueue(task)
@@ -314,13 +384,14 @@ async def submit_dynamic_task(req: SubmitDynamicTaskRequest):
         )
     agent = agents[req.agent_name]
     if agent.status in (AgentStatus.COMPLETED, AgentStatus.FAILED):
-        transition_to(agent, AgentStatus.READY)
+        _transition_agent(req.agent_name, AgentStatus.READY, reason="task.dynamic_submit")
     
     # 验证父任务是否存在
     if req.parent_task_id and req.parent_task_id not in tasks:
         raise HTTPException(status_code=404, detail=f"父任务 '{req.parent_task_id}' 不存在")
 
     _record_task_context(req.context_id, req.agent_name, req.task_input)
+    _set_context_handle(req.agent_name, req.context_id or None)
 
     task = TaskSpec(
         agent_name=req.agent_name,
@@ -328,6 +399,7 @@ async def submit_dynamic_task(req: SubmitDynamicTaskRequest):
         context_id=req.context_id,
         priority=req.priority,
         dependencies=[req.parent_task_id] if req.parent_task_id else [],
+        failure_policy=req.failure_policy,
     )
     tasks[task.task_id] = task
     
@@ -346,7 +418,22 @@ async def get_task(task_id: str):
     if task_id not in tasks:
         raise HTTPException(status_code=404, detail="Task not found")
     t = tasks[task_id]
-    return {"task_id": t.task_id, "status": t.status, "result": t.result, "error": t.error}
+    acb = agent_controls.get(t.agent_name)
+    runtime = None
+    if acb is not None:
+        runtime = {
+            "agent_name": acb.agent_name,
+            "agent_status": acb.status,
+            "current_task_id": acb.current_task_id,
+            "trace_id": acb.trace_id,
+        }
+    return {
+        "task_id": t.task_id,
+        "status": t.status,
+        "result": t.result,
+        "error": t.error,
+        "runtime": runtime,
+    }
 
 
 @app.post("/messages")
@@ -378,6 +465,21 @@ async def receive_messages(agent_name: str, limit: int = 50):
     messages = message_router.receive(agent_name, limit=limit)
     return {"messages": [m.model_dump() for m in messages]}
 
+
+@app.get("/scheduler/queues")
+async def scheduler_queues():
+    target = scheduler
+    if hasattr(scheduler, "_inner"):
+        target = scheduler._inner
+    if hasattr(target, "queue_snapshot"):
+        return target.queue_snapshot()
+    return {
+        "ready": [task.task_id for task in getattr(target, "task_queue", [])],
+        "running": [],
+        "waiting": [],
+        "blocked": [],
+    }
+
 # ───── 调度循环（后台任务） ─────
 
 async def scheduling_loop():
@@ -396,9 +498,10 @@ async def scheduling_loop():
                 continue
 
             if agent.status in (AgentStatus.COMPLETED, AgentStatus.FAILED):
-                transition_to(agent, AgentStatus.READY)
-            transition_to(agent, AgentStatus.RUNNING)
-            agent.current_task_id = task.task_id
+                _transition_agent(task.agent_name, AgentStatus.READY, task_id=task.task_id, reason="scheduler.requeue")
+            _set_context_handle(task.agent_name, task.context_id or None)
+            _transition_agent(task.agent_name, AgentStatus.RUNNING, task_id=task.task_id, reason="scheduler.dispatch")
+            _set_current_task(task.agent_name, task.task_id)
             logger.info(f"调度：任务 {task.task_id} → Agent '{task.agent_name}'")
 
             system_prompt = agent.system_prompt or f"你是一个{agent.role}"
@@ -473,20 +576,20 @@ async def scheduling_loop():
                 if success_output is not None:
                     task.status = TaskStatus.SUCCESS
                     task.result = {"role": agent.role, "output": success_output}
-                    transition_to(agent, AgentStatus.COMPLETED)
+                    _transition_agent(task.agent_name, AgentStatus.COMPLETED, task_id=task.task_id, reason="task.success")
                     scheduler.complete_task(task.task_id)
                     logger.info(f"任务 {task.task_id} ✓")
                 else:
                     task.status = TaskStatus.FAILED
                     task.error = last_error or "worker error"
-                    transition_to(agent, AgentStatus.FAILED)
+                    _transition_agent(task.agent_name, AgentStatus.FAILED, task_id=task.task_id, reason="task.failed")
                     scheduler.fail_task(task.task_id)
                     logger.error(f"任务 {task.task_id} ✗: {task.error}")
                     task.result = {"role": agent.role, "output": f"[错误] {task.error}"}
             except Exception as e:
                 task.status = TaskStatus.FAILED
                 task.error = str(e)
-                transition_to(agent, AgentStatus.FAILED)
+                _transition_agent(task.agent_name, AgentStatus.FAILED, task_id=task.task_id, reason="task.exception")
                 scheduler.fail_task(task.task_id)
                 logger.error(f"任务 {task.task_id} ✗: {e}")
                 task.result = {"role": agent.role, "output": f"[错误] {str(e)}"}
@@ -496,7 +599,7 @@ async def scheduling_loop():
                 agent_inflight_tasks[task.agent_name] = max(agent_inflight_tasks.get(task.agent_name, 0) - 1, 0)
 
             task.completed_at = datetime.now()
-            agent.current_task_id = None
+            _set_current_task(task.agent_name, None)
 
         except Exception as e:
             logger.error(f"调度循环异常: {e}")
@@ -570,8 +673,9 @@ async def shutdown():
 @app.get("/metrics")
 async def metrics():
     status_counts = {}
-    for agent in agents.values():
-        s = agent.status.value
+    for name, agent in agents.items():
+        acb = agent_controls.get(name)
+        s = (acb.status if acb is not None else agent.status).value
         status_counts[s] = status_counts.get(s, 0) + 1
 
     result = {

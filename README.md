@@ -121,13 +121,19 @@ curl -s http://127.0.0.1:8234/tasks/<task_id>
 ## 当前进度
 agentd 接入 LLM：支持 mock / deepseek，可由 configs/runtime.json 或环境变量切换。
 
-调度器：支持 fifo / dag。dag 支持任务依赖、动态任务、失败级联。
+ACB（Agent Control Block）：新增 Agent 运行态控制块，集中记录状态、当前任务、资源配额、上下文句柄、故障域、trace_id 和 timeline；可通过 `/agents/{agent_name}/acb` 查询。
+
+调度器：支持 fifo / dag / kernel。dag 支持任务依赖和动态任务；kernel 支持 ready / running / waiting / blocked 队列，可通过 `SCHEDULER_TYPE=kernel` 启用，并通过 `/scheduler/queues` 查询队列快照。
+
+故障隔离：任务默认 `failure_policy=isolate`，单个 Agent 任务失败不会默认级联失败下游任务；显式设置 `failure_policy=fail-closed` 时才阻断强依赖下游。
 
 资源感知调度：支持 `resource_aware` 模式，基于 `psutil` 采集 CPU / 内存，支持全局与单 Agent 的 LLM 并发控制。
 
-上下文管理：支持按 `context_id` 复用上下文，区分 shared / private 数据，支持超阈值压缩，并在 `/metrics` 输出上下文统计。
+上下文管理：支持按 `context_id` 复用上下文，区分 shared / private 数据，支持超阈值压缩；新增 Semantic Context（version、shared/private keys）和 Execution Context（prefix cache key、token_count、reused_tokens、saved_tokens、cache_hit_ratio）统计，并在 `/metrics` 输出 token/cache 指标。
 
 Agent 生命周期管理：支持注册、提交任务、查询任务状态。
+
+任务查询：`/tasks/{task_id}` 返回任务结果，同时包含 Agent runtime 摘要（agent_status、current_task_id、trace_id）。
 
 Agent 执行模型：每个 Agent 为独立进程（worker），agentd 通过 UDS 下发任务并回传结果。
 
@@ -142,11 +148,17 @@ core/test_lifecycle_core.py:测试Agent生命周期状态。
 
 验证状态转换的合法性（如CREATED->READY->RUNNING->COMPLETED）以及非法转换能否正确拦截
 
-scheduler/test_dag.py:DAG 调度器单元测试（依赖、动态任务、失败级联、拓扑排序）。
+core/test_acb.py:测试 ACB 运行态控制块。
+
+验证 ACB 从 AgentSpec 初始化、状态转换 timeline 记录、资源配额和上下文句柄序列化。
+
+scheduler/test_dag.py:DAG 调度器单元测试（依赖、动态任务、默认故障隔离、显式 fail-closed、拓扑排序）。
+
+scheduler/test_kernel.py:Kernel 调度器单元测试（ready/running/waiting/blocked 队列、依赖唤醒、priority 排序、默认故障隔离、显式 fail-closed）。
 
 scheduler/test_resource_aware.py:资源感知调度器单元测试（资源检查、LLM 并发控制、FIFO/DAG 包装行为）。
 
-context/test_manager.py:上下文管理器单元测试（上下文复用、shared/private 隔离、压缩与 metrics）。
+context/test_manager.py:上下文管理器单元测试（上下文复用、shared/private 隔离、压缩、Semantic Context、Execution Context、token/cache metrics）。
 
 api/test_client.py:SDK（AgentRuntimeClient）单元测试。
 
@@ -155,7 +167,7 @@ comm/test_router.py:消息路由器（mailbox）单元测试。
 
 daemon/test_lifecycle.py:测试通过agentd API操作时Agent生命周期是否按预期流转。
 
-覆盖创建 Agent、提交任务、依赖任务校验、DAG 依赖阻塞与失败级联、消息收发等场景。
+覆盖创建 Agent、ACB 查询、提交任务、依赖任务校验、DAG 依赖阻塞、故障隔离、显式 fail-closed、消息收发等场景。
 
 daemon/test_resource_aware.py:资源感知调度集成测试。
 

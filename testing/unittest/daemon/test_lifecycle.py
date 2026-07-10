@@ -35,6 +35,42 @@ class TestAgentLifecycleAPI:
         data = resp.json()
         assert data["status"] == "READY"
 
+    def test_agent_acb_endpoint_returns_runtime_state(self, client):
+        """ACB 接口返回 Agent 运行态、资源配额和 timeline"""
+        suffix = str(int(time.time() * 1000))
+        agent_name = f"lifecycle_test_acb_{suffix}"
+        resp = client.post("/agents", json={
+            "agent_name": agent_name,
+            "role": "测试员",
+            "memory_max_bytes": 1024,
+            "cpu_max": "50000 100000",
+        })
+        assert resp.status_code == 200
+
+        resp = client.get(f"/agents/{agent_name}/acb")
+        assert resp.status_code == 200
+        acb = resp.json()
+        assert acb["agent_name"] == agent_name
+        assert acb["status"] == "READY"
+        assert acb["current_task_id"] is None
+        assert acb["resource_quota"]["memory_max_bytes"] == 1024
+        assert acb["resource_quota"]["cpu_max"] == "50000 100000"
+        assert acb["context_handle"] == {"context_id": None}
+        assert acb["fault_domain"] == agent_name
+        assert acb["trace_id"].startswith("trace_")
+        assert any(e["to_status"] == "READY" for e in acb["timeline"])
+
+    def test_scheduler_queues_endpoint_returns_queue_shape(self, client):
+        """调度队列接口返回 ready/running/waiting/blocked 四类队列"""
+        resp = client.get("/scheduler/queues")
+        assert resp.status_code == 200
+        queues = resp.json()
+        assert set(queues.keys()) == {"ready", "running", "waiting", "blocked"}
+        assert isinstance(queues["ready"], list)
+        assert isinstance(queues["running"], list)
+        assert isinstance(queues["waiting"], list)
+        assert isinstance(queues["blocked"], list)
+
     def test_list_agents_shows_status(self, client):
         """列出 Agent 应包含状态信息"""
         suffix = str(int(time.time() * 1000))
@@ -74,7 +110,11 @@ class TestAgentLifecycleAPI:
         assert lifecycle_test["status"] == "COMPLETED"
         # 检查任务状态
         resp = client.get(f"/tasks/{task_id}")
-        assert resp.json()["status"] == "SUCCESS"
+        task_data = resp.json()
+        assert task_data["status"] == "SUCCESS"
+        assert task_data["runtime"]["agent_name"] == agent_name
+        assert task_data["runtime"]["agent_status"] == "COMPLETED"
+        assert task_data["runtime"]["trace_id"].startswith("trace_")
 
     def test_submit_task_to_busy_agent(self, client):
         """Agent 正在执行时提交新任务应该返回 409"""
@@ -329,7 +369,7 @@ class TestAgentLifecycleAPI:
         data_b = wait_task_done(client, task_b, timeout_s=10.0)
         assert data_b["status"] == "SUCCESS"
 
-    def test_dag_dependency_failure_cascades(self, client):
+    def test_dag_dependency_failure_isolated_by_default(self, client):
         suffix = str(int(time.time() * 1000))
         agent_a = f"dag_fail_a_{suffix}"
         agent_b = f"dag_fail_b_{suffix}"
@@ -354,17 +394,50 @@ class TestAgentLifecycleAPI:
         data_a = wait_task_done(client, task_a, timeout_s=10.0)
         assert data_a["status"] == "FAILED"
 
-        deadline = time.time() + 10.0
+        deadline = time.time() + 2.0
         while time.time() < deadline:
             rb = client.get(f"/tasks/{task_b}")
             assert rb.status_code == 200
             task_b_status = rb.json()["status"]
             assert task_b_status != "RUNNING"
-            if task_b_status == "FAILED":
+            assert task_b_status != "FAILED"
+            time.sleep(0.1)
+
+    def test_dag_dependency_failure_fail_closed_cascades(self, client):
+        suffix = str(int(time.time() * 1000))
+        agent_a = f"dag_fail_closed_a_{suffix}"
+        agent_b = f"dag_fail_closed_b_{suffix}"
+        client.post("/agents", json={"agent_name": agent_a, "role": "测试员"})
+        client.post("/agents", json={"agent_name": agent_b, "role": "测试员"})
+
+        resp_a = client.post("/tasks", json={
+            "agent_name": agent_a,
+            "task_input": {"request": "任务A失败", "__test": {"sleep_ms": 800, "force_error": True}},
+            "failure_policy": "fail-closed",
+        })
+        assert resp_a.status_code == 200
+        task_a = resp_a.json()["task_id"]
+
+        resp_b = client.post("/tasks", json={
+            "agent_name": agent_b,
+            "task_input": {"request": "任务B依赖A", "__test": {"sleep_ms": 800}},
+            "dependencies": [task_a],
+        })
+        assert resp_b.status_code == 200
+        task_b = resp_b.json()["task_id"]
+
+        data_a = wait_task_done(client, task_a, timeout_s=10.0)
+        assert data_a["status"] == "FAILED"
+
+        deadline = time.time() + 10.0
+        while time.time() < deadline:
+            rb = client.get(f"/tasks/{task_b}")
+            assert rb.status_code == 200
+            if rb.json()["status"] == "FAILED":
                 return
             time.sleep(0.1)
 
-        raise AssertionError("依赖任务失败后，未观察到下游任务进入 FAILED")
+        raise AssertionError("fail-closed 下游任务未进入 FAILED")
 
 
 class TestAgentDuplicateAndKill:

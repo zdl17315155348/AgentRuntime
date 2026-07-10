@@ -9,11 +9,13 @@ from aruntime.core.models import AgentStatus
 # 格式：当前状态 → 允许转换到的下一个状态集合
 ALLOWED_TRANSITIONS = {
     AgentStatus.CREATED:   {AgentStatus.READY, AgentStatus.KILLED},
-    AgentStatus.READY:     {AgentStatus.RUNNING, AgentStatus.KILLED},
-    AgentStatus.RUNNING:   {AgentStatus.COMPLETED, AgentStatus.FAILED, AgentStatus.WAITING, AgentStatus.KILLED},
-    AgentStatus.WAITING:   {AgentStatus.READY, AgentStatus.KILLED},
-    AgentStatus.FAILED:    {AgentStatus.READY, AgentStatus.KILLED},   # 失败后可重试回到 READY
+    AgentStatus.READY:     {AgentStatus.RUNNING, AgentStatus.SUSPENDED, AgentStatus.ISOLATED, AgentStatus.KILLED},
+    AgentStatus.RUNNING:   {AgentStatus.COMPLETED, AgentStatus.FAILED, AgentStatus.WAITING, AgentStatus.SUSPENDED, AgentStatus.ISOLATED, AgentStatus.KILLED},
+    AgentStatus.WAITING:   {AgentStatus.READY, AgentStatus.SUSPENDED, AgentStatus.ISOLATED, AgentStatus.KILLED},
+    AgentStatus.FAILED:    {AgentStatus.READY, AgentStatus.ISOLATED, AgentStatus.KILLED},   # 失败后可重试回到 READY
     AgentStatus.COMPLETED: {AgentStatus.READY, AgentStatus.KILLED},
+    AgentStatus.SUSPENDED: {AgentStatus.READY, AgentStatus.ISOLATED, AgentStatus.KILLED},
+    AgentStatus.ISOLATED:  {AgentStatus.READY, AgentStatus.KILLED},
     AgentStatus.KILLED:    set(),        # 终态，不可转换
 }
 
@@ -21,7 +23,13 @@ class InvalidTransitionError(Exception):
     """不合法的状态转换异常"""
     pass
 
-def transition_to(agent, new_status: AgentStatus) -> None:
+def transition_to(
+    agent,
+    new_status: AgentStatus,
+    task_id: str | None = None,
+    reason: str = "",
+    detail: dict | None = None,
+) -> None:
     """
     将 Agent 转换到新状态
     如果转换不合法，抛出 InvalidTransitionError
@@ -39,9 +47,13 @@ def transition_to(agent, new_status: AgentStatus) -> None:
             f"（允许的目标: {[s.value for s in allowed]}）"
         )
     
+    if hasattr(agent, "record_transition"):
+        agent.record_transition(current, new_status, task_id=task_id, reason=reason, detail=detail)
+
     agent.status = new_status
     from datetime import datetime
-    agent.updated_at = datetime.now()
+    if hasattr(agent, "updated_at"):
+        agent.updated_at = datetime.now()
 
 def can_transition_to(agent, new_status: AgentStatus) -> bool:
     """检查是否能转换到目标状态（不执行转换）"""

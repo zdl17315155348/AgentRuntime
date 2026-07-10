@@ -12,6 +12,8 @@ class AgentStatus(str, Enum):
     WAITING = "WAITING"      # 等待依赖任务完成
     FAILED = "FAILED"        # 执行失败
     COMPLETED = "COMPLETED"  # 执行成功
+    SUSPENDED = "SUSPENDED"  # 已暂停
+    ISOLATED = "ISOLATED"    # 已隔离
     KILLED = "KILLED"        # 被终止
 
 
@@ -24,6 +26,15 @@ class TaskStatus(str, Enum):
     CANCELLED = "CANCELLED"  # 被取消
 
 
+class FailurePolicy(str, Enum):
+    RETRY = "retry"
+    FALLBACK = "fallback"
+    DEGRADE = "degrade"
+    FAIL_OPEN = "fail-open"
+    FAIL_CLOSED = "fail-closed"
+    ISOLATE = "isolate"
+
+
 class TaskSpec(BaseModel):
     task_id: str = Field(default_factory=lambda: f"task_{datetime.now().timestamp()}")
     agent_name: str
@@ -31,6 +42,7 @@ class TaskSpec(BaseModel):
     context_id: Optional[str] = None
     priority: int = 0
     dependencies: List[str] = []       # 依赖的任务 ID 列表
+    failure_policy: FailurePolicy = FailurePolicy.ISOLATE
     status: TaskStatus = TaskStatus.PENDING
     result: Optional[Dict[str, Any]] = None
     error: Optional[str] = None

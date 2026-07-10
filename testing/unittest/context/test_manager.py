@@ -1,6 +1,15 @@
 from aruntime.context.manager import ContextManager
 
 
+def assert_base_context(payload, context_id, shared, private, compressed=False):
+    assert payload["context_id"] == context_id
+    assert payload["shared"] == shared
+    assert payload["private"] == private
+    assert payload["compressed"] is compressed
+    assert "semantic" in payload
+    assert "execution" in payload
+
+
 def test_context_reuse_shared_and_private_data():
     manager = ContextManager(compress_threshold_chars=1000)
 
@@ -23,18 +32,18 @@ def test_context_reuse_shared_and_private_data():
         "repo": "agent-runtime-os",
         "plan": "fix tests",
     }
-    assert manager.build_agent_context("ctx-code-repair", "planner") == {
-        "context_id": "ctx-code-repair",
-        "shared": {"repo": "agent-runtime-os", "plan": "fix tests"},
-        "private": {"note": "planner-only"},
-        "compressed": False,
-    }
-    assert manager.build_agent_context("ctx-code-repair", "coder") == {
-        "context_id": "ctx-code-repair",
-        "shared": {"repo": "agent-runtime-os", "plan": "fix tests"},
-        "private": {"note": "coder-only"},
-        "compressed": False,
-    }
+    assert_base_context(
+        manager.build_agent_context("ctx-code-repair", "planner"),
+        "ctx-code-repair",
+        {"repo": "agent-runtime-os", "plan": "fix tests"},
+        {"note": "planner-only"},
+    )
+    assert_base_context(
+        manager.build_agent_context("ctx-code-repair", "coder"),
+        "ctx-code-repair",
+        {"repo": "agent-runtime-os", "plan": "fix tests"},
+        {"note": "coder-only"},
+    )
 
 
 def test_private_data_is_isolated_per_agent():
@@ -116,12 +125,12 @@ def test_metrics_track_reuse_and_compression():
 def test_missing_context_returns_empty_payload_without_build_hit():
     manager = ContextManager(compress_threshold_chars=1000)
 
-    assert manager.build_agent_context("ctx-missing", "planner") == {
-        "context_id": "ctx-missing",
-        "shared": {},
-        "private": {},
-        "compressed": False,
-    }
+    assert_base_context(
+        manager.build_agent_context("ctx-missing", "planner"),
+        "ctx-missing",
+        {},
+        {},
+    )
     assert manager.get_metrics()["build_hits"] == 0
 
 
@@ -242,3 +251,45 @@ def test_large_private_data_triggers_compression():
     assert ctx.compressed is True
     assert manager.get_metrics()["compression_count"] == 1
     assert manager.build_agent_context("ctx-large-private", "planner")["private"] == {}
+
+
+def test_execution_context_tracks_prefix_cache_hit_and_saved_tokens():
+    manager = ContextManager(compress_threshold_chars=1000)
+    manager.record_task_context(
+        context_id="ctx-cache",
+        agent_name="planner",
+        shared_data={"repo": "agent-runtime-os", "plan": "fix"},
+        private_data={"note": "first"},
+    )
+
+    first = manager.build_agent_context("ctx-cache", "planner")
+    second = manager.build_agent_context("ctx-cache", "planner")
+
+    assert first["execution"]["cache_hit"] is False
+    assert second["execution"]["cache_hit"] is True
+    assert second["execution"]["reused_tokens"] > 0
+    assert second["execution"]["saved_tokens"] > 0
+    assert second["execution"]["cache_hit_ratio"] == 0.5
+
+    metrics = manager.get_metrics()
+    assert metrics["cache_hits"] == 1
+    assert metrics["cache_hit_ratio"] == 0.5
+    assert metrics["original_tokens"] > 0
+    assert metrics["saved_tokens"] > 0
+    assert metrics["token_saved_ratio"] > 0
+
+
+def test_semantic_context_reports_version_and_keys():
+    manager = ContextManager(compress_threshold_chars=1000)
+    manager.record_task_context(
+        context_id="ctx-semantic",
+        agent_name="planner",
+        shared_data={"repo": "agent-runtime-os"},
+        private_data={"note": "planner-only"},
+    )
+
+    built = manager.build_agent_context("ctx-semantic", "planner")
+
+    assert built["semantic"]["version"] == 2
+    assert built["semantic"]["shared_keys"] == ["repo"]
+    assert built["semantic"]["private_keys"] == ["note"]

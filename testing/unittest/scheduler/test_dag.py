@@ -3,7 +3,7 @@ DAG 调度器单元测试
 """
 
 import pytest
-from aruntime.core.models import TaskSpec, TaskStatus
+from aruntime.core.models import FailurePolicy, TaskSpec, TaskStatus
 from aruntime.scheduler.dag import DAGScheduler
 
 
@@ -91,8 +91,8 @@ def test_dag_multiple_dependencies():
     assert dequeued.task_id == "task3"
 
 
-def test_dag_cascade_failure():
-    """测试级联失败"""
+def test_dag_failure_is_isolated_by_default():
+    """默认失败隔离，不级联失败下游任务"""
     scheduler = DAGScheduler()
     
     task1 = TaskSpec(task_id="task1", agent_name="agent1", task_input={})
@@ -105,7 +105,28 @@ def test_dag_cascade_failure():
     scheduler.dequeue()
     scheduler.fail_task("task1")
     
-    # task2 应该也失败了
+    assert "task1" in scheduler.failed_tasks
+    assert "task2" not in scheduler.failed_tasks
+    assert task2.status == TaskStatus.PENDING
+
+
+def test_dag_fail_closed_cascades_failure():
+    """显式 fail-closed 时级联失败"""
+    scheduler = DAGScheduler()
+
+    task1 = TaskSpec(
+        task_id="task1",
+        agent_name="agent1",
+        task_input={},
+        failure_policy=FailurePolicy.FAIL_CLOSED,
+    )
+    task2 = TaskSpec(task_id="task2", agent_name="agent2", task_input={}, dependencies=["task1"])
+
+    scheduler.enqueue(task1)
+    scheduler.enqueue(task2)
+    scheduler.dequeue()
+    scheduler.fail_task("task1")
+
     assert "task2" in scheduler.failed_tasks
     assert task2.status == TaskStatus.FAILED
 

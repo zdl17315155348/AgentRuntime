@@ -6,7 +6,7 @@ DAG 调度器
 from typing import Optional, List, Dict, Set
 from collections import defaultdict, deque
 
-from aruntime.core.models import TaskSpec, TaskStatus
+from aruntime.core.models import FailurePolicy, TaskSpec, TaskStatus
 from aruntime.scheduler.base import BaseScheduler
 
 
@@ -105,17 +105,20 @@ class DAGScheduler(BaseScheduler):
         """
         标记任务失败
         
-        失败策略：
-        - 标记任务为失败
-        - 所有依赖此任务的任务也标记为失败（级联失败）
+        默认失败策略为 isolate：
+        - 只记录当前失败任务
+        - 不默认级联失败下游任务
+        - 下游任务保持等待，等待后续容错策略处理
+        显式 fail-closed 时才阻断下游。
         """
         if task_id not in self.nodes:
             return
         
         self.failed_tasks.add(task_id)
         node = self.nodes[task_id]
+        if node.task.failure_policy != FailurePolicy.FAIL_CLOSED:
+            return
         
-        # 级联失败：所有依赖此任务的任务也失败
         for dependent_id in node.dependents:
             if dependent_id in self.nodes and dependent_id not in self.failed_tasks:
                 dep_node = self.nodes[dependent_id]
