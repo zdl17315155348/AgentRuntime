@@ -2,15 +2,15 @@
 import asyncio
 import logging
 from datetime import datetime
-from typing import Dict
+from typing import Dict, Optional
 import subprocess
-import sys
+import secrets
 
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
 
 from aruntime.core.acb import AgentControlBlock
-from aruntime.core.models import AgentSpec, FailurePolicy, TaskSpec, TaskStatus, AgentStatus
+from aruntime.core.models import AgentSpec, FailurePolicy, FailureMode, TaskAttempt, TaskSpec, TaskStatus, AgentStatus
 from aruntime.core.lifecycle import transition_to, InvalidTransitionError
 from aruntime.scheduler.fifo import FIFOScheduler
 from aruntime.scheduler.dag import DAGScheduler
@@ -24,7 +24,13 @@ from aruntime.comm.transport import start_uds_server
 from aruntime.context.manager import ContextManager
 from aruntime.resource.cgroup import apply_cgroup_v2
 from aruntime.resource.monitor import ResourceMonitor
+from aruntime.resource.types import ResourceClass, ResourceLease, ResourceRequest
 from aruntime.scheduler.resource_aware import ResourceAwareScheduler
+from aruntime.observability import TraceRecorder
+from aruntime.daemon.fault_service import WorkerFaultState, retry_backoff_seconds
+from aruntime.daemon.recovery_service import recover_tasks
+from aruntime.daemon.store import SQLiteStateStore
+from aruntime.daemon.worker_service import json_log, start_worker_process
 
 import json
 
@@ -81,18 +87,44 @@ tasks: Dict[str, TaskSpec] = {}
 
 # 初始化调度器
 SCHEDULER_TYPE = os.getenv("SCHEDULER_TYPE", scheduler_config.get("type", "fifo"))
+SCHEDULER_POLICY = os.getenv("SCHEDULER_POLICY", scheduler_config.get("policy", "priority"))
 resource_aware = os.getenv("RESOURCE_AWARE", "").lower() in ("true", "1", "yes") or scheduler_config.get("resource_aware", False)
-resource_monitor: ResourceMonitor | None = None
+resource_monitor: ResourceMonitor = ResourceMonitor()
+
+
+def _resource_request_for_task(task: TaskSpec, agent: AgentSpec) -> ResourceRequest:
+    raw = dict(task.resource_request or {})
+    if agent.memory_max_bytes:
+        raw.setdefault(ResourceClass.MEMORY.value, float(agent.memory_max_bytes))
+    if task.token_budget:
+        raw.setdefault(ResourceClass.TOKEN.value, float(task.token_budget))
+    return ResourceRequest.from_dict(raw)
+
+
+def _kernel_resource_checker(task: TaskSpec) -> tuple[bool, str]:
+    agent = agents.get(task.agent_name)
+    if agent is None:
+        return False, "agent_missing"
+    ok, reason = resource_monitor.can_allocate(_resource_request_for_task(task, agent))
+    return ok, reason
 
 if SCHEDULER_TYPE == "kernel":
-    _inner: BaseScheduler = KernelScheduler()
+    _inner: BaseScheduler = KernelScheduler(
+        policy=SCHEDULER_POLICY,
+        resource_checker=_kernel_resource_checker if resource_monitor is not None else None,
+    )
+elif SCHEDULER_TYPE in ("fifo", "priority", "resource_aware", "fair_share", "deadline"):
+    policy = "resource_aware" if SCHEDULER_TYPE == "resource_aware" else SCHEDULER_TYPE
+    _inner: BaseScheduler = KernelScheduler(
+        policy=policy,
+        resource_checker=_kernel_resource_checker if resource_monitor is not None else None,
+    )
 elif SCHEDULER_TYPE == "dag":
     _inner: BaseScheduler = DAGScheduler()
 else:
     _inner: BaseScheduler = FIFOScheduler()
 
-if resource_aware:
-    resource_monitor = ResourceMonitor()
+if resource_aware and not isinstance(_inner, KernelScheduler):
     scheduler: BaseScheduler = ResourceAwareScheduler(_inner, resource_monitor, agents)
 else:
     scheduler: BaseScheduler = _inner
@@ -100,13 +132,48 @@ else:
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("agentd")
 
+state_store = SQLiteStateStore()
 agent_inflight_tasks: Dict[str, int] = {}
-message_router = MessageRouter()
+agent_auth_tokens: Dict[str, str] = {}
+fault_states: Dict[str, WorkerFaultState] = {}
+message_router = MessageRouter(store=state_store)
 uds_server = None
 agent_workers: Dict[str, subprocess.Popen] = {}
 pending_task_results: Dict[str, asyncio.Future] = {}
+trace_recorder = TraceRecorder()
+scheduler_event: asyncio.Event | None = None
+global_dispatch_semaphore: asyncio.Semaphore | None = None
+agent_dispatch_semaphores: Dict[str, asyncio.Semaphore] = {}
+llm_usage_totals = {
+    "input_tokens": 0,
+    "output_tokens": 0,
+    "total_tokens": 0,
+    "latency_ms_total": 0.0,
+    "calls": 0,
+    "prefix_cache_hits": 0,
+    "logical_context_reuse_hits": 0,
+}
 
 app = FastAPI(title="Agent Runtime Daemon", version="0.1.0")
+
+
+def _persist_agent(agent_name: str) -> None:
+    agent = agents.get(agent_name)
+    if agent is None:
+        return
+    proc = agent_workers.get(agent_name)
+    fault = fault_states.get(agent_name)
+    state_store.save_agent(
+        agent,
+        worker_pid=(proc.pid if proc is not None else None),
+        auth_token=agent_auth_tokens.get(agent_name, ""),
+        last_heartbeat=(fault.last_heartbeat if fault else None),
+    )
+
+
+def _persist_task(task: TaskSpec | None) -> None:
+    if task is not None:
+        state_store.save_task(task)
 
 
 def _sync_agent_from_acb(agent_name: str) -> None:
@@ -129,9 +196,11 @@ def _transition_agent(
     if acb is not None:
         transition_to(acb, new_status, task_id=task_id, reason=reason)
         _sync_agent_from_acb(agent_name)
+        _persist_agent(agent_name)
         return
     agent = agents[agent_name]
     transition_to(agent, new_status, task_id=task_id, reason=reason)
+    _persist_agent(agent_name)
 
 
 def _set_current_task(agent_name: str, task_id: str | None) -> None:
@@ -141,6 +210,7 @@ def _set_current_task(agent_name: str, task_id: str | None) -> None:
     agent = agents.get(agent_name)
     if agent is not None:
         agent.current_task_id = task_id
+        _persist_agent(agent_name)
 
 
 def _set_context_handle(agent_name: str, context_id: str | None) -> None:
@@ -148,21 +218,28 @@ def _set_context_handle(agent_name: str, context_id: str | None) -> None:
     if acb is not None:
         acb.set_context(context_id)
 
+
+def _wake_scheduler() -> None:
+    if scheduler_event is not None:
+        scheduler_event.set()
+
+
+def _agent_semaphore(agent_name: str) -> asyncio.Semaphore:
+    agent = agents.get(agent_name)
+    limit = max(int(agent.llm_max_concurrent if agent else 1), 1)
+    sem = agent_dispatch_semaphores.get(agent_name)
+    if sem is None:
+        sem = asyncio.Semaphore(limit)
+        agent_dispatch_semaphores[agent_name] = sem
+    return sem
+
+
 def _start_worker(agent_name: str) -> subprocess.Popen:
     uds_path = os.getenv("AGENTD_UDS_PATH", "/tmp/agent-runtime-agentd.sock")
-    env = os.environ.copy()
-    env["AGENT_NAME"] = agent_name
-    env["AGENTD_UDS_PATH"] = uds_path
-    env["LLM_BACKEND"] = llm_gateway.backend
-    env["LLM_API_KEY"] = llm_gateway.api_key or ""
-    proc = subprocess.Popen(
-        [sys.executable, "-m", "aruntime.worker.agent_worker"],
-        cwd=os.path.join(os.path.dirname(__file__), "..", ".."),
-        env=env,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
+    token = agent_auth_tokens.setdefault(agent_name, secrets.token_urlsafe(24))
+    proc = start_worker_process(agent_name, uds_path, llm_gateway.backend, llm_gateway.api_key or "", token)
     agent_workers[agent_name] = proc
+    fault_states.setdefault(agent_name, WorkerFaultState(agent_name=agent_name, fault_domain=agent_name)).heartbeat()
     acb = agent_controls.get(agent_name)
     if acb is not None:
         acb.ipc_endpoint = uds_path
@@ -178,6 +255,7 @@ def _start_worker(agent_name: str) -> subprocess.Popen:
         )
         if cg.get("ok") is not True and cg.get("error"):
             logger.info(f"cgroup 未生效: {cg.get('error')}")
+        _persist_agent(agent_name)
     return proc
 
 
@@ -197,6 +275,63 @@ def _stop_worker(agent_name: str) -> None:
         except Exception:
             pass
     agent_workers.pop(agent_name, None)
+    _persist_agent(agent_name)
+
+
+def _isolate_failed_worker(agent_name: str, task_id: str, error: str) -> None:
+    agent = agents.get(agent_name)
+    if agent is None:
+        return
+    if agent.status not in (AgentStatus.FAILED, AgentStatus.KILLED):
+        try:
+            _transition_agent(agent_name, AgentStatus.FAILED, task_id=task_id, reason="worker.failed")
+        except InvalidTransitionError:
+            agent.status = AgentStatus.FAILED
+    acb = agent_controls.get(agent_name)
+    if acb is not None:
+        acb.record_event("worker.isolated", task_id=task_id, reason="worker.failed", detail={"error": error})
+    resource_monitor.reclaim(task_id, reason=error)
+    state_store.release_leases_for_task(task_id, reason=error)
+    _stop_worker(agent_name)
+    fault = fault_states.setdefault(agent_name, WorkerFaultState(agent_name=agent_name, fault_domain=agent_name))
+    if agent.status != AgentStatus.KILLED and fault.can_restart():
+        fault.record_restart()
+        _start_worker(agent_name)
+    _persist_agent(agent_name)
+
+
+def _prepare_fallback_attempt(task: TaskSpec, fallback_agent: str) -> TaskAttempt | None:
+    if fallback_agent not in agents:
+        task.error = f"fallback agent '{fallback_agent}' not found"
+        return None
+    test_cfg = task.task_input.get("__test")
+    if isinstance(test_cfg, dict):
+        test_cfg.pop("crash_worker", None)
+    attempt = task.create_attempt(
+        fallback_agent,
+        worker_pid=(agent_workers.get(fallback_agent).pid if fallback_agent in agent_workers else None),
+    )
+    task.scheduler_decision_reason = f"fallback:{task.agent_name}->{fallback_agent}"
+    agent_inflight_tasks[fallback_agent] = agent_inflight_tasks.get(fallback_agent, 0) + 1
+    fault_states.setdefault(task.agent_name, WorkerFaultState(agent_name=task.agent_name, fault_domain=task.agent_name)).record_fallback(
+        task.task_id,
+        task.agent_name,
+        fallback_agent,
+        attempt.attempt_id,
+    )
+    _persist_task(task)
+    return attempt
+
+
+def _prepare_agent_for_task(task: TaskSpec, reason: str) -> None:
+    agent = agents.get(task.agent_name)
+    if agent is None:
+        return
+    if agent.status in (AgentStatus.COMPLETED, AgentStatus.FAILED):
+        _transition_agent(task.agent_name, AgentStatus.READY, task_id=task.task_id, reason=f"{reason}.ready")
+    _set_context_handle(task.agent_name, task.context_id or None)
+    _transition_agent(task.agent_name, AgentStatus.RUNNING, task_id=task.task_id, reason=reason)
+    _set_current_task(task.agent_name, task.task_id)
 
 
 class CreateAgentRequest(BaseModel):
@@ -213,8 +348,31 @@ class SubmitTaskRequest(BaseModel):
     task_input: dict
     context_id: str = ""
     priority: int = 0
-    dependencies: list[str] = []
-    failure_policy: FailurePolicy = FailurePolicy.ISOLATE
+    deadline: Optional[datetime] = None
+    resource_request: dict = Field(default_factory=dict)
+    token_budget: Optional[int] = None
+    timeout: Optional[float] = None
+    parent_task_id: str = ""
+    trace_id: str = ""
+    dependencies: list[str] = Field(default_factory=list)
+    dependency_failure_policies: dict[str, FailureMode] = Field(default_factory=dict)
+    on_failure: dict[str, FailureMode] = Field(default_factory=dict)
+    failure_policy: FailurePolicy = Field(default_factory=FailurePolicy)
+
+    @field_validator("failure_policy", mode="before")
+    @classmethod
+    def normalize_failure_policy(cls, value):
+        return FailurePolicy.from_legacy(value)
+
+    @field_validator("dependency_failure_policies", "on_failure", mode="before")
+    @classmethod
+    def normalize_edge_failure_policy(cls, value):
+        if not value:
+            return {}
+        return {
+            str(dep_id): FailureMode(mode.value if isinstance(mode, FailureMode) else str(mode).replace("-", "_"))
+            for dep_id, mode in dict(value).items()
+        }
 
 
 class SubmitDynamicTaskRequest(BaseModel):
@@ -223,7 +381,29 @@ class SubmitDynamicTaskRequest(BaseModel):
     parent_task_id: str = ""
     context_id: str = ""
     priority: int = 0
-    failure_policy: FailurePolicy = FailurePolicy.ISOLATE
+    deadline: Optional[datetime] = None
+    resource_request: dict = Field(default_factory=dict)
+    token_budget: Optional[int] = None
+    timeout: Optional[float] = None
+    trace_id: str = ""
+    dependency_failure_policies: dict[str, FailureMode] = Field(default_factory=dict)
+    on_failure: dict[str, FailureMode] = Field(default_factory=dict)
+    failure_policy: FailurePolicy = Field(default_factory=FailurePolicy)
+
+    @field_validator("failure_policy", mode="before")
+    @classmethod
+    def normalize_failure_policy(cls, value):
+        return FailurePolicy.from_legacy(value)
+
+    @field_validator("dependency_failure_policies", "on_failure", mode="before")
+    @classmethod
+    def normalize_edge_failure_policy(cls, value):
+        if not value:
+            return {}
+        return {
+            str(dep_id): FailureMode(mode.value if isinstance(mode, FailureMode) else str(mode).replace("-", "_"))
+            for dep_id, mode in dict(value).items()
+        }
 
 
 class SendMessageRequest(BaseModel):
@@ -241,11 +421,126 @@ def _record_task_context(context_id: str, agent_name: str, task_input: dict) -> 
         context = {}
     shared_data = context.get("shared", {})
     private_data = context.get("private", {})
+    readonly_data = context.get("readonly", context.get("readonly_context", {}))
     if not isinstance(shared_data, dict):
         shared_data = {}
     if not isinstance(private_data, dict):
         private_data = {}
-    context_manager.record_task_context(context_id, agent_name, shared_data, private_data)
+    if not isinstance(readonly_data, dict):
+        readonly_data = {}
+    context_manager.record_task_context(context_id, agent_name, shared_data, private_data, readonly_data)
+
+
+def _record_trace_event(task: TaskSpec, name: str, detail: dict | None = None) -> None:
+    trace_recorder.event(task.trace_id, task.task_id, name, detail or {})
+    state_store.save_trace_event(task.trace_id, task.task_id, name, detail or {})
+
+
+def _attempt_agent(task: TaskSpec, attempt: TaskAttempt | None = None) -> str:
+    return attempt.agent_name if attempt is not None else task.agent_name
+
+
+def _make_task(**kwargs) -> TaskSpec:
+    trace_id = kwargs.pop("trace_id", "")
+    if trace_id:
+        kwargs["trace_id"] = trace_id
+    return TaskSpec(**kwargs)
+
+
+def _edge_failure_policies(req) -> dict[str, FailureMode]:
+    result = dict(getattr(req, "dependency_failure_policies", {}) or {})
+    result.update(getattr(req, "on_failure", {}) or {})
+    return result
+
+
+def _scheduler_metrics() -> dict:
+    all_tasks = list(tasks.values())
+    queue_wait = [t.queue_wait_ms for t in all_tasks if t.queue_wait_ms is not None]
+    runtime = [t.agent_runtime_ms for t in all_tasks if t.agent_runtime_ms is not None]
+    target = scheduler._inner if hasattr(scheduler, "_inner") else scheduler
+    queues = target.queue_snapshot() if hasattr(target, "queue_snapshot") else {
+        "ready": [task.task_id for task in getattr(target, "task_queue", [])],
+        "running": [],
+        "waiting": [],
+        "failed": [],
+        "completed": [],
+    }
+    return {
+        "policy": getattr(target, "policy", SCHEDULER_TYPE),
+        "queues": queues,
+        "queue_wait_ms_avg": round(sum(queue_wait) / len(queue_wait), 3) if queue_wait else 0,
+        "agent_runtime_ms_avg": round(sum(runtime) / len(runtime), 3) if runtime else 0,
+        "decisions": {
+            t.task_id: {
+                "scheduler_decision_reason": t.scheduler_decision_reason,
+                "resource_block_reason": t.resource_block_reason,
+            }
+            for t in all_tasks
+            if t.scheduler_decision_reason or t.resource_block_reason
+        },
+        "selection_log": getattr(target, "selection_log", [])[-50:],
+    }
+
+
+def _record_llm_usage(task: TaskSpec, usage: dict) -> None:
+    if not usage:
+        return
+    task.llm_usage = usage
+    llm_usage_totals["input_tokens"] += int(usage.get("input_tokens") or 0)
+    llm_usage_totals["output_tokens"] += int(usage.get("output_tokens") or 0)
+    llm_usage_totals["total_tokens"] += int(usage.get("total_tokens") or 0)
+    llm_usage_totals["latency_ms_total"] += float(usage.get("latency_ms") or 0.0)
+    llm_usage_totals["calls"] += 1
+    if usage.get("logical_context_reuse_hit") or usage.get("prefix_cache_hit"):
+        llm_usage_totals["prefix_cache_hits"] += 1
+        llm_usage_totals["logical_context_reuse_hits"] += 1
+
+
+def _llm_metrics() -> dict:
+    calls = int(llm_usage_totals["calls"])
+    return {
+        "input_tokens": int(llm_usage_totals["input_tokens"]),
+        "output_tokens": int(llm_usage_totals["output_tokens"]),
+        "total_tokens": int(llm_usage_totals["total_tokens"]),
+        "latency_ms": round(float(llm_usage_totals["latency_ms_total"]), 3),
+        "latency_ms_avg": round(float(llm_usage_totals["latency_ms_total"]) / calls, 3) if calls else 0.0,
+        "prefix_cache_hits": int(llm_usage_totals["prefix_cache_hits"]),
+        "prefix_hit_ratio": round(int(llm_usage_totals["prefix_cache_hits"]) / calls, 4) if calls else 0.0,
+        "logical_context_reuse_hits": int(llm_usage_totals["logical_context_reuse_hits"]),
+        "logical_context_reuse_hit_ratio": round(int(llm_usage_totals["logical_context_reuse_hits"]) / calls, 4) if calls else 0.0,
+        "calls": calls,
+    }
+
+
+def _histogram(values: list[float], buckets: list[float] | None = None) -> dict:
+    buckets = buckets or [1, 10, 50, 100, 500, 1000, 5000, 10000]
+    counts = {str(bucket): 0 for bucket in buckets}
+    counts["+Inf"] = 0
+    for value in values:
+        matched = False
+        for bucket in buckets:
+            if value <= bucket:
+                counts[str(bucket)] += 1
+                matched = True
+                break
+        if not matched:
+            counts["+Inf"] += 1
+    return {
+        "count": len(values),
+        "sum": round(sum(values), 3),
+        "buckets": counts,
+    }
+
+
+def _trace_json(task: TaskSpec) -> dict:
+    context_metrics = context_manager.get_metrics()
+    return trace_recorder.to_json(
+        task_id=task.task_id,
+        queue_wait_ms=task.queue_wait_ms,
+        llm_calls=trace_recorder.event_count(task.task_id, "llm.call"),
+        token_used=trace_recorder.event_detail_sum(task.task_id, "llm.call", "total_tokens"),
+        context_hit_ratio=float(context_metrics.get("cache_hit_ratio") or 0.0),
+    )
 
 @app.post("/agents")
 async def create_agent(req: CreateAgentRequest):
@@ -264,8 +559,10 @@ async def create_agent(req: CreateAgentRequest):
     agents[agent.agent_name] = agent
     acb = AgentControlBlock.from_agent_spec(agent)
     agent_controls[agent.agent_name] = acb
+    fault_states[agent.agent_name] = WorkerFaultState(agent_name=agent.agent_name, fault_domain=agent.agent_name)
     _transition_agent(agent.agent_name, AgentStatus.READY, reason="agent.created")
     _start_worker(agent.agent_name)
+    _persist_agent(agent.agent_name)
     logger.info(f"Agent created: {agent.agent_name} (status: {agent.status})")
     return {"agent_name": agent.agent_name, "status": agent.status}
 
@@ -332,12 +629,7 @@ async def submit_task(req: SubmitTaskRequest):
         raise HTTPException(status_code=404, detail=f"Agent '{req.agent_name}' 不存在")
 
     agent = agents[req.agent_name]
-    if agent_inflight_tasks.get(req.agent_name, 0) > 0:
-        raise HTTPException(
-            status_code=409,
-            detail=f"Agent '{req.agent_name}' 当前已有未完成任务，无法接受新任务",
-        )
-    if agent.status not in (AgentStatus.READY, AgentStatus.COMPLETED, AgentStatus.FAILED):
+    if agent.status in (AgentStatus.KILLED, AgentStatus.SUSPENDED, AgentStatus.ISOLATED):
         raise HTTPException(
             status_code=409,
             detail=f"Agent '{req.agent_name}' 当前状态为 {agent.status}，无法接受新任务"
@@ -353,17 +645,29 @@ async def submit_task(req: SubmitTaskRequest):
     _record_task_context(req.context_id, req.agent_name, req.task_input)
     _set_context_handle(req.agent_name, req.context_id or None)
 
-    task = TaskSpec(
+    task = _make_task(
         agent_name=req.agent_name,
         task_input=req.task_input,
         context_id=req.context_id,
         priority=req.priority,
+        deadline=req.deadline,
+        resource_request=req.resource_request,
+        token_budget=req.token_budget,
+        timeout=req.timeout,
+        parent_task_id=req.parent_task_id or None,
+        trace_id=req.trace_id,
         dependencies=req.dependencies,
+        dependency_failure_policies=_edge_failure_policies(req),
         failure_policy=req.failure_policy,
     )
     tasks[task.task_id] = task
+    trace_recorder.ensure_trace(task.trace_id, task.task_id)
+    _record_trace_event(task, "task.created", {"agent_name": task.agent_name})
     scheduler.enqueue(task)
+    _record_trace_event(task, "scheduler.enqueue", {"status": task.status})
     agent_inflight_tasks[req.agent_name] = agent_inflight_tasks.get(req.agent_name, 0) + 1
+    _persist_task(task)
+    _wake_scheduler()
     logger.info(f"任务 {task.task_id} 已入队（依赖: {req.dependencies}，等待前面 {scheduler.pending_count - 1} 个任务）")
 
     return {"task_id": task.task_id, "status": task.status, "message": "任务已加入调度队列"}
@@ -377,12 +681,12 @@ async def submit_dynamic_task(req: SubmitDynamicTaskRequest):
     if req.agent_name not in agents:
         raise HTTPException(status_code=404, detail=f"Agent '{req.agent_name}' 不存在")
 
-    if agent_inflight_tasks.get(req.agent_name, 0) > 0:
+    agent = agents[req.agent_name]
+    if agent.status in (AgentStatus.KILLED, AgentStatus.SUSPENDED, AgentStatus.ISOLATED):
         raise HTTPException(
             status_code=409,
-            detail=f"Agent '{req.agent_name}' 当前已有未完成任务，无法接受新任务",
+            detail=f"Agent '{req.agent_name}' 当前状态为 {agent.status}，无法接受新任务"
         )
-    agent = agents[req.agent_name]
     if agent.status in (AgentStatus.COMPLETED, AgentStatus.FAILED):
         _transition_agent(req.agent_name, AgentStatus.READY, reason="task.dynamic_submit")
     
@@ -393,22 +697,34 @@ async def submit_dynamic_task(req: SubmitDynamicTaskRequest):
     _record_task_context(req.context_id, req.agent_name, req.task_input)
     _set_context_handle(req.agent_name, req.context_id or None)
 
-    task = TaskSpec(
+    task = _make_task(
         agent_name=req.agent_name,
         task_input=req.task_input,
         context_id=req.context_id,
         priority=req.priority,
+        deadline=req.deadline,
+        resource_request=req.resource_request,
+        token_budget=req.token_budget,
+        timeout=req.timeout,
+        parent_task_id=req.parent_task_id or None,
+        trace_id=req.trace_id,
         dependencies=[req.parent_task_id] if req.parent_task_id else [],
+        dependency_failure_policies=_edge_failure_policies(req),
         failure_policy=req.failure_policy,
     )
     tasks[task.task_id] = task
+    trace_recorder.ensure_trace(task.trace_id, task.task_id)
+    _record_trace_event(task, "task.created", {"agent_name": task.agent_name, "parent_task_id": req.parent_task_id})
     
     # 如果是 DAG 调度器，使用 add_dynamic_task
     if hasattr(scheduler, 'add_dynamic_task'):
         scheduler.add_dynamic_task(task, req.parent_task_id)
     else:
         scheduler.enqueue(task)
+    _record_trace_event(task, "scheduler.enqueue", {"status": task.status})
     agent_inflight_tasks[req.agent_name] = agent_inflight_tasks.get(req.agent_name, 0) + 1
+    _persist_task(task)
+    _wake_scheduler()
     
     logger.info(f"动态任务 {task.task_id} 已入队（父任务: {req.parent_task_id}）")
     return {"task_id": task.task_id, "status": task.status, "message": "动态任务已加入调度队列"}
@@ -432,8 +748,40 @@ async def get_task(task_id: str):
         "status": t.status,
         "result": t.result,
         "error": t.error,
+        "llm_usage": t.llm_usage,
+        "trace_id": t.trace_id,
+        "definition": t.definition.model_dump() if t.definition else None,
+        "tcb": t.tcb.model_dump() if t.tcb else None,
+        "attempts": [attempt.model_dump() for attempt in t.attempts],
+        "scheduler": {
+            "priority": t.priority,
+            "deadline": t.deadline.isoformat() if t.deadline else None,
+            "resource_request": t.resource_request,
+            "resource_usage": t.resource_usage,
+            "resource_lease": t.resource_lease,
+            "token_budget": t.token_budget,
+            "timeout": t.timeout,
+            "failure_policy": t.failure_policy.model_dump(),
+            "dependency_failure_policies": {k: v.value for k, v in t.dependency_failure_policies.items()},
+            "parent_task_id": t.parent_task_id,
+            "queue_wait_ms": t.queue_wait_ms,
+            "scheduler_decision_reason": t.scheduler_decision_reason,
+            "resource_block_reason": t.resource_block_reason,
+            "agent_runtime_ms": t.agent_runtime_ms,
+        },
         "runtime": runtime,
+        "trace": _trace_json(t),
     }
+
+
+@app.get("/tasks/{task_id}/trace")
+async def get_task_trace(task_id: str):
+    if task_id not in tasks:
+        raise HTTPException(status_code=404, detail="Task not found")
+    trace = _trace_json(tasks[task_id])
+    if not trace:
+        raise HTTPException(status_code=404, detail="Trace not found")
+    return trace
 
 
 @app.post("/messages")
@@ -462,7 +810,19 @@ async def receive_messages(agent_name: str, limit: int = 50):
     if limit > 200:
         limit = 200
 
-    messages = message_router.receive(agent_name, limit=limit)
+    messages = await message_router.receive(agent_name, limit=limit)
+    return {"messages": [m.model_dump() for m in messages]}
+
+
+@app.get("/messages/{agent_name}/dead-letter")
+async def receive_dead_letters(agent_name: str, limit: int = 50):
+    if agent_name not in agents:
+        raise HTTPException(status_code=404, detail=f"Agent '{agent_name}' 不存在")
+    if limit < 1:
+        limit = 1
+    if limit > 200:
+        limit = 200
+    messages = await message_router.dead_letters(agent_name, limit=limit)
     return {"messages": [m.model_dump() for m in messages]}
 
 
@@ -472,7 +832,13 @@ async def scheduler_queues():
     if hasattr(scheduler, "_inner"):
         target = scheduler._inner
     if hasattr(target, "queue_snapshot"):
-        return target.queue_snapshot()
+        snapshot = target.queue_snapshot()
+        return {
+            "ready": snapshot.get("ready", []),
+            "running": snapshot.get("running", []),
+            "waiting": snapshot.get("waiting", []),
+            "blocked": snapshot.get("blocked", []),
+        }
     return {
         "ready": [task.task_id for task in getattr(target, "task_queue", [])],
         "running": [],
@@ -482,133 +848,325 @@ async def scheduler_queues():
 
 # ───── 调度循环（后台任务） ─────
 
-async def scheduling_loop():
-    """后台不断从队列取任务并执行"""
+running_executions: set[asyncio.Task] = set()
+
+
+def _dequeue_ready_batch() -> list[TaskSpec]:
+    if hasattr(scheduler, "dispatch_ready"):
+        return scheduler.dispatch_ready()
+
+    batch: list[TaskSpec] = []
     while True:
+        task = scheduler.dequeue()
+        if task is None:
+            break
+        if not task.scheduler_decision_reason:
+            task.transition_to(TaskStatus.RUNNING, "legacy_dequeue")
+        batch.append(task)
+    return batch
+
+
+async def _run_task_once(
+    task: TaskSpec,
+    agent: AgentSpec,
+    task_payload: dict,
+    user_message: str,
+    lease: ResourceLease | None,
+    attempt: TaskAttempt | None = None,
+) -> str:
+    agent_name = _attempt_agent(task, attempt)
+    loop = asyncio.get_running_loop()
+    fut = loop.create_future()
+    pending_task_results[task.task_id] = fut
+    span_id = trace_recorder.start_span(task.trace_id, task.task_id, "agent.execute", agent_name)
+    try:
+        trace_recorder.span_event(task.task_id, span_id, "agent.dispatch", {"agent_name": agent_name})
+        _record_trace_event(task, "ipc.wait_connected", {"agent_name": agent_name})
+        ok = await message_router.wait_connected(agent_name, timeout_s=5.0)
+        if not ok:
+            proc = agent_workers.get(agent_name)
+            if proc is not None and proc.poll() is not None:
+                raise RuntimeError("agent worker crashed")
+            raise RuntimeError("agent worker not connected")
+
+        if lease is not None:
+            _record_trace_event(task, "resource.monitor", {"lease_id": lease.lease_id})
+            within_limits, limit_reason = resource_monitor.monitor_lease(lease)
+            if not within_limits:
+                raise RuntimeError(f"resource limit exceeded: {limit_reason}")
+
+        _record_trace_event(task, "ipc.send_task", {"agent_name": agent_name})
+        sent = await message_router.send_event(agent_name, {
+            "type": "exec_task",
+            "task_id": task.task_id,
+            "system_prompt": agent.system_prompt or f"你是一个{agent.role}",
+            "user_message": user_message,
+            "task_input": task_payload,
+        })
+        if not sent:
+            raise RuntimeError("failed to send exec_task")
+
+        timeout_s = task.timeout or (task.failure_policy.timeout_ms / 1000.0)
         try:
-            task = scheduler.dequeue()
-            if task is None:
-                await asyncio.sleep(0.5)
+            result = await asyncio.wait_for(fut, timeout=timeout_s)
+        except asyncio.TimeoutError:
+            raise RuntimeError("task timeout")
+
+        status = result.get("status")
+        output = result.get("output") or ""
+        error = result.get("error") or ""
+        usage = result.get("usage") or {}
+        if isinstance(usage, dict):
+            _record_llm_usage(task, usage)
+            _record_trace_event(task, "llm.call", usage)
+            if attempt is not None:
+                attempt.token_usage = usage
+                _persist_task(task)
+        if status == "SUCCESS":
+            if attempt is not None:
+                task.finish_attempt(attempt, result={"output": output}, token_usage=usage if isinstance(usage, dict) else {})
+                _persist_task(task)
+            trace_recorder.finish_span(task.task_id, span_id, "success")
+            return output
+        if attempt is not None:
+            task.finish_attempt(attempt, failure_reason=error or "worker error", token_usage=usage if isinstance(usage, dict) else {})
+            _persist_task(task)
+        raise RuntimeError(error or "worker error")
+    except Exception:
+        if attempt is not None and attempt.completed_at is None:
+            task.finish_attempt(attempt, failure_reason="worker error")
+            _persist_task(task)
+        trace_recorder.finish_span(task.task_id, span_id, "failed")
+        raise
+    finally:
+        pending_task_results.pop(task.task_id, None)
+
+
+async def _run_task_with_policy(task: TaskSpec) -> tuple[bool, str]:
+    agent = agents.get(task.agent_name)
+    if agent is None:
+        return False, f"agent '{task.agent_name}' not found"
+
+    task_payload = {}
+    if task.context_id:
+        _record_trace_event(task, "context.build", {"context_id": task.context_id, "agent_name": task.agent_name})
+        task_payload["runtime_context"] = context_manager.build_agent_context(task.context_id, task.agent_name)
+    task_payload.update(task.task_input)
+    user_message = str(task_payload)
+
+    max_attempts = max(int(task.failure_policy.max_retries or 0) + 1, 1)
+    last_error = ""
+    for attempt in range(max_attempts):
+        task_attempt = task.create_attempt(
+            task.agent_name,
+            worker_pid=(agent_workers.get(task.agent_name).pid if task.agent_name in agent_workers else None),
+        )
+        _persist_task(task)
+        try:
+            _record_trace_event(task, "resource.acquire", {"agent_name": task.agent_name})
+            lease = await resource_monitor.acquire_async(task.task_id, task.agent_name, _resource_request_for_task(task, agent))
+            if lease is None:
+                raise RuntimeError("resource lease not available")
+            task.set_resource_lease(lease.to_dict())
+            state_store.save_lease(lease)
+            _persist_task(task)
+            output = await _run_task_once(task, agent, task_payload, user_message, lease, task_attempt)
+            return True, output
+        except Exception as e:
+            last_error = str(e)
+            if task_attempt.completed_at is None:
+                task.finish_attempt(task_attempt, failure_reason=last_error)
+            trace_recorder.increment_retry(task.task_id)
+            _record_trace_event(task, "task.retry_or_reclaim", {"error": last_error, "attempt": attempt})
+            _isolate_failed_worker(task.agent_name, task.task_id, last_error)
+            await resource_monitor.reclaim_async(task.task_id, reason=last_error)
+            if attempt < max_attempts - 1:
+                await asyncio.sleep(retry_backoff_seconds(attempt))
+                continue
+            if task.failure_policy.mode == FailureMode.FALLBACK.value and task.failure_policy.fallback_agent:
                 continue
 
-            agent = agents.get(task.agent_name)
-            if agent is None:
-                task.status = TaskStatus.CANCELLED
-                agent_inflight_tasks[task.agent_name] = max(agent_inflight_tasks.get(task.agent_name, 0) - 1, 0)
-                continue
-
-            if agent.status in (AgentStatus.COMPLETED, AgentStatus.FAILED):
-                _transition_agent(task.agent_name, AgentStatus.READY, task_id=task.task_id, reason="scheduler.requeue")
-            _set_context_handle(task.agent_name, task.context_id or None)
-            _transition_agent(task.agent_name, AgentStatus.RUNNING, task_id=task.task_id, reason="scheduler.dispatch")
-            _set_current_task(task.agent_name, task.task_id)
-            logger.info(f"调度：任务 {task.task_id} → Agent '{task.agent_name}'")
-
-            system_prompt = agent.system_prompt or f"你是一个{agent.role}"
+    if task.failure_policy.mode == FailureMode.FALLBACK.value and task.failure_policy.fallback_agent:
+        fallback_agent_name = task.failure_policy.fallback_agent
+        fallback_attempt = _prepare_fallback_attempt(task, fallback_agent_name)
+        if fallback_attempt is not None:
+            _record_trace_event(task, "task.fallback", {"fallback_agent": fallback_agent_name})
+            agent = agents[fallback_agent_name]
+            try:
+                _transition_agent(fallback_agent_name, AgentStatus.RUNNING, task_id=task.task_id, reason="scheduler.fallback_dispatch")
+            except InvalidTransitionError:
+                pass
+            proc = agent_workers.get(fallback_agent_name)
+            if proc is None or proc.poll() is not None:
+                _stop_worker(fallback_agent_name)
+                _start_worker(fallback_agent_name)
             task_payload = {}
             if task.context_id:
-                task_payload["runtime_context"] = context_manager.build_agent_context(task.context_id, task.agent_name)
+                _record_trace_event(task, "context.build", {"context_id": task.context_id, "agent_name": fallback_agent_name})
+                task_payload["runtime_context"] = context_manager.build_agent_context(task.context_id, fallback_agent_name)
             task_payload.update(task.task_input)
             user_message = str(task_payload)
-
-            acquired = False
-
             try:
-                max_attempts = int(getattr(agent, "max_retries", 1) or 1)
-                if max_attempts < 1:
-                    max_attempts = 1
-
-                last_error = ""
-                success_output = None
-
-                for attempt in range(max_attempts):
-                    loop = asyncio.get_running_loop()
-                    fut = loop.create_future()
-                    pending_task_results[task.task_id] = fut
-                    try:
-                        ok = await message_router.wait_connected(task.agent_name, timeout_s=5.0)
-                        if not ok:
-                            proc = agent_workers.get(task.agent_name)
-                            if proc is not None and proc.poll() is not None:
-                                _stop_worker(task.agent_name)
-                                _start_worker(task.agent_name)
-                                ok = await message_router.wait_connected(task.agent_name, timeout_s=5.0)
-                            if not ok:
-                                raise RuntimeError("agent worker not connected")
-
-                        # 申请 LLM 资源
-                        if resource_aware and resource_monitor is not None:
-                            if not resource_monitor.acquire_llm(task.agent_name, agent.llm_max_concurrent):
-                                raise RuntimeError("LLM resource not available")
-                            acquired = True
-
-                        sent = await message_router.send_event(task.agent_name, {
-                            "type": "exec_task",
-                            "task_id": task.task_id,
-                            "system_prompt": system_prompt,
-                            "user_message": user_message,
-                            "task_input": task_payload,
-                        })
-                        if not sent:
-                            raise RuntimeError("failed to send exec_task")
-
-                        try:
-                            result = await asyncio.wait_for(fut, timeout=120.0)
-                        except asyncio.TimeoutError:
-                            raise RuntimeError("task timeout")
-
-                        status = result.get("status")
-                        output = result.get("output") or ""
-                        error = result.get("error") or ""
-                        if status == "SUCCESS":
-                            success_output = output
-                            break
-                        raise RuntimeError(error or "worker error")
-                    except Exception as e:
-                        last_error = str(e)
-                        _stop_worker(task.agent_name)
-                        _start_worker(task.agent_name)
-                        if attempt < max_attempts - 1:
-                            await asyncio.sleep(0.2 * (attempt + 1))
-                    finally:
-                        pending_task_results.pop(task.task_id, None)
-
-                if success_output is not None:
-                    task.status = TaskStatus.SUCCESS
-                    task.result = {"role": agent.role, "output": success_output}
-                    _transition_agent(task.agent_name, AgentStatus.COMPLETED, task_id=task.task_id, reason="task.success")
-                    scheduler.complete_task(task.task_id)
-                    logger.info(f"任务 {task.task_id} ✓")
-                else:
-                    task.status = TaskStatus.FAILED
-                    task.error = last_error or "worker error"
-                    _transition_agent(task.agent_name, AgentStatus.FAILED, task_id=task.task_id, reason="task.failed")
-                    scheduler.fail_task(task.task_id)
-                    logger.error(f"任务 {task.task_id} ✗: {task.error}")
-                    task.result = {"role": agent.role, "output": f"[错误] {task.error}"}
+                _record_trace_event(task, "resource.acquire", {"agent_name": fallback_agent_name})
+                lease = await resource_monitor.acquire_async(task.task_id, fallback_agent_name, _resource_request_for_task(task, agent))
+                if lease is None:
+                    raise RuntimeError("resource lease not available")
+                task.set_resource_lease(lease.to_dict())
+                state_store.save_lease(lease)
+                _persist_task(task)
+                output = await _run_task_once(task, agent, task_payload, user_message, lease, fallback_attempt)
+                return True, output
             except Exception as e:
-                task.status = TaskStatus.FAILED
-                task.error = str(e)
-                _transition_agent(task.agent_name, AgentStatus.FAILED, task_id=task.task_id, reason="task.exception")
+                last_error = str(e)
+                if fallback_attempt.completed_at is None:
+                    task.finish_attempt(fallback_attempt, failure_reason=last_error)
+                _isolate_failed_worker(fallback_agent_name, task.task_id, last_error)
+                await resource_monitor.reclaim_async(task.task_id, reason=last_error)
+
+    if task.failure_policy.mode == FailureMode.FALLBACK.value and task.failure_policy.fallback_agent:
+        return False, last_error or "worker error"
+    if task.failure_policy.mode == FailureMode.DEGRADE.value:
+        return True, f"[降级] {last_error or 'worker error'}"
+    return False, last_error or "worker error"
+
+
+async def _execute_task(task: TaskSpec) -> None:
+    original_agent = task.agent_name
+    try:
+        if task.deadline is not None:
+            deadline = task.deadline
+            now = datetime.now(tz=deadline.tzinfo) if deadline.tzinfo else datetime.now()
+            if deadline <= now:
+                task.transition_to(TaskStatus.CANCELLED, "deadline.expired")
+                task.error = "deadline expired"
                 scheduler.fail_task(task.task_id)
-                logger.error(f"任务 {task.task_id} ✗: {e}")
-                task.result = {"role": agent.role, "output": f"[错误] {str(e)}"}
-            finally:
-                if resource_aware and acquired and resource_monitor is not None:
-                    resource_monitor.release_llm(task.agent_name)
-                agent_inflight_tasks[task.agent_name] = max(agent_inflight_tasks.get(task.agent_name, 0) - 1, 0)
+                _record_trace_event(task, "task.cancelled", {"reason": "deadline.expired"})
+                _persist_task(task)
+                return
+        agent = agents.get(task.agent_name)
+        if agent is None:
+            task.transition_to(TaskStatus.CANCELLED, "agent_missing")
+            _persist_task(task)
+            return
+        _prepare_agent_for_task(task, "scheduler.dispatch")
+        logger.info(f"调度：任务 {task.task_id} → Agent '{task.agent_name}'")
 
-            task.completed_at = datetime.now()
-            _set_current_task(task.agent_name, None)
+        ok, output_or_error = await _run_task_with_policy(task)
+        agent = agents.get(task.agent_name)
+        if ok:
+            task.transition_to(TaskStatus.SUCCESS, "task.success")
+            task.result = {"role": agent.role if agent else "", "output": output_or_error}
+            if agent is not None and agent.status != AgentStatus.KILLED:
+                if agent.status == AgentStatus.FAILED:
+                    _transition_agent(task.agent_name, AgentStatus.READY, task_id=task.task_id, reason="task.recovered")
+                if agent.status == AgentStatus.RUNNING:
+                    _transition_agent(task.agent_name, AgentStatus.COMPLETED, task_id=task.task_id, reason="task.success")
+            scheduler.complete_task(task.task_id)
+            _record_trace_event(task, "task.success", {"agent_name": task.agent_name})
+            _persist_task(task)
+            logger.info(f"任务 {task.task_id} ✓")
+        else:
+            task.transition_to(TaskStatus.FAILED, "task.failed")
+            task.error = output_or_error
+            if agent is not None and agent.status not in (AgentStatus.FAILED, AgentStatus.KILLED):
+                _transition_agent(task.agent_name, AgentStatus.FAILED, task_id=task.task_id, reason="task.failed")
+            scheduler.fail_task(task.task_id)
+            _record_trace_event(task, "task.failed", {"error": task.error})
+            logger.error(f"任务 {task.task_id} ✗: {task.error}")
+            task.result = {"role": agent.role if agent else "", "output": f"[错误] {task.error}"}
+            _persist_task(task)
+    except Exception as e:
+        task.transition_to(TaskStatus.FAILED, "task.exception")
+        task.error = str(e)
+        agent = agents.get(task.agent_name)
+        if agent is not None and agent.status not in (AgentStatus.FAILED, AgentStatus.KILLED):
+            try:
+                _transition_agent(task.agent_name, AgentStatus.FAILED, task_id=task.task_id, reason="task.exception")
+            except InvalidTransitionError:
+                agent.status = AgentStatus.FAILED
+        scheduler.fail_task(task.task_id)
+        _record_trace_event(task, "task.exception", {"error": task.error})
+        task.result = {"role": agent.role if agent else "", "output": f"[错误] {task.error}"}
+        _persist_task(task)
+        logger.error(f"任务 {task.task_id} ✗: {task.error}")
+    finally:
+        await resource_monitor.release_async(task.task_id)
+        state_store.release_leases_for_task(task.task_id, reason="task.finished")
+        _record_trace_event(task, "resource.release", {"task_id": task.task_id})
+        task.resource_usage = resource_monitor.usage.to_dict()
+        _persist_task(task)
+        agent_inflight_tasks[original_agent] = max(agent_inflight_tasks.get(original_agent, 0) - 1, 0)
+        for attempt in task.attempts:
+            if attempt.agent_name != original_agent:
+                agent_inflight_tasks[attempt.agent_name] = max(agent_inflight_tasks.get(attempt.agent_name, 0) - 1, 0)
+                _set_current_task(attempt.agent_name, None)
+        _set_current_task(task.agent_name, None)
+        _wake_scheduler()
 
+
+async def _execute_task_with_limits(task: TaskSpec) -> None:
+    global_sem = global_dispatch_semaphore
+    agent_sem = _agent_semaphore(task.agent_name)
+    if global_sem is None:
+        async with agent_sem:
+            await _execute_task(task)
+        return
+    async with global_sem:
+        async with agent_sem:
+            await _execute_task(task)
+
+
+async def scheduling_loop():
+    """后台不断从队列取任务并发执行"""
+    while True:
+        try:
+            event = scheduler_event
+            if event is not None:
+                await event.wait()
+                event.clear()
+            batch = _dequeue_ready_batch()
+            if not batch:
+                if event is None:
+                    await asyncio.sleep(0.05)
+                continue
+
+            for task in batch:
+                execution = asyncio.create_task(_execute_task_with_limits(task))
+                running_executions.add(execution)
+                execution.add_done_callback(running_executions.discard)
         except Exception as e:
             logger.error(f"调度循环异常: {e}")
-            await asyncio.sleep(1)
+            await asyncio.sleep(0.05)
 
 @app.on_event("startup")
 async def startup():
-    asyncio.create_task(scheduling_loop())
-    logger.info("调度循环已启动")
+    global scheduler_event, global_dispatch_semaphore
+    scheduler_event = asyncio.Event()
+    scheduler_event.set()
+    global_dispatch_semaphore = asyncio.Semaphore(max(resource_monitor.llm_max_concurrent, 1))
+    restored_agent_names: list[str] = []
+    try:
+        for row in state_store.load_agents():
+            agent = AgentSpec(**json.loads(row["data"]))
+            if agent.status not in (AgentStatus.KILLED, AgentStatus.READY, AgentStatus.CREATED):
+                agent.status = AgentStatus.READY
+                agent.current_task_id = None
+            agents[agent.agent_name] = agent
+            agent_controls[agent.agent_name] = AgentControlBlock.from_agent_spec(agent)
+            agent_auth_tokens[agent.agent_name] = row.get("auth_token") or secrets.token_urlsafe(24)
+            fault_states[agent.agent_name] = WorkerFaultState(agent_name=agent.agent_name, fault_domain=agent.agent_name)
+            if agent.status != AgentStatus.KILLED:
+                restored_agent_names.append(agent.agent_name)
+        for message in state_store.load_mailbox_messages(dead_letter=False):
+            message_router.restore_mailbox([message])
+        for task in recover_tasks(state_store)[0]:
+            if task.task_id not in tasks and task.agent_name in agents:
+                tasks[task.task_id] = task
+                trace_recorder.ensure_trace(task.trace_id, task.task_id)
+                scheduler.enqueue(task)
+        json_log("daemon.recovery", recovered_tasks=len(tasks), persistence=state_store.counts())
+    except Exception as e:
+        logger.error(f"恢复状态失败: {e}")
     global uds_server
     uds_path = os.getenv("AGENTD_UDS_PATH", "/tmp/agent-runtime-agentd.sock")
     try:
@@ -625,11 +1183,27 @@ async def startup():
                 "status": data.get("status"),
                 "output": data.get("output"),
                 "error": data.get("error"),
+                "usage": data.get("usage") or {},
             })
 
-        uds_server = await start_uds_server(uds_path, message_router, task_result_handler=_on_task_result)
+        async def _on_heartbeat(agent_name: str, data: dict) -> None:
+            fault = fault_states.setdefault(agent_name, WorkerFaultState(agent_name=agent_name, fault_domain=agent_name))
+            fault.heartbeat()
+            _persist_agent(agent_name)
+
+        uds_server = await start_uds_server(
+            uds_path,
+            message_router,
+            task_result_handler=_on_task_result,
+            auth_tokens=agent_auth_tokens,
+            heartbeat_handler=_on_heartbeat,
+        )
+        for agent_name in restored_agent_names:
+            _start_worker(agent_name)
     except Exception as e:
         logger.error(f"UDS server 启动失败: {e}")
+    asyncio.create_task(scheduling_loop())
+    logger.info("调度循环已启动")
 
     async def worker_monitor_loop():
         while True:
@@ -640,9 +1214,14 @@ async def startup():
                     proc = agent_workers.get(name)
                     if proc is None:
                         continue
-                    if proc.poll() is not None:
+                    fault = fault_states.setdefault(name, WorkerFaultState(agent_name=name, fault_domain=name))
+                    if proc.poll() is not None or fault.heartbeat_stale(10.0):
                         _stop_worker(name)
-                        _start_worker(name)
+                        if fault.can_restart():
+                            fault.record_restart()
+                            _start_worker(name)
+                        else:
+                            _transition_agent(name, AgentStatus.ISOLATED, reason="fault.circuit_open")
             except Exception:
                 pass
             await asyncio.sleep(1.0)
@@ -696,10 +1275,34 @@ async def metrics():
             "failed": sum(1 for t in tasks.values() if t.status == TaskStatus.FAILED),
         },
     }
-    result["context"] = context_manager.get_metrics()
+    result["faults"] = {
+        name: fault.to_dict()
+        for name, fault in fault_states.items()
+    }
+    result["persistence"] = {
+        "db_path": state_store.path,
+        "counts": state_store.counts(),
+    }
+    context_metrics = context_manager.get_metrics()
+    llm_metrics = _llm_metrics()
+    result["context"] = context_metrics
+    result["llm"] = llm_metrics
+    result["experiments"] = {
+        "token_saving_ratio": context_metrics["token_saving_ratio"],
+        "context_build_time_ms": context_metrics["context_build_time_ms"],
+        "prefix_hit_ratio": context_metrics["prefix_hit_ratio"],
+        "llm_latency_ms": llm_metrics["latency_ms_avg"],
+    }
+    result["scheduler"] = _scheduler_metrics()
 
-    if resource_aware and resource_monitor is not None:
-        result["resource"] = resource_monitor.get_snapshot()
+    result["resource"] = resource_monitor.get_snapshot()
+    result["histograms"] = {
+        "queue_wait_ms": _histogram([t.queue_wait_ms for t in tasks.values() if t.queue_wait_ms is not None]),
+        "agent_runtime_ms": _histogram([t.agent_runtime_ms for t in tasks.values() if t.agent_runtime_ms is not None]),
+        "llm_latency_ms": _histogram([float(t.llm_usage.get("latency_ms") or 0.0) for t in tasks.values() if t.llm_usage]),
+        "context_build_time_ms": _histogram([float(context_metrics.get("context_build_time_ms_avg") or 0.0)] if context_metrics.get("build_hits") else []),
+        "resource_lease_count": _histogram([float(len(result["resource"].get("leases", [])))]),
+    }
 
     return result
 

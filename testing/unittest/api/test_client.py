@@ -81,6 +81,28 @@ def test_submit_task_sends_context_payload():
     }
 
 
+def test_submit_task_sends_failure_policy_and_on_failure():
+    c = AgentRuntimeClient(base_url="http://example")
+    http = _HTTP()
+    c.client = http
+
+    c.submit_task(
+        "coder_a",
+        {"request": "x"},
+        failure_policy={
+            "mode": "fallback",
+            "max_retries": 1,
+            "fallback_agent": "coder_b",
+            "timeout_ms": 1000,
+        },
+        on_failure={"build": "fail_open"},
+    )
+
+    assert http.last_post["json"]["failure_policy"]["mode"] == "fallback"
+    assert http.last_post["json"]["failure_policy"]["fallback_agent"] == "coder_b"
+    assert http.last_post["json"]["on_failure"] == {"build": "fail_open"}
+
+
 def test_get_task_hits_task_endpoint():
     c = AgentRuntimeClient(base_url="http://example")
     http = _HTTP()

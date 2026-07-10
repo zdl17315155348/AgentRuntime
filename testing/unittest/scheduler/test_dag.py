@@ -3,7 +3,7 @@ DAG 调度器单元测试
 """
 
 import pytest
-from aruntime.core.models import FailurePolicy, TaskSpec, TaskStatus
+from aruntime.core.models import FailureMode, FailurePolicy, TaskSpec, TaskStatus
 from aruntime.scheduler.dag import DAGScheduler
 
 
@@ -129,6 +129,32 @@ def test_dag_fail_closed_cascades_failure():
 
     assert "task2" in scheduler.failed_tasks
     assert task2.status == TaskStatus.FAILED
+
+
+def test_dag_edge_fail_open_releases_dependent_task():
+    scheduler = DAGScheduler()
+    task1 = TaskSpec(
+        task_id="task1",
+        agent_name="agent1",
+        task_input={},
+        failure_policy={"mode": "fail_closed"},
+    )
+    task2 = TaskSpec(
+        task_id="task2",
+        agent_name="agent2",
+        task_input={},
+        dependencies=["task1"],
+        dependency_failure_policies={"task1": FailureMode.FAIL_OPEN},
+    )
+
+    scheduler.enqueue(task1)
+    scheduler.enqueue(task2)
+    scheduler.dequeue()
+    scheduler.fail_task("task1")
+
+    assert "task2" not in scheduler.failed_tasks
+    assert task2.status == TaskStatus.READY
+    assert scheduler.dequeue().task_id == "task2"
 
 
 def test_dag_topological_sort():

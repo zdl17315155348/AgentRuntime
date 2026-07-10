@@ -13,7 +13,7 @@ class FIFOScheduler(BaseScheduler):
 
     def enqueue(self, task: TaskSpec) -> None:
         """将任务加入队列尾部，标记为 READY"""
-        task.status = TaskStatus.READY
+        task.transition_to(TaskStatus.READY, "fifo_enqueue")
         self.task_queue.append(task)
 
     def dequeue(self) -> Optional[TaskSpec]:
@@ -22,7 +22,7 @@ class FIFOScheduler(BaseScheduler):
             return None
         
         task = self.task_queue.pop(0)
-        task.status = TaskStatus.RUNNING
+        task.transition_to(TaskStatus.RUNNING, "fifo_order")
         return task
 
     def complete_task(self, task_id: str) -> None:

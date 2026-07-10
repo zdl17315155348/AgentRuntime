@@ -118,6 +118,9 @@ class TestResourceAwareWithFIFO:
         assert "llm_active_agents" in snap
         assert "llm_total_concurrent" in snap
         assert "llm_max_concurrent" in snap
+        assert "usage" in snap
+        assert "leases" in snap
+        assert "reclaimed" in snap
 
 
 class TestResourceAwareWithDAG:

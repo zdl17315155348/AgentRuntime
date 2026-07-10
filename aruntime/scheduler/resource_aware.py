@@ -53,7 +53,7 @@ class ResourceAwareScheduler(BaseScheduler):
                 llm_max_concurrent=agent.llm_max_concurrent,
             ):
                 task = queue.pop(i)
-                task.status = TaskStatus.RUNNING
+                task.transition_to(TaskStatus.RUNNING, "resource_available")
                 return task
 
         return None

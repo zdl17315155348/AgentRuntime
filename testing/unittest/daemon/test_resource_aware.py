@@ -78,6 +78,9 @@ class TestResourceAwareIntegration:
         assert "mem_percent" in resource
         assert "llm_active_agents" in resource
         assert "llm_total_concurrent" in resource
+        assert "usage" in resource
+        assert "leases" in resource
+        assert "reclaimed" in resource
 
     def test_task_executes_normally_with_resource_aware(self, client):
         """资源感知模式下任务正常执行并完成"""

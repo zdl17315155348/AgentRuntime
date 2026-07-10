@@ -99,6 +99,8 @@ echo "== integration (resource_aware=true) =="
 python3 -m pytest testing/unittest/daemon/test_resource_aware.py -v
 
 echo "== smoke =="
+fuser -k 8234/tcp >/dev/null 2>&1 || true
+rm -f /tmp/agent-runtime-agentd.sock /tmp/agent-runtime-os/state.db /tmp/agent-runtime-os/state.db-wal /tmp/agent-runtime-os/state.db-shm || true
 SMOKE_LLM_BACKEND="${SMOKE_LLM_BACKEND:-}"
 SMOKE_LLM_API_KEY="${SMOKE_LLM_API_KEY:-}"
 if [ -z "$SMOKE_LLM_API_KEY" ] && [ -f configs/runtime.json ]; then
@@ -113,4 +115,7 @@ if [ -n "$SMOKE_LLM_API_KEY" ]; then
 else
   echo "跳过 smoke（未提供真实 LLM key）"
 fi
+
+echo "== benchmark =="
+python3 -m pytest testing/perf/test_benchmark.py -q
 '

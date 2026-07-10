@@ -6,7 +6,7 @@ DAG 调度器
 from typing import Optional, List, Dict, Set
 from collections import defaultdict, deque
 
-from aruntime.core.models import FailurePolicy, TaskSpec, TaskStatus
+from aruntime.core.models import FailureMode, TaskSpec, TaskStatus
 from aruntime.scheduler.base import BaseScheduler
 
 
@@ -35,6 +35,7 @@ class DAGScheduler(BaseScheduler):
         self.nodes: Dict[str, DAGNode] = {}  # task_id -> DAGNode
         self.completed_tasks: Set[str] = set()  # 已完成的任务 ID
         self.failed_tasks: Set[str] = set()  # 失败的任务 ID
+        self.waiting_queue: list[TaskSpec] = []
     
     def enqueue(self, task: TaskSpec) -> None:
         """
@@ -56,7 +57,10 @@ class DAGScheduler(BaseScheduler):
         
         # 如果没有依赖，直接标记为 READY
         if len(node.dependencies) == 0:
-            task.status = TaskStatus.READY
+            task.transition_to(TaskStatus.READY, "dependencies_satisfied")
+        else:
+            task.transition_to(TaskStatus.PENDING, "waiting_dependencies")
+            self.waiting_queue.append(task)
         
         self.task_queue.append(task)
     
@@ -73,7 +77,9 @@ class DAGScheduler(BaseScheduler):
             node = self.nodes.get(task.task_id)
             if node and node.is_ready:
                 self.task_queue.remove(task)
-                task.status = TaskStatus.RUNNING
+                if task in self.waiting_queue:
+                    self.waiting_queue.remove(task)
+                task.transition_to(TaskStatus.RUNNING, "dag_ready")
                 return task
         
         return None
@@ -99,7 +105,9 @@ class DAGScheduler(BaseScheduler):
                 if task_id in dep_node.dependencies:
                     dep_node.dependencies.remove(task_id)
                     if len(dep_node.dependencies) == 0:
-                        dep_node.task.status = TaskStatus.READY
+                        dep_node.task.transition_to(TaskStatus.READY, "dependencies_satisfied")
+                        if dep_node.task in self.waiting_queue:
+                            self.waiting_queue.remove(dep_node.task)
     
     def fail_task(self, task_id: str) -> None:
         """
@@ -116,14 +124,18 @@ class DAGScheduler(BaseScheduler):
         
         self.failed_tasks.add(task_id)
         node = self.nodes[task_id]
-        if node.task.failure_policy != FailurePolicy.FAIL_CLOSED:
-            return
-        
         for dependent_id in node.dependents:
             if dependent_id in self.nodes and dependent_id not in self.failed_tasks:
                 dep_node = self.nodes[dependent_id]
-                dep_node.task.status = TaskStatus.FAILED
-                self.fail_task(dependent_id)
+                edge_mode = dep_node.task.dependency_failure_policies.get(task_id)
+                mode = edge_mode or FailureMode(node.task.failure_policy.mode)
+                if mode == FailureMode.FAIL_CLOSED:
+                    dep_node.task.transition_to(TaskStatus.FAILED, "dependency_fail_closed")
+                    self.fail_task(dependent_id)
+                elif edge_mode in (FailureMode.FAIL_OPEN, FailureMode.DEGRADE, FailureMode.FALLBACK):
+                    dep_node.dependencies.discard(task_id)
+                    if dep_node.is_ready:
+                        dep_node.task.transition_to(TaskStatus.READY, f"dependency_{mode.value}")
     
     def topological_sort(self) -> List[str]:
         """

@@ -1,7 +1,8 @@
-from pydantic import BaseModel, Field
-from typing import Optional, Dict, Any, List
+from pydantic import BaseModel, Field, field_validator
+from typing import Optional, Dict, Any, List, Literal, ClassVar
 from enum import Enum
 from datetime import datetime
+from uuid import uuid4
 
 
 class AgentStatus(str, Enum):
@@ -21,33 +22,263 @@ class TaskStatus(str, Enum):
     PENDING = "PENDING"      # 等待调度
     READY = "READY"          # 就绪，可执行
     RUNNING = "RUNNING"      # 正在执行
+    ORPHANED = "ORPHANED"    # daemon 恢复时发现原执行者已失联
     SUCCESS = "SUCCESS"      # 执行成功
     FAILED = "FAILED"        # 执行失败
     CANCELLED = "CANCELLED"  # 被取消
 
 
-class FailurePolicy(str, Enum):
+class FailureMode(str, Enum):
     RETRY = "retry"
     FALLBACK = "fallback"
     DEGRADE = "degrade"
-    FAIL_OPEN = "fail-open"
-    FAIL_CLOSED = "fail-closed"
-    ISOLATE = "isolate"
+    FAIL_OPEN = "fail_open"
+    FAIL_CLOSED = "fail_closed"
+
+
+class FailurePolicy(BaseModel):
+    RETRY: ClassVar[str] = "retry"
+    FALLBACK: ClassVar[str] = "fallback"
+    DEGRADE: ClassVar[str] = "degrade"
+    FAIL_OPEN: ClassVar[str] = "fail_open"
+    FAIL_CLOSED: ClassVar[str] = "fail_closed"
+    ISOLATE: ClassVar[str] = "fail_open"
+
+    mode: Literal["fail_open", "fail_closed", "retry", "fallback", "degrade"] = "fail_open"
+    max_retries: int = 0
+    fallback_agent: Optional[str] = None
+    timeout_ms: int = 120000
+
+    @field_validator("mode", mode="before")
+    @classmethod
+    def normalize_mode(cls, value):
+        if isinstance(value, FailureMode):
+            return value.value
+        if isinstance(value, str):
+            normalized = value.replace("-", "_")
+            if normalized == "isolate":
+                return "fail_open"
+            return normalized
+        return value
+
+    @classmethod
+    def from_legacy(cls, value) -> "FailurePolicy":
+        if isinstance(value, FailurePolicy):
+            return value
+        if isinstance(value, dict):
+            return cls(**value)
+        if isinstance(value, str) or isinstance(value, FailureMode):
+            return cls(mode=value)
+        return cls()
+
+
+class TaskDefinition(BaseModel):
+    agent_name: str
+    task_input: Dict[str, Any]
+    dependencies: List[str] = Field(default_factory=list)
+    priority: int = 0
+    resource_request: Dict[str, Any] = Field(default_factory=dict)
+
+
+class TaskQueueInfo(BaseModel):
+    scheduler_decision_reason: str = ""
+    resource_block_reason: str = ""
+    queue_wait_ms: Optional[float] = None
+
+
+class TaskAttempt(BaseModel):
+    attempt_id: str
+    worker_pid: Optional[int] = None
+    agent_name: str
+    failure_reason: str = ""
+    token_usage: Dict[str, Any] = Field(default_factory=dict)
+    result: Optional[Dict[str, Any]] = None
+    started_at: datetime = Field(default_factory=datetime.now)
+    completed_at: Optional[datetime] = None
+
+
+class TaskControlBlock(BaseModel):
+    task_id: str
+    state: TaskStatus = TaskStatus.PENDING
+    queue_info: TaskQueueInfo = Field(default_factory=TaskQueueInfo)
+    resource_lease: Optional[Dict[str, Any]] = None
+    trace_id: str = Field(default_factory=lambda: f"trace_{uuid4().hex}")
+    current_attempt: int = 0
+    created_at: datetime = Field(default_factory=datetime.now)
+    started_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
+    agent_runtime_ms: Optional[float] = None
+
+    _ALLOWED: ClassVar[dict[TaskStatus, set[TaskStatus]]] = {
+        TaskStatus.PENDING: {TaskStatus.READY, TaskStatus.FAILED, TaskStatus.CANCELLED},
+        TaskStatus.READY: {TaskStatus.PENDING, TaskStatus.RUNNING, TaskStatus.FAILED, TaskStatus.CANCELLED},
+        TaskStatus.RUNNING: {TaskStatus.PENDING, TaskStatus.ORPHANED, TaskStatus.SUCCESS, TaskStatus.FAILED, TaskStatus.CANCELLED},
+        TaskStatus.ORPHANED: {TaskStatus.READY, TaskStatus.FAILED, TaskStatus.CANCELLED},
+        TaskStatus.SUCCESS: set(),
+        TaskStatus.FAILED: {TaskStatus.READY},
+        TaskStatus.CANCELLED: set(),
+    }
+
+    def transition_to(self, state: TaskStatus, reason: str = "") -> None:
+        state = TaskStatus(state)
+        if state != self.state and state not in self._ALLOWED.get(self.state, set()):
+            raise ValueError(f"invalid task transition: {self.state} -> {state}")
+        now = datetime.now()
+        self.state = state
+        if state == TaskStatus.RUNNING and self.started_at is None:
+            self.started_at = now
+            self.queue_info.queue_wait_ms = round((now - self.created_at).total_seconds() * 1000, 3)
+        if state in (TaskStatus.SUCCESS, TaskStatus.FAILED, TaskStatus.CANCELLED):
+            self.completed_at = now
+            started = self.started_at or self.created_at
+            self.agent_runtime_ms = round((now - started).total_seconds() * 1000, 3)
+        if reason:
+            self.queue_info.scheduler_decision_reason = reason
+
+    def block(self, reason: str) -> None:
+        self.transition_to(TaskStatus.PENDING, "resource_blocked")
+        self.queue_info.resource_block_reason = reason
+
+    def unblock(self, reason: str = "dependencies_satisfied") -> None:
+        self.queue_info.resource_block_reason = ""
+        self.transition_to(TaskStatus.READY, reason)
 
 
 class TaskSpec(BaseModel):
-    task_id: str = Field(default_factory=lambda: f"task_{datetime.now().timestamp()}")
+    task_id: str = Field(default_factory=lambda: f"task_{uuid4().hex}")
     agent_name: str
     task_input: Dict[str, Any]
     context_id: Optional[str] = None
     priority: int = 0
-    dependencies: List[str] = []       # 依赖的任务 ID 列表
-    failure_policy: FailurePolicy = FailurePolicy.ISOLATE
+    deadline: Optional[datetime] = None
+    resource_request: Dict[str, Any] = Field(default_factory=dict)
+    resource_usage: Dict[str, Any] = Field(default_factory=dict)
+    resource_lease: Optional[Dict[str, Any]] = None
+    token_budget: Optional[int] = None
+    timeout: Optional[float] = None
+    parent_task_id: Optional[str] = None
+    trace_id: str = Field(default_factory=lambda: f"trace_{uuid4().hex}")
+    dependencies: List[str] = Field(default_factory=list)       # 依赖的任务 ID 列表
+    dependency_failure_policies: Dict[str, FailureMode] = Field(default_factory=dict)
+    failure_policy: FailurePolicy = Field(default_factory=FailurePolicy)
     status: TaskStatus = TaskStatus.PENDING
     result: Optional[Dict[str, Any]] = None
     error: Optional[str] = None
+    llm_usage: Dict[str, Any] = Field(default_factory=dict)
     created_at: datetime = Field(default_factory=datetime.now)
+    started_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
+    queue_wait_ms: Optional[float] = None
+    scheduler_decision_reason: str = ""
+    resource_block_reason: str = ""
+    agent_runtime_ms: Optional[float] = None
+    definition: Optional[TaskDefinition] = None
+    tcb: Optional[TaskControlBlock] = None
+    attempts: List[TaskAttempt] = Field(default_factory=list)
+
+    def model_post_init(self, __context) -> None:
+        if self.definition is None:
+            self.definition = TaskDefinition(
+                agent_name=self.agent_name,
+                task_input=self.task_input,
+                dependencies=list(self.dependencies),
+                priority=self.priority,
+                resource_request=dict(self.resource_request),
+            )
+        if self.tcb is None:
+            self.tcb = TaskControlBlock(
+                task_id=self.task_id,
+                state=self.status,
+                trace_id=self.trace_id,
+                created_at=self.created_at,
+                started_at=self.started_at,
+                completed_at=self.completed_at,
+                resource_lease=self.resource_lease,
+                agent_runtime_ms=self.agent_runtime_ms,
+                queue_info=TaskQueueInfo(
+                    scheduler_decision_reason=self.scheduler_decision_reason,
+                    resource_block_reason=self.resource_block_reason,
+                    queue_wait_ms=self.queue_wait_ms,
+                ),
+            )
+        self._sync_from_tcb()
+
+    def transition_to(self, status: TaskStatus, reason: str = "") -> None:
+        if self.tcb is None:
+            self.model_post_init(None)
+        self.tcb.transition_to(status, reason)
+        self._sync_from_tcb()
+
+    def block(self, reason: str) -> None:
+        if self.tcb is None:
+            self.model_post_init(None)
+        self.tcb.block(reason)
+        self._sync_from_tcb()
+
+    def unblock(self, reason: str = "dependencies_satisfied") -> None:
+        if self.tcb is None:
+            self.model_post_init(None)
+        self.tcb.unblock(reason)
+        self._sync_from_tcb()
+
+    def set_resource_lease(self, lease: Dict[str, Any] | None) -> None:
+        if self.tcb is None:
+            self.model_post_init(None)
+        self.tcb.resource_lease = lease
+        self.resource_lease = lease
+
+    def create_attempt(self, agent_name: str, worker_pid: int | None = None) -> TaskAttempt:
+        if self.tcb is None:
+            self.model_post_init(None)
+        self.tcb.current_attempt += 1
+        attempt = TaskAttempt(
+            attempt_id=f"{self.task_id}:attempt:{self.tcb.current_attempt}",
+            worker_pid=worker_pid,
+            agent_name=agent_name,
+        )
+        self.attempts.append(attempt)
+        return attempt
+
+    def finish_attempt(
+        self,
+        attempt: TaskAttempt,
+        result: Dict[str, Any] | None = None,
+        failure_reason: str = "",
+        token_usage: Dict[str, Any] | None = None,
+    ) -> None:
+        attempt.completed_at = datetime.now()
+        attempt.result = result
+        attempt.failure_reason = failure_reason
+        attempt.token_usage = token_usage or {}
+
+    def _sync_from_tcb(self) -> None:
+        if self.tcb is None:
+            return
+        self.status = self.tcb.state
+        self.trace_id = self.tcb.trace_id
+        self.created_at = self.tcb.created_at
+        self.started_at = self.tcb.started_at
+        self.completed_at = self.tcb.completed_at
+        self.resource_lease = self.tcb.resource_lease
+        self.agent_runtime_ms = self.tcb.agent_runtime_ms
+        self.queue_wait_ms = self.tcb.queue_info.queue_wait_ms
+        self.scheduler_decision_reason = self.tcb.queue_info.scheduler_decision_reason
+        self.resource_block_reason = self.tcb.queue_info.resource_block_reason
+
+    @field_validator("failure_policy", mode="before")
+    @classmethod
+    def normalize_failure_policy(cls, value):
+        return FailurePolicy.from_legacy(value)
+
+    @field_validator("dependency_failure_policies", mode="before")
+    @classmethod
+    def normalize_dependency_failure_policies(cls, value):
+        if not value:
+            return {}
+        return {
+            str(dep_id): FailureMode(mode.value if isinstance(mode, FailureMode) else str(mode).replace("-", "_"))
+            for dep_id, mode in dict(value).items()
+        }
 
 
 class AgentSpec(BaseModel):

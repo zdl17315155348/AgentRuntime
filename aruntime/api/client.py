@@ -36,6 +36,8 @@ class AgentRuntimeClient:
         context_id: str = "",
         priority: int = 0,
         dependencies: Optional[list[str]] = None,
+        failure_policy: Optional[dict | str] = None,
+        on_failure: Optional[dict[str, str]] = None,
     ) -> dict:
         payload: dict = {
             "agent_name": agent_name,
@@ -45,6 +47,10 @@ class AgentRuntimeClient:
         }
         if dependencies is not None:
             payload["dependencies"] = dependencies
+        if failure_policy is not None:
+            payload["failure_policy"] = failure_policy
+        if on_failure is not None:
+            payload["on_failure"] = on_failure
         resp = self.client.post(
             f"{self.base_url}/tasks",
             json=payload,

@@ -117,7 +117,7 @@ class TestAgentLifecycleAPI:
         assert task_data["runtime"]["trace_id"].startswith("trace_")
 
     def test_submit_task_to_busy_agent(self, client):
-        """Agent 正在执行时提交新任务应该返回 409"""
+        """Agent 正在执行时提交新任务应进入队列"""
         suffix = str(int(time.time() * 1000))
         agent_name = f"lifecycle_test_busy_{suffix}"
         client.post("/agents", json={
@@ -136,7 +136,8 @@ class TestAgentLifecycleAPI:
             "agent_name": agent_name,
             "task_input": {"request": "第二个任务"},
         })
-        assert resp2.status_code == 409
+        assert resp2.status_code == 200
+        assert resp2.json()["message"] == "任务已加入调度队列"
 
         data = wait_task_done(client, task_id, timeout_s=10.0)
         assert data["status"] == "SUCCESS"
@@ -283,12 +284,39 @@ class TestAgentLifecycleAPI:
 
         data = wait_task_done(client, task_id, timeout_s=10.0)
         assert data["status"] == "SUCCESS"
+        assert data["llm_usage"]["input_tokens"] > 0
+        assert data["llm_usage"]["total_tokens"] >= data["llm_usage"]["input_tokens"]
+        assert data["scheduler"]["resource_lease"]["task_id"] == task_id
+        assert data["trace"]["trace_id"] == data["trace_id"]
+        assert data["trace"]["task_id"] == task_id
+        assert data["trace"]["llm_calls"] >= 1
+        assert data["trace"]["token_used"] == data["llm_usage"]["total_tokens"]
+
+        trace_resp = client.get(f"/tasks/{task_id}/trace")
+        assert trace_resp.status_code == 200
+        trace = trace_resp.json()
+        assert "agent.execute" in trace["critical_path"]
+        trace_events = {event["name"] for event in trace["events"]}
+        assert {"context.build", "resource.acquire", "ipc.send_task", "llm.call"}.issubset(trace_events)
+        assert trace["spans"][0]["name"] == "agent.execute"
+        assert trace["spans"][0]["events"][0]["name"] == "agent.dispatch"
 
         resp = client.get("/metrics")
         assert resp.status_code == 200
-        context = resp.json()["context"]
+        metrics = resp.json()
+        context = metrics["context"]
         assert context["total_contexts"] >= 1
         assert context["build_hits"] >= 1
+        assert "token_saving_ratio" in metrics["experiments"]
+        assert "context_build_time_ms" in metrics["experiments"]
+        assert "prefix_hit_ratio" in metrics["experiments"]
+        assert "llm_latency_ms" in metrics["experiments"]
+        assert metrics["llm"]["input_tokens"] > 0
+        assert "resource" in metrics
+        assert "usage" in metrics["resource"]
+        assert "histograms" in metrics
+        assert "queue_wait_ms" in metrics["histograms"]
+        assert "llm_latency_ms" in metrics["histograms"]
 
     def test_failed_task_sets_agent_failed_and_can_retry(self, client):
         suffix = str(int(time.time() * 1000))
@@ -438,6 +466,55 @@ class TestAgentLifecycleAPI:
             time.sleep(0.1)
 
         raise AssertionError("fail-closed 下游任务未进入 FAILED")
+
+    def test_fallback_policy_switches_coder_and_tester_continues(self, client):
+        suffix = str(int(time.time() * 1000))
+        coder_a = f"coder_a_{suffix}"
+        coder_b = f"coder_b_{suffix}"
+        tester = f"tester_{suffix}"
+        client.post("/agents", json={"agent_name": coder_a, "role": "Coder A"})
+        client.post("/agents", json={"agent_name": coder_b, "role": "Coder B"})
+        client.post("/agents", json={"agent_name": tester, "role": "Tester"})
+
+        resp_a = client.post("/tasks", json={
+            "agent_name": coder_a,
+            "task_input": {
+                "request": "实现功能",
+                "__test": {"crash_worker": True},
+            },
+            "failure_policy": {
+                "mode": "fallback",
+                "max_retries": 0,
+                "fallback_agent": coder_b,
+                "timeout_ms": 1000,
+            },
+        })
+        assert resp_a.status_code == 200
+        coder_task = resp_a.json()["task_id"]
+
+        resp_t = client.post("/tasks", json={
+            "agent_name": tester,
+            "task_input": {"request": "继续测试"},
+            "dependencies": [coder_task],
+            "on_failure": {coder_task: "fail_open"},
+        })
+        assert resp_t.status_code == 200
+        tester_task = resp_t.json()["task_id"]
+
+        coder_data = wait_task_done(client, coder_task, timeout_s=10.0)
+        assert coder_data["status"] == "SUCCESS"
+        assert coder_data["runtime"]["agent_name"] == coder_a
+        assert [a["agent_name"] for a in coder_data["attempts"]][-1] == coder_b
+        assert coder_data["scheduler"]["failure_policy"]["mode"] == "fallback"
+
+        tester_data = wait_task_done(client, tester_task, timeout_s=10.0)
+        assert tester_data["status"] == "SUCCESS"
+
+        agents = client.get("/agents").json()["agents"]
+        coder_a_state = next(a for a in agents if a["name"] == coder_a)
+        coder_b_state = next(a for a in agents if a["name"] == coder_b)
+        assert coder_a_state["status"] in ("READY", "COMPLETED")
+        assert coder_b_state["current_task"] is None
 
 
 class TestAgentDuplicateAndKill:

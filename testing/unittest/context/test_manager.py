@@ -96,7 +96,10 @@ def test_context_is_compressed_when_over_threshold():
     )
 
     assert ctx.compressed is True
-    assert ctx.shared_data["__compressed_summary__"].startswith("Context compressed from ")
+    assert ctx.shared_data["__structured_summary__"] is True
+    assert "long" in ctx.shared_data["keys"]
+    assert ctx.previous_versions
+    assert ctx.shared_data["important"] == {}
     assert manager.build_agent_context("ctx-large", "planner")["compressed"] is True
 
 
@@ -235,7 +238,8 @@ def test_compressed_context_ignores_later_payload_growth():
     )
 
     built = manager.build_agent_context("ctx-compressed-stable", "planner")
-    assert set(built["shared"].keys()) == {"__compressed_summary__"}
+    assert built["shared"]["__structured_summary__"] is True
+    assert "long" in built["shared"]["keys"]
     assert built["private"] == {}
 
 
@@ -250,7 +254,22 @@ def test_large_private_data_triggers_compression():
 
     assert ctx.compressed is True
     assert manager.get_metrics()["compression_count"] == 1
-    assert manager.build_agent_context("ctx-large-private", "planner")["private"] == {}
+    built = manager.build_agent_context("ctx-large-private", "planner")
+    assert built["private"]["__structured_summary__"] is True
+    assert "long" in built["private"]["keys"]
+
+
+def test_context_rollback_restores_pre_compression_version():
+    manager = ContextManager(compress_threshold_chars=20)
+    manager.record_task_context(
+        context_id="ctx-rollback",
+        agent_name="planner",
+        shared_data={"goal": "ship", "long": "abcdefghijklmnopqrstuvwxyz"},
+    )
+
+    assert manager.rollback_context("ctx-rollback") is True
+    built = manager.build_agent_context("ctx-rollback", "planner")
+    assert built["shared"]["goal"] == "ship"
 
 
 def test_execution_context_tracks_prefix_cache_hit_and_saved_tokens():
@@ -293,3 +312,34 @@ def test_semantic_context_reports_version_and_keys():
     assert built["semantic"]["version"] == 2
     assert built["semantic"]["shared_keys"] == ["repo"]
     assert built["semantic"]["private_keys"] == ["note"]
+
+
+def test_context_reports_readonly_diff_summary_and_execution_metrics():
+    manager = ContextManager(compress_threshold_chars=1000)
+    manager.record_task_context(
+        context_id="ctx-optimized",
+        agent_name="planner",
+        shared_data={"repo": "agent-runtime-os"},
+        private_data={"note": "planner-only"},
+        readonly_data={"policy": "readonly"},
+    )
+
+    first = manager.build_agent_context("ctx-optimized", "planner")
+    second = manager.build_agent_context("ctx-optimized", "planner")
+
+    assert first["semantic"]["shared_context"] == {"repo": "agent-runtime-os"}
+    assert first["semantic"]["private_context"] == {"note": "planner-only"}
+    assert first["semantic"]["readonly_context"] == {"policy": "readonly"}
+    assert first["semantic"]["context_version"] == 3
+    assert first["semantic"]["context_diff"]["readonly"] == {"policy": "readonly"}
+    assert first["semantic"]["summary"]
+    assert first["execution"]["prefix_hash"]
+    assert first["execution"]["prefix_block_id"].startswith("pblk_")
+    assert first["execution"]["input_token_before"] >= first["execution"]["input_token_after"]
+    assert second["execution"]["cache_hit"] is True
+    assert second["execution"]["reuse_count"] == 0
+
+    metrics = manager.get_metrics()
+    assert metrics["token_saving_ratio"] > 0
+    assert metrics["context_build_time_ms"] >= 0
+    assert metrics["prefix_hit_ratio"] == metrics["cache_hit_ratio"]

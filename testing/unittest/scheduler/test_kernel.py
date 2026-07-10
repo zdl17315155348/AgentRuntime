@@ -1,5 +1,6 @@
-from aruntime.core.models import FailurePolicy, TaskSpec, TaskStatus
+from aruntime.core.models import FailureMode, FailurePolicy, TaskSpec, TaskStatus
 from aruntime.scheduler.kernel import KernelScheduler
+from datetime import datetime, timedelta
 
 
 def test_kernel_scheduler_uses_ready_and_running_queues():
@@ -104,3 +105,108 @@ def test_kernel_scheduler_fail_closed_cascades_failure():
     assert task2.status == TaskStatus.FAILED
     assert "t2" in scheduler.failed_tasks
     assert scheduler.queue_snapshot()["waiting"] == []
+
+
+def test_kernel_scheduler_records_completed_and_runtime_metadata():
+    scheduler = KernelScheduler(policy="fifo")
+    task = TaskSpec(task_id="t1", agent_name="agent1", task_input={})
+
+    scheduler.enqueue(task)
+    assert scheduler.dispatch_ready() == [task]
+
+    assert task.started_at is not None
+    assert task.queue_wait_ms is not None
+    assert task.scheduler_decision_reason == "fifo_order"
+
+    scheduler.complete_task("t1")
+    snapshot = scheduler.queue_snapshot()
+    assert snapshot["running"] == []
+    assert snapshot["completed"] == ["t1"]
+
+
+def test_kernel_scheduler_moves_resource_blocked_task_to_waiting_then_wakes():
+    calls = {"count": 0}
+
+    def checker(task):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return False, "cpu_busy"
+        return True, "resource_available"
+
+    scheduler = KernelScheduler(policy="resource_aware", resource_checker=checker)
+    task = TaskSpec(task_id="t1", agent_name="agent1", task_input={})
+
+    scheduler.enqueue(task)
+    assert scheduler.dispatch_ready() == []
+    assert scheduler.queue_snapshot()["waiting"] == ["t1"]
+    assert scheduler.queue_snapshot()["blocked"] == ["t1"]
+    assert task.resource_block_reason == "cpu_busy"
+
+    assert scheduler.dispatch_ready() == [task]
+    assert scheduler.queue_snapshot()["waiting"] == []
+    assert task.resource_block_reason == ""
+
+
+def test_kernel_scheduler_policy_plugins_order_tasks():
+    low = TaskSpec(task_id="low", agent_name="agent1", task_input={}, priority=1)
+    high = TaskSpec(task_id="high", agent_name="agent1", task_input={}, priority=10)
+    priority_scheduler = KernelScheduler(policy="priority")
+    priority_scheduler.enqueue(low)
+    priority_scheduler.enqueue(high)
+    assert priority_scheduler.dequeue().task_id == "high"
+
+    late = TaskSpec(
+        task_id="late",
+        agent_name="agent1",
+        task_input={},
+        deadline=datetime.now() + timedelta(hours=2),
+    )
+    soon = TaskSpec(
+        task_id="soon",
+        agent_name="agent1",
+        task_input={},
+        deadline=datetime.now() + timedelta(minutes=1),
+    )
+    deadline_scheduler = KernelScheduler(policy="deadline")
+    deadline_scheduler.enqueue(late)
+    deadline_scheduler.enqueue(soon)
+    assert deadline_scheduler.dequeue().task_id == "soon"
+
+
+def test_kernel_scheduler_fair_share_prefers_less_dispatched_agent():
+    scheduler = KernelScheduler(policy="fair_share")
+    a1_first = TaskSpec(task_id="a1_first", agent_name="a1", task_input={})
+    a1_second = TaskSpec(task_id="a1_second", agent_name="a1", task_input={})
+    a2_first = TaskSpec(task_id="a2_first", agent_name="a2", task_input={})
+
+    scheduler.enqueue(a1_first)
+    assert scheduler.dequeue().task_id == "a1_first"
+    scheduler.enqueue(a1_second)
+    scheduler.enqueue(a2_first)
+
+    assert scheduler.dequeue().task_id == "a2_first"
+
+
+def test_kernel_scheduler_edge_fail_open_releases_dependent_task():
+    scheduler = KernelScheduler()
+    task1 = TaskSpec(
+        task_id="t1",
+        agent_name="agent1",
+        task_input={},
+        failure_policy={"mode": "fail_closed"},
+    )
+    task2 = TaskSpec(
+        task_id="t2",
+        agent_name="agent2",
+        task_input={},
+        dependencies=["t1"],
+        dependency_failure_policies={"t1": FailureMode.FAIL_OPEN},
+    )
+
+    scheduler.enqueue(task1)
+    scheduler.enqueue(task2)
+    scheduler.dequeue()
+    scheduler.fail_task("t1")
+
+    assert "t2" not in scheduler.failed_tasks
+    assert scheduler.queue_snapshot()["ready"] == ["t2"]
