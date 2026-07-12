@@ -26,5 +26,6 @@ trap cleanup EXIT INT TERM
 
 $DOCKER start -a "$CID"
 $DOCKER cp "$CID:/app/BENCHMARK.md" "$PROJECT_DIR/BENCHMARK.md"
+$DOCKER cp "$CID:/app/benchmark" "$PROJECT_DIR/benchmark"
 
-echo "BENCHMARK.md generated"
+echo "BENCHMARK.md and benchmark/ generated"

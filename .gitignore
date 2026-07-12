@@ -2,7 +2,6 @@ configs/*.json
 project-content.txt
 Dockerfile
 AGENTS.md
-BENCHMARK.md
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
@@ -181,7 +180,7 @@ artifacts/
 *.benchmark
 
 # Performance logs
-perf/
+/perf/
 
 # Environment variables file
 .env.local

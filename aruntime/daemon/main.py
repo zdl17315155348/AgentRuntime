@@ -22,7 +22,7 @@ from aruntime.comm.message import Message
 from aruntime.comm.router import MessageRouter
 from aruntime.comm.transport import start_uds_server
 from aruntime.context.manager import ContextManager
-from aruntime.resource.cgroup import apply_cgroup_v2
+from aruntime.resource.cgroup import CgroupManager, apply_cgroup_v2
 from aruntime.resource.monitor import ResourceMonitor
 from aruntime.resource.types import ResourceClass, ResourceLease, ResourceRequest
 from aruntime.scheduler.resource_aware import ResourceAwareScheduler
@@ -90,6 +90,8 @@ SCHEDULER_TYPE = os.getenv("SCHEDULER_TYPE", scheduler_config.get("type", "fifo"
 SCHEDULER_POLICY = os.getenv("SCHEDULER_POLICY", scheduler_config.get("policy", "priority"))
 resource_aware = os.getenv("RESOURCE_AWARE", "").lower() in ("true", "1", "yes") or scheduler_config.get("resource_aware", False)
 resource_monitor: ResourceMonitor = ResourceMonitor()
+cgroup_strict = os.getenv("CGROUP_STRICT", "").lower() in ("true", "1", "yes")
+cgroup_manager = CgroupManager()
 
 
 def _resource_request_for_task(task: TaskSpec, agent: AgentSpec) -> ResourceRequest:
@@ -101,10 +103,22 @@ def _resource_request_for_task(task: TaskSpec, agent: AgentSpec) -> ResourceRequ
     return ResourceRequest.from_dict(raw)
 
 
+def _cgroup_ready(agent_name: str) -> tuple[bool, str]:
+    if not cgroup_strict:
+        return True, "cgroup_not_strict"
+    binding = cgroup_bindings.get(agent_name)
+    if binding and binding.get("ok") is True:
+        return True, "cgroup_ready"
+    return False, "cgroup_bind_failed"
+
+
 def _kernel_resource_checker(task: TaskSpec) -> tuple[bool, str]:
     agent = agents.get(task.agent_name)
     if agent is None:
         return False, "agent_missing"
+    ok, reason = _cgroup_ready(task.agent_name)
+    if not ok:
+        return ok, reason
     ok, reason = resource_monitor.can_allocate(_resource_request_for_task(task, agent))
     return ok, reason
 
@@ -137,6 +151,7 @@ agent_inflight_tasks: Dict[str, int] = {}
 agent_auth_tokens: Dict[str, str] = {}
 fault_states: Dict[str, WorkerFaultState] = {}
 message_router = MessageRouter(store=state_store)
+cgroup_bindings: Dict[str, dict] = {}
 uds_server = None
 agent_workers: Dict[str, subprocess.Popen] = {}
 pending_task_results: Dict[str, asyncio.Future] = {}
@@ -251,30 +266,43 @@ def _start_worker(agent_name: str) -> subprocess.Popen:
             pid=proc.pid,
             group_name=agent_name,
             memory_max_bytes=agent.memory_max_bytes,
+            memory_high_bytes=agent.memory_high_bytes,
             cpu_max=agent.cpu_max,
+            pids_max=agent.pids_max or 64,
         )
-        if cg.get("ok") is not True and cg.get("error"):
-            logger.info(f"cgroup 未生效: {cg.get('error')}")
+        cgroup_bindings[agent_name] = cg
+        if cg.get("ok") is not True:
+            if cg.get("error"):
+                logger.info(f"cgroup 未生效: {cg.get('error')}")
+            if cgroup_strict:
+                _stop_worker(agent_name, cleanup_cgroup=False)
+                raise RuntimeError(f"cgroup bind failed: {cg.get('error') or 'unknown'}")
         _persist_agent(agent_name)
     return proc
 
 
-def _stop_worker(agent_name: str) -> None:
+def _stop_worker(agent_name: str, cleanup_cgroup: bool = True) -> None:
     proc = agent_workers.get(agent_name)
-    if proc is None:
-        return
-    try:
-        proc.terminate()
-    except Exception:
-        pass
-    try:
-        proc.wait(timeout=2)
-    except Exception:
+    if proc is not None:
         try:
-            proc.kill()
+            proc.terminate()
         except Exception:
             pass
-    agent_workers.pop(agent_name, None)
+        try:
+            proc.wait(timeout=2)
+        except Exception:
+            try:
+                proc.kill()
+                proc.wait(timeout=2)
+            except Exception:
+                pass
+        agent_workers.pop(agent_name, None)
+    if cleanup_cgroup:
+        binding = cgroup_bindings.pop(agent_name, None)
+        if binding and binding.get("ok") is True:
+            cleaned = cgroup_manager.cleanup(agent_name)
+            if cleaned.get("ok") is not True and cleaned.get("error"):
+                logger.info(f"cgroup 清理失败: {cleaned.get('error')}")
     _persist_agent(agent_name)
 
 
@@ -341,7 +369,9 @@ class CreateAgentRequest(BaseModel):
     model: str = "gpt-4o-mini"
     max_retries: int = 3
     memory_max_bytes: int | None = None
+    memory_high_bytes: int | None = None
     cpu_max: str = ""
+    pids_max: int | None = None
 
 class SubmitTaskRequest(BaseModel):
     agent_name: str
@@ -554,14 +584,24 @@ async def create_agent(req: CreateAgentRequest):
         model=req.model,
         max_retries=req.max_retries,
         memory_max_bytes=req.memory_max_bytes,
+        memory_high_bytes=req.memory_high_bytes,
         cpu_max=req.cpu_max or None,
+        pids_max=req.pids_max,
     )
     agents[agent.agent_name] = agent
     acb = AgentControlBlock.from_agent_spec(agent)
     agent_controls[agent.agent_name] = acb
     fault_states[agent.agent_name] = WorkerFaultState(agent_name=agent.agent_name, fault_domain=agent.agent_name)
+    try:
+        _start_worker(agent.agent_name)
+    except Exception as e:
+        agents.pop(agent.agent_name, None)
+        agent_controls.pop(agent.agent_name, None)
+        fault_states.pop(agent.agent_name, None)
+        agent_auth_tokens.pop(agent.agent_name, None)
+        cgroup_bindings.pop(agent.agent_name, None)
+        raise HTTPException(status_code=503, detail=str(e))
     _transition_agent(agent.agent_name, AgentStatus.READY, reason="agent.created")
-    _start_worker(agent.agent_name)
     _persist_agent(agent.agent_name)
     logger.info(f"Agent created: {agent.agent_name} (status: {agent.status})")
     return {"agent_name": agent.agent_name, "status": agent.status}
@@ -963,6 +1003,9 @@ async def _run_task_with_policy(task: TaskSpec) -> tuple[bool, str]:
         )
         _persist_task(task)
         try:
+            cgroup_ok, cgroup_reason = _cgroup_ready(task.agent_name)
+            if not cgroup_ok:
+                raise RuntimeError(cgroup_reason)
             _record_trace_event(task, "resource.acquire", {"agent_name": task.agent_name})
             lease = await resource_monitor.acquire_async(task.task_id, task.agent_name, _resource_request_for_task(task, agent))
             if lease is None:
@@ -1007,6 +1050,9 @@ async def _run_task_with_policy(task: TaskSpec) -> tuple[bool, str]:
             task_payload.update(task.task_input)
             user_message = str(task_payload)
             try:
+                cgroup_ok, cgroup_reason = _cgroup_ready(fallback_agent_name)
+                if not cgroup_ok:
+                    raise RuntimeError(cgroup_reason)
                 _record_trace_event(task, "resource.acquire", {"agent_name": fallback_agent_name})
                 lease = await resource_monitor.acquire_async(task.task_id, fallback_agent_name, _resource_request_for_task(task, agent))
                 if lease is None:
@@ -1266,6 +1312,13 @@ async def metrics():
             "total": len(agent_workers),
             "alive": sum(1 for p in agent_workers.values() if p.poll() is None),
             "dead": sum(1 for p in agent_workers.values() if p.poll() is not None),
+        },
+        "cgroups": {
+            name: {
+                "binding": binding,
+                "stats": cgroup_manager.read_stats(name) if binding.get("ok") is True else {},
+            }
+            for name, binding in cgroup_bindings.items()
         },
         "tasks": {
             "total": len(tasks),

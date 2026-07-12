@@ -9,13 +9,17 @@ from aruntime.core.models import AgentSpec, AgentStatus
 @dataclass
 class ResourceQuota:
     memory_max_bytes: int | None = None
+    memory_high_bytes: int | None = None
     cpu_max: str | None = None
+    pids_max: int | None = None
     llm_max_concurrent: int = 1
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "memory_max_bytes": self.memory_max_bytes,
+            "memory_high_bytes": self.memory_high_bytes,
             "cpu_max": self.cpu_max,
+            "pids_max": self.pids_max,
             "llm_max_concurrent": self.llm_max_concurrent,
         }
 
@@ -72,7 +76,9 @@ class AgentControlBlock:
             status=agent.status,
             resource_quota=ResourceQuota(
                 memory_max_bytes=agent.memory_max_bytes,
+                memory_high_bytes=agent.memory_high_bytes,
                 cpu_max=agent.cpu_max,
+                pids_max=agent.pids_max,
                 llm_max_concurrent=agent.llm_max_concurrent,
             ),
             fault_domain=agent.agent_name,

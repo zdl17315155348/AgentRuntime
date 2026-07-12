@@ -75,6 +75,8 @@ class CgroupManager:
             "cpu_stat": self._read_kv(path, "cpu.stat"),
             "memory_events": self._read_kv(path, "memory.events"),
             "cgroup_events": self._read_kv(path, "cgroup.events"),
+            "cpu_pressure": self._read_pressure(path, "cpu.pressure"),
+            "memory_pressure": self._read_pressure(path, "memory.pressure"),
         }
 
     def kill(self, group_name: str) -> dict:
@@ -94,8 +96,13 @@ class CgroupManager:
         path = self._path(group_name)
         try:
             if os.path.isdir(path):
+                if path.startswith("/sys/fs/cgroup"):
+                    os.rmdir(path)
+                    return {"ok": True, "path": path}
                 for name in os.listdir(path):
-                    os.remove(os.path.join(path, name))
+                    item = os.path.join(path, name)
+                    if os.path.isfile(item):
+                        os.remove(item)
                 os.rmdir(path)
             return {"ok": True, "path": path}
         except Exception as e:
@@ -146,18 +153,49 @@ class CgroupManager:
         with open(file_path, "r") as f:
             return [int(line.strip()) for line in f if line.strip().isdigit()]
 
+    def _read_pressure(self, path: str, name: str) -> dict[str, dict[str, float]]:
+        result: dict[str, dict[str, float]] = {}
+        file_path = os.path.join(path, name)
+        if not os.path.exists(file_path):
+            return result
+        with open(file_path, "r") as f:
+            for line in f:
+                parts = line.split()
+                if not parts:
+                    continue
+                values: dict[str, float] = {}
+                for item in parts[1:]:
+                    if "=" not in item:
+                        continue
+                    key, value = item.split("=", 1)
+                    try:
+                        values[key] = float(value)
+                    except ValueError:
+                        continue
+                result[parts[0]] = values
+        return result
+
 
 def apply_cgroup_v2(
     pid: int,
     group_name: str,
     memory_max_bytes: int | None = None,
     cpu_max: str | None = None,
+    memory_high_bytes: int | None = None,
+    pids_max: int | None = 64,
 ) -> dict:
     manager = CgroupManager()
-    created = manager.create(group_name, memory_max_bytes=memory_max_bytes, cpu_max=cpu_max, pids_max=64)
+    created = manager.create(
+        group_name,
+        memory_max_bytes=memory_max_bytes,
+        cpu_max=cpu_max,
+        memory_high_bytes=memory_high_bytes,
+        pids_max=pids_max,
+    )
     if created.get("ok") is not True:
         return created
     attached = manager.attach(group_name, pid)
     if attached.get("ok") is not True:
+        manager.cleanup(group_name)
         return attached
     return {"ok": True, "path": created["path"], "stats": manager.read_stats(group_name)}

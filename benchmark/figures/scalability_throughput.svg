@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="920" height="420" viewBox="0 0 920 420">
+<rect width="100%" height="100%" fill="#ffffff"/>
+<text x="460.0" y="28" text-anchor="middle" font-size="18" font-family="Arial" fill="#111">Scalability Throughput</text>
+<line x1="80" y1="340" x2="800" y2="340" stroke="#333"/>
+<line x1="80" y1="50" x2="80" y2="340" stroke="#333"/>
+<polyline fill="none" stroke="#4f46e5" stroke-width="2" points="80.00,50.00 122.35,87.87 164.71,93.54 207.06,89.09 249.41,81.26 291.76,80.61 334.12,271.86 376.47,270.79 418.82,270.50 461.18,270.52 503.53,270.74 545.88,272.76 588.24,304.79 630.59,304.57 672.94,305.39 715.29,305.04 757.65,304.83 800.00,304.85"/>
+<rect x="810" y="58" width="12" height="12" fill="#4f46e5"/>
+<text x="828" y="68" font-size="12" font-family="Arial" fill="#111">throughput</text>
+<text x="80.00" y="366" text-anchor="middle" font-size="11" font-family="Arial" fill="#111">agents/1/tasks/100</text>
+<text x="122.35" y="366" text-anchor="middle" font-size="11" font-family="Arial" fill="#111">agents/4/tasks/100</text>
+<text x="164.71" y="366" text-anchor="middle" font-size="11" font-family="Arial" fill="#111">agents/8/tasks/100</text>
+<text x="207.06" y="366" text-anchor="middle" font-size="11" font-family="Arial" fill="#111">agents/16/tasks/100</text>
+<text x="249.41" y="366" text-anchor="middle" font-size="11" font-family="Arial" fill="#111">agents/32/tasks/100</text>
+<text x="291.76" y="366" text-anchor="middle" font-size="11" font-family="Arial" fill="#111">agents/64/tasks/100</text>
+<text x="334.12" y="366" text-anchor="middle" font-size="11" font-family="Arial" fill="#111">agents/1/tasks/500</text>
+<text x="376.47" y="366" text-anchor="middle" font-size="11" font-family="Arial" fill="#111">agents/4/tasks/500</text>
+<text x="418.82" y="366" text-anchor="middle" font-size="11" font-family="Arial" fill="#111">agents/8/tasks/500</text>
+<text x="461.18" y="366" text-anchor="middle" font-size="11" font-family="Arial" fill="#111">agents/16/tasks/500</text>
+<text x="503.53" y="366" text-anchor="middle" font-size="11" font-family="Arial" fill="#111">agents/32/tasks/500</text>
+<text x="545.88" y="366" text-anchor="middle" font-size="11" font-family="Arial" fill="#111">agents/64/tasks/500</text>
+<text x="588.24" y="366" text-anchor="middle" font-size="11" font-family="Arial" fill="#111">agents/1/tasks/1000</text>
+<text x="630.59" y="366" text-anchor="middle" font-size="11" font-family="Arial" fill="#111">agents/4/tasks/1000</text>
+<text x="672.94" y="366" text-anchor="middle" font-size="11" font-family="Arial" fill="#111">agents/8/tasks/1000</text>
+<text x="715.29" y="366" text-anchor="middle" font-size="11" font-family="Arial" fill="#111">agents/16/tasks/1000</text>
+<text x="757.65" y="366" text-anchor="middle" font-size="11" font-family="Arial" fill="#111">agents/32/tasks/1000</text>
+<text x="800.00" y="366" text-anchor="middle" font-size="11" font-family="Arial" fill="#111">agents/64/tasks/1000</text>
+<text x="16" y="62" font-size="12" font-family="Arial" fill="#444">unit: /s</text>
+</svg>

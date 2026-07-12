@@ -43,7 +43,9 @@ class TestAgentLifecycleAPI:
             "agent_name": agent_name,
             "role": "测试员",
             "memory_max_bytes": 1024,
+            "memory_high_bytes": 512,
             "cpu_max": "50000 100000",
+            "pids_max": 16,
         })
         assert resp.status_code == 200
 
@@ -54,7 +56,9 @@ class TestAgentLifecycleAPI:
         assert acb["status"] == "READY"
         assert acb["current_task_id"] is None
         assert acb["resource_quota"]["memory_max_bytes"] == 1024
+        assert acb["resource_quota"]["memory_high_bytes"] == 512
         assert acb["resource_quota"]["cpu_max"] == "50000 100000"
+        assert acb["resource_quota"]["pids_max"] == 16
         assert acb["context_handle"] == {"context_id": None}
         assert acb["fault_domain"] == agent_name
         assert acb["trace_id"].startswith("trace_")

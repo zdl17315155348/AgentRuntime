@@ -8,7 +8,9 @@ def test_acb_from_agent_spec_captures_runtime_fields():
         agent_name="planner",
         role="规划者",
         memory_max_bytes=1024,
+        memory_high_bytes=512,
         cpu_max="50000 100000",
+        pids_max=16,
         llm_max_concurrent=2,
     )
 
@@ -17,7 +19,9 @@ def test_acb_from_agent_spec_captures_runtime_fields():
     assert acb.agent_name == "planner"
     assert acb.status == AgentStatus.CREATED
     assert acb.resource_quota.memory_max_bytes == 1024
+    assert acb.resource_quota.memory_high_bytes == 512
     assert acb.resource_quota.cpu_max == "50000 100000"
+    assert acb.resource_quota.pids_max == 16
     assert acb.resource_quota.llm_max_concurrent == 2
     assert acb.fault_domain == "planner"
     assert acb.trace_id.startswith("trace_")

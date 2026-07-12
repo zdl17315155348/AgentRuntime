@@ -79,6 +79,18 @@ async def test_message_router_disconnect_during_route_requeues_without_deadlock(
 
 
 @pytest.mark.anyio
+async def test_message_router_register_flush_requeues_without_deadlock():
+    r = MessageRouter()
+    await r.send(Message(from_agent="a", to_agent="b", payload={"i": 1}))
+
+    await asyncio.wait_for(r.register("b", _BrokenWriter()), timeout=1.0)
+
+    got = await asyncio.wait_for(r.receive("b", limit=10), timeout=1.0)
+    assert [m.payload for m in got] == [{"i": 1}]
+    assert await asyncio.wait_for(r.wait_connected("b", timeout_s=0.01), timeout=1.0) is False
+
+
+@pytest.mark.anyio
 async def test_message_router_reconnect_keeps_new_connection_event():
     r = MessageRouter()
     old_writer = _BrokenWriter()
