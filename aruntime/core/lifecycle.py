@@ -8,13 +8,15 @@ from aruntime.core.models import AgentStatus
 # 合法的状态转换映射表
 # 格式：当前状态 → 允许转换到的下一个状态集合
 ALLOWED_TRANSITIONS = {
-    AgentStatus.CREATED:   {AgentStatus.READY, AgentStatus.KILLED},
-    AgentStatus.READY:     {AgentStatus.RUNNING, AgentStatus.SUSPENDED, AgentStatus.ISOLATED, AgentStatus.KILLED},
-    AgentStatus.RUNNING:   {AgentStatus.COMPLETED, AgentStatus.FAILED, AgentStatus.WAITING, AgentStatus.SUSPENDED, AgentStatus.ISOLATED, AgentStatus.KILLED},
-    AgentStatus.WAITING:   {AgentStatus.READY, AgentStatus.SUSPENDED, AgentStatus.ISOLATED, AgentStatus.KILLED},
-    AgentStatus.FAILED:    {AgentStatus.READY, AgentStatus.ISOLATED, AgentStatus.KILLED},   # 失败后可重试回到 READY
-    AgentStatus.COMPLETED: {AgentStatus.READY, AgentStatus.KILLED},
-    AgentStatus.SUSPENDED: {AgentStatus.READY, AgentStatus.ISOLATED, AgentStatus.KILLED},
+    AgentStatus.CREATED:   {AgentStatus.READY, AgentStatus.FAILED},
+    AgentStatus.READY:     {AgentStatus.RUNNING, AgentStatus.SUSPENDED, AgentStatus.LOST, AgentStatus.KILLED},
+    AgentStatus.RUNNING:   {AgentStatus.WAITING, AgentStatus.COMPLETED, AgentStatus.FAILED, AgentStatus.ISOLATED, AgentStatus.LOST, AgentStatus.KILLED},
+    AgentStatus.WAITING:   {AgentStatus.READY, AgentStatus.FAILED, AgentStatus.LOST, AgentStatus.KILLED},
+    AgentStatus.FAILED:    {AgentStatus.RECOVERING, AgentStatus.ISOLATED, AgentStatus.KILLED},   # 失败后需先进入恢复态
+    AgentStatus.LOST:      {AgentStatus.RECOVERING, AgentStatus.ISOLATED, AgentStatus.KILLED},
+    AgentStatus.RECOVERING: {AgentStatus.READY, AgentStatus.KILLED},
+    AgentStatus.COMPLETED: set(),
+    AgentStatus.SUSPENDED: {AgentStatus.READY, AgentStatus.KILLED},
     AgentStatus.ISOLATED:  {AgentStatus.READY, AgentStatus.KILLED},
     AgentStatus.KILLED:    set(),        # 终态，不可转换
 }

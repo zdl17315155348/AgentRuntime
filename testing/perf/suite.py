@@ -133,12 +133,11 @@ class _SimulatedPool:
             return False, "cpu_slot_blocked"
         if self.memory_used + memory > self.memory_slots:
             return False, "memory_slot_blocked"
-        self.cpu_used += cpu
-        self.memory_used += memory
         return True, "resource_available"
 
     def acquire(self, task: TaskSpec) -> None:
-        return None
+        self.cpu_used += int(task.resource_request.get("cpu") or 0)
+        self.memory_used += int(task.resource_request.get("memory") or 0)
 
     def release(self, task: TaskSpec) -> None:
         self.cpu_used = max(0, self.cpu_used - int(task.resource_request.get("cpu") or 0))

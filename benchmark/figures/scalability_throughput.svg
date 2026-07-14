@@ -3,7 +3,7 @@
 <text x="460.0" y="28" text-anchor="middle" font-size="18" font-family="Arial" fill="#111">Scalability Throughput</text>
 <line x1="80" y1="340" x2="800" y2="340" stroke="#333"/>
 <line x1="80" y1="50" x2="80" y2="340" stroke="#333"/>
-<polyline fill="none" stroke="#4f46e5" stroke-width="2" points="80.00,50.00 122.35,87.87 164.71,93.54 207.06,89.09 249.41,81.26 291.76,80.61 334.12,271.86 376.47,270.79 418.82,270.50 461.18,270.52 503.53,270.74 545.88,272.76 588.24,304.79 630.59,304.57 672.94,305.39 715.29,305.04 757.65,304.83 800.00,304.85"/>
+<polyline fill="none" stroke="#4f46e5" stroke-width="2" points="80.00,50.00 122.35,56.55 164.71,53.99 207.06,54.48 249.41,56.37 291.76,53.20 334.12,273.57 376.47,272.11 418.82,272.01 461.18,272.27 503.53,272.25 545.88,272.36 588.24,305.73 630.59,305.67 672.94,305.78 715.29,305.66 757.65,305.86 800.00,306.02"/>
 <rect x="810" y="58" width="12" height="12" fill="#4f46e5"/>
 <text x="828" y="68" font-size="12" font-family="Arial" fill="#111">throughput</text>
 <text x="80.00" y="366" text-anchor="middle" font-size="11" font-family="Arial" fill="#111">agents/1/tasks/100</text>

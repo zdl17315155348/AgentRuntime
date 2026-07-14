@@ -68,6 +68,19 @@ class AgentControlBlock:
     created_at: datetime = field(default_factory=datetime.now)
     updated_at: datetime = field(default_factory=datetime.now)
     timeline: list[TimelineEvent] = field(default_factory=list)
+    _ALLOWED_TRANSITIONS = {
+        AgentStatus.CREATED: {AgentStatus.READY, AgentStatus.FAILED},
+        AgentStatus.READY: {AgentStatus.RUNNING, AgentStatus.SUSPENDED, AgentStatus.LOST, AgentStatus.KILLED},
+        AgentStatus.RUNNING: {AgentStatus.WAITING, AgentStatus.COMPLETED, AgentStatus.FAILED, AgentStatus.ISOLATED, AgentStatus.LOST, AgentStatus.KILLED},
+        AgentStatus.WAITING: {AgentStatus.READY, AgentStatus.FAILED, AgentStatus.LOST, AgentStatus.KILLED},
+        AgentStatus.FAILED: {AgentStatus.RECOVERING, AgentStatus.ISOLATED, AgentStatus.KILLED},
+        AgentStatus.LOST: {AgentStatus.RECOVERING, AgentStatus.ISOLATED, AgentStatus.KILLED},
+        AgentStatus.RECOVERING: {AgentStatus.READY, AgentStatus.KILLED},
+        AgentStatus.ISOLATED: {AgentStatus.READY, AgentStatus.KILLED},
+        AgentStatus.SUSPENDED: {AgentStatus.READY, AgentStatus.KILLED},
+        AgentStatus.COMPLETED: set(),
+        AgentStatus.KILLED: set(),
+    }
 
     @classmethod
     def from_agent_spec(cls, agent: AgentSpec) -> "AgentControlBlock":
@@ -122,6 +135,19 @@ class AgentControlBlock:
             )
         )
         self.updated_at = datetime.now()
+
+    def transition_to(
+        self,
+        target: AgentStatus,
+        task_id: str | None = None,
+        reason: str = "",
+        detail: dict[str, Any] | None = None,
+    ) -> None:
+        if target not in self._ALLOWED_TRANSITIONS.get(self.status, set()):
+            raise ValueError(f"invalid agent transition: {self.status} -> {target}")
+        old = self.status
+        self.status = target
+        self.record_transition(old, target, task_id=task_id, reason=reason, detail=detail)
 
     def set_current_task(self, task_id: str | None) -> None:
         self.current_task_id = task_id

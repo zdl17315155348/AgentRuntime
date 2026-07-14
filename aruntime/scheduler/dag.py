@@ -128,11 +128,13 @@ class DAGScheduler(BaseScheduler):
             if dependent_id in self.nodes and dependent_id not in self.failed_tasks:
                 dep_node = self.nodes[dependent_id]
                 edge_mode = dep_node.task.dependency_failure_policies.get(task_id)
-                mode = edge_mode or FailureMode(node.task.failure_policy.mode)
+                mode = edge_mode
+                if mode is None and "failure_policy" in node.task.model_fields_set:
+                    mode = FailureMode(node.task.failure_policy.mode)
                 if mode == FailureMode.FAIL_CLOSED:
                     dep_node.task.transition_to(TaskStatus.FAILED, "dependency_fail_closed")
                     self.fail_task(dependent_id)
-                elif edge_mode in (FailureMode.FAIL_OPEN, FailureMode.DEGRADE, FailureMode.FALLBACK):
+                elif mode in (FailureMode.FAIL_OPEN, FailureMode.DEGRADE, FailureMode.FALLBACK):
                     dep_node.dependencies.discard(task_id)
                     if dep_node.is_ready:
                         dep_node.task.transition_to(TaskStatus.READY, f"dependency_{mode.value}")
@@ -177,6 +179,31 @@ class DAGScheduler(BaseScheduler):
             task.dependencies.append(parent_task_id)
         
         self.enqueue(task)
+
+    def add_dependencies(self, task_id: str, dependency_ids: list[str]) -> None:
+        node = self.nodes.get(task_id)
+        if node is None:
+            raise KeyError(task_id)
+        task = node.task
+        if task.status in (TaskStatus.RUNNING, TaskStatus.SUCCESS, TaskStatus.FAILED, TaskStatus.CANCELLED):
+            raise ValueError("task state does not allow dependency updates")
+        unique_ids = list(dict.fromkeys(dependency_ids))
+        if task_id in unique_ids:
+            raise ValueError("self dependency is not allowed")
+        for dep_id in unique_ids:
+            dep_node = self.nodes.get(dep_id)
+            if dep_node is None:
+                raise KeyError(dep_id)
+        for dep_id in unique_ids:
+            if dep_id not in node.dependencies:
+                node.dependencies.add(dep_id)
+                self.nodes[dep_id].dependents.add(task_id)
+                if dep_id in self.completed_tasks:
+                    node.dependencies.discard(dep_id)
+        if task in self.task_queue and not node.is_ready:
+            task.transition_to(TaskStatus.PENDING, "waiting_dependencies")
+            if task not in self.waiting_queue:
+                self.waiting_queue.append(task)
     
     @property
     def pending_count(self) -> int:

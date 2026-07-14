@@ -11,6 +11,9 @@ class MessageRouter:
     def __init__(self, store=None):
         self._mailboxes: dict[str, Deque[Message]] = defaultdict(deque)
         self._dead_letters: dict[str, Deque[Message]] = defaultdict(deque)
+        self._unacked: dict[str, Message] = {}
+        self._processed: dict[str, set[str]] = defaultdict(set)
+        self._retry_count: dict[str, int] = defaultdict(int)
         self._connections: dict[str, asyncio.StreamWriter] = {}
         self._conn_locks: dict[str, asyncio.Lock] = {}
         self._connected_events: dict[str, asyncio.Event] = {}
@@ -19,6 +22,8 @@ class MessageRouter:
         self._store = store
 
     def _enqueue_locked(self, message: Message) -> None:
+        if message.message_id in self._processed[message.to_agent]:
+            return
         mailbox = self._mailboxes[message.to_agent]
         if self._mailbox_max > 0 and len(mailbox) >= self._mailbox_max:
             dropped = mailbox.popleft()
@@ -28,6 +33,8 @@ class MessageRouter:
         mailbox.append(message)
         if self._store is not None:
             self._store.save_mailbox_message(message, dead_letter=False)
+        if message.ack_required:
+            self._unacked[message.message_id] = message
 
     def restore_mailbox(self, messages: list[Message]) -> None:
         for message in messages:
@@ -46,10 +53,37 @@ class MessageRouter:
                 return []
             messages: list[Message] = []
             for _ in range(min(limit, len(mailbox))):
-                messages.append(mailbox.popleft())
+                message = mailbox.popleft()
+                if message.message_id in self._processed[agent_name]:
+                    continue
+                messages.append(message)
             if self._store is not None:
                 self._store.delete_mailbox_messages([message.message_id for message in messages])
             return messages
+
+    async def ack(self, agent_name: str, message_id: str) -> bool:
+        async with self._lock:
+            message = self._unacked.pop(message_id, None)
+            self._processed[agent_name].add(message_id)
+            if self._store is not None:
+                self._store.delete_mailbox_messages([message_id])
+            return message is not None
+
+    async def replay_unacked(self, agent_name: str, max_retries: int = 3) -> int:
+        async with self._lock:
+            messages = [msg for msg in self._unacked.values() if msg.to_agent == agent_name]
+            replay: list[Message] = []
+            for msg in messages:
+                self._retry_count[msg.message_id] += 1
+                if self._retry_count[msg.message_id] > max_retries:
+                    self._dead_letters[msg.to_agent].append(msg)
+                    self._unacked.pop(msg.message_id, None)
+                    if self._store is not None:
+                        self._store.save_mailbox_message(msg, dead_letter=True)
+                else:
+                    replay.append(msg)
+                    self._mailboxes[agent_name].appendleft(msg)
+            return len(replay)
 
     async def dead_letters(self, agent_name: str | None = None, limit: int = 50) -> list[Message]:
         async with self._lock:
@@ -69,12 +103,17 @@ class MessageRouter:
             if ev is None:
                 ev = asyncio.Event()
                 self._connected_events[agent_name] = ev
-            ev.set()
             queued = list(self._mailboxes.get(agent_name, deque()))
+            queued_ids = {msg.message_id for msg in queued}
+            queued.extend([
+                msg for msg in self._unacked.values()
+                if msg.to_agent == agent_name and msg.message_id not in queued_ids
+            ])
             if queued:
                 self._mailboxes[agent_name] = deque()
-            if self._store is not None:
-                self._store.delete_mailbox_messages([msg.message_id for msg in queued])
+        ev.set()
+        if self._store is not None and queued:
+            self._store.delete_mailbox_messages([msg.message_id for msg in queued])
 
         for msg in queued:
             await self._send_to_writer(agent_name, msg)

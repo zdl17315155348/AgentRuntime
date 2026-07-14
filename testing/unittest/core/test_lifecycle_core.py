@@ -46,9 +46,10 @@ class TestLifecycleBasic:
         transition_to(agent, AgentStatus.FAILED)
         assert agent.status == AgentStatus.FAILED
 
-    def test_failed_to_ready(self):
-        """FAILED → READY 合法（失败后可重试）"""
+    def test_failed_to_recovering_to_ready(self):
+        """FAILED → RECOVERING → READY 合法"""
         agent = _make_agent(AgentStatus.FAILED)
+        transition_to(agent, AgentStatus.RECOVERING)
         transition_to(agent, AgentStatus.READY)
         assert agent.status == AgentStatus.READY
 
@@ -63,6 +64,24 @@ class TestLifecycleBasic:
         agent = _make_agent(AgentStatus.WAITING)
         transition_to(agent, AgentStatus.READY)
         assert agent.status == AgentStatus.READY
+
+    def test_lost_recovery_loop(self):
+        """READY/RUNNING/WAITING → LOST → RECOVERING → READY 合法"""
+        for start in (AgentStatus.READY, AgentStatus.RUNNING, AgentStatus.WAITING):
+            agent = _make_agent(start)
+            transition_to(agent, AgentStatus.LOST)
+            transition_to(agent, AgentStatus.RECOVERING)
+            transition_to(agent, AgentStatus.READY)
+            assert agent.status == AgentStatus.READY
+
+    def test_lost_to_isolated_or_killed(self):
+        isolated = _make_agent(AgentStatus.LOST)
+        transition_to(isolated, AgentStatus.ISOLATED)
+        assert isolated.status == AgentStatus.ISOLATED
+
+        killed = _make_agent(AgentStatus.LOST)
+        transition_to(killed, AgentStatus.KILLED)
+        assert killed.status == AgentStatus.KILLED
 
 class TestLifecycleInvalidTransitions:
     """测试非法状态转换"""
@@ -103,7 +122,7 @@ class TestLifecycleCanTransition:
         """合法转换返回 True"""
         agent = _make_agent(AgentStatus.CREATED)
         assert can_transition_to(agent, AgentStatus.READY) is True
-        assert can_transition_to(agent, AgentStatus.KILLED) is True
+        assert can_transition_to(agent, AgentStatus.FAILED) is True
 
     def test_can_transition_illegal(self):
         """非法转换返回 False"""
@@ -111,10 +130,10 @@ class TestLifecycleCanTransition:
         assert can_transition_to(agent, AgentStatus.RUNNING) is False
         assert can_transition_to(agent, AgentStatus.COMPLETED) is False
 
-    def test_completed_can_transition_to_ready_and_killed(self):
+    def test_completed_is_terminal(self):
         agent = _make_agent(AgentStatus.COMPLETED)
-        assert can_transition_to(agent, AgentStatus.READY) is True
-        assert can_transition_to(agent, AgentStatus.KILLED) is True
+        assert can_transition_to(agent, AgentStatus.READY) is False
+        assert can_transition_to(agent, AgentStatus.KILLED) is False
 
     def test_killed_cannot_transition(self):
         """终态 KILLED 不能转换到任何状态"""

@@ -222,12 +222,12 @@ def test_repeated_record_on_compressed_context_does_not_increment_compression_co
     assert manager.get_metrics()["compression_count"] == first_count
 
 
-def test_compressed_context_ignores_later_payload_growth():
-    manager = ContextManager(compress_threshold_chars=20)
+def test_compressed_context_keeps_later_delta_payload():
+    manager = ContextManager(compress_threshold_chars=100)
     manager.record_task_context(
         context_id="ctx-compressed-stable",
         agent_name="planner",
-        shared_data={"long": "abcdefghijklmnopqrstuvwxyz"},
+        shared_data={"long": "abcdefghijklmnopqrstuvwxyz" * 4},
     )
 
     manager.record_task_context(
@@ -240,7 +240,8 @@ def test_compressed_context_ignores_later_payload_growth():
     built = manager.build_agent_context("ctx-compressed-stable", "planner")
     assert built["shared"]["__structured_summary__"] is True
     assert "long" in built["shared"]["keys"]
-    assert built["private"] == {}
+    assert built["shared"]["new"] == "value"
+    assert built["private"] == {"secret": "later"}
 
 
 def test_large_private_data_triggers_compression():
@@ -298,6 +299,23 @@ def test_execution_context_tracks_prefix_cache_hit_and_saved_tokens():
     assert metrics["token_saved_ratio"] > 0
 
 
+def test_full_context_cache_key_includes_agent_private_context():
+    manager = ContextManager(compress_threshold_chars=1000)
+    manager.record_task_context("ctx-cache-private", "planner", shared_data={"repo": "agent-runtime-os"})
+    manager.record_task_context("ctx-cache-private", "agent-a", private_data={"secret": "a"})
+    manager.record_task_context("ctx-cache-private", "agent-b", private_data={"secret": "b"})
+
+    first = manager.build_agent_context("ctx-cache-private", "agent-a")
+    second = manager.build_agent_context("ctx-cache-private", "agent-b")
+
+    assert first["execution"]["shared_prefix_hit"] is False
+    assert first["execution"]["full_context_hit"] is False
+    assert second["execution"]["shared_prefix_hit"] is True
+    assert second["execution"]["full_context_hit"] is False
+    assert second["execution"]["cache_hit"] is False
+    assert second["execution"]["full_execution_context_hash"] != first["execution"]["full_execution_context_hash"]
+
+
 def test_semantic_context_reports_version_and_keys():
     manager = ContextManager(compress_threshold_chars=1000)
     manager.record_task_context(
@@ -342,4 +360,4 @@ def test_context_reports_readonly_diff_summary_and_execution_metrics():
     metrics = manager.get_metrics()
     assert metrics["token_saving_ratio"] > 0
     assert metrics["context_build_time_ms"] >= 0
-    assert metrics["prefix_hit_ratio"] == metrics["cache_hit_ratio"]
+    assert metrics["prefix_hit_ratio"] >= metrics["cache_hit_ratio"]

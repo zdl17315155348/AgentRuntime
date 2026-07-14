@@ -147,6 +147,74 @@ def test_kernel_scheduler_moves_resource_blocked_task_to_waiting_then_wakes():
     assert task.resource_block_reason == ""
 
 
+def test_kernel_scheduler_keeps_resource_blocked_task_waiting_until_resources_available():
+    calls = {"count": 0}
+
+    def checker(task):
+        calls["count"] += 1
+        if calls["count"] < 3:
+            return False, "cpu_busy"
+        return True, "resource_available"
+
+    scheduler = KernelScheduler(policy="resource_aware", resource_checker=checker)
+    task = TaskSpec(task_id="t1", agent_name="agent1", task_input={})
+
+    scheduler.enqueue(task)
+    assert scheduler.dispatch_ready() == []
+    scheduler.wake_waiting()
+
+    assert scheduler.queue_snapshot()["ready"] == []
+    assert scheduler.queue_snapshot()["waiting"] == ["t1"]
+    assert task.resource_block_reason == "cpu_busy"
+
+    assert scheduler.dispatch_ready() == [task]
+
+
+def test_kernel_scheduler_default_fail_open_releases_dependent_task():
+    scheduler = KernelScheduler()
+    task1 = TaskSpec(
+        task_id="t1",
+        agent_name="agent1",
+        task_input={},
+        failure_policy={"mode": "fail_open"},
+    )
+    task2 = TaskSpec(task_id="t2", agent_name="agent2", task_input={}, dependencies=["t1"])
+
+    scheduler.enqueue(task1)
+    scheduler.enqueue(task2)
+    scheduler.dequeue()
+    scheduler.fail_task("t1")
+
+    assert "t2" not in scheduler.failed_tasks
+    assert scheduler.queue_snapshot()["ready"] == ["t2"]
+
+
+def test_kernel_scheduler_resource_aware_score_uses_normalized_ratios():
+    scheduler = KernelScheduler(policy="resource_aware", resource_checker=lambda task: (True, "resource_available"))
+    low_ratio = TaskSpec(
+        task_id="low_ratio",
+        agent_name="agent1",
+        task_input={},
+        resource_request={"memory_max_bytes": 100_000_000, "token_budget": 100, "llm_max_concurrent": 1},
+    )
+    balanced_heavy = TaskSpec(
+        task_id="balanced",
+        agent_name="agent1",
+        task_input={},
+        resource_request={"memory_max_bytes": 90_000_000, "token_budget": 10_000, "llm_max_concurrent": 10},
+    )
+
+    scheduler.enqueue(low_ratio)
+    scheduler.enqueue(balanced_heavy)
+    dispatched = scheduler.dispatch_ready(limit=2)
+
+    assert [task.task_id for task in dispatched] == ["low_ratio", "balanced"]
+    assert '"memory_ratio"' in low_ratio.scheduler_decision_reason
+    assert '"token_ratio"' in low_ratio.scheduler_decision_reason
+    assert '"llm_ratio"' in low_ratio.scheduler_decision_reason
+    assert '"final_score"' in low_ratio.scheduler_decision_reason
+
+
 def test_kernel_scheduler_policy_plugins_order_tasks():
     low = TaskSpec(task_id="low", agent_name="agent1", task_input={}, priority=1)
     high = TaskSpec(task_id="high", agent_name="agent1", task_input={}, priority=10)

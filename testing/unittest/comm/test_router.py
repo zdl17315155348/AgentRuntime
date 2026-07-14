@@ -52,6 +52,36 @@ class _BrokenWriter:
         return None
 
 
+class _SlowWriter:
+    def __init__(self):
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    def write(self, data: bytes) -> None:
+        return None
+
+    async def drain(self) -> None:
+        self.started.set()
+        await self.release.wait()
+
+
+@pytest.mark.anyio
+async def test_message_router_slow_drain_does_not_block_global_mailbox_operations():
+    r = MessageRouter()
+    writer = _SlowWriter()
+    await r.register("online", writer)
+
+    route_task = asyncio.create_task(r.route(Message(from_agent="a", to_agent="online", payload={"i": 1})))
+    await asyncio.wait_for(writer.started.wait(), timeout=1.0)
+
+    await asyncio.wait_for(r.send(Message(from_agent="a", to_agent="offline", payload={"i": 2})), timeout=0.1)
+    got = await asyncio.wait_for(r.receive("offline", limit=10), timeout=0.1)
+
+    writer.release.set()
+    await asyncio.wait_for(route_task, timeout=1.0)
+    assert [m.payload for m in got] == [{"i": 2}]
+
+
 @pytest.mark.anyio
 async def test_message_router_concurrent_offline_routes_do_not_deadlock():
     r = MessageRouter()

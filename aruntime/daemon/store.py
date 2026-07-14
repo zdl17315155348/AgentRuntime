@@ -158,8 +158,25 @@ class SQLiteStateStore:
     def release_all_active_leases(self, reason: str = "daemon.recovery") -> None:
         with self._lock:
             rows = self._conn.execute("SELECT task_id FROM resource_leases WHERE status = 'active'").fetchall()
+            task_ids = [row["task_id"] for row in rows]
+            for task_id in task_ids:
+                self._release_leases_for_task_unlocked(task_id, reason=reason)
+            self._conn.commit()
+
+    def _release_leases_for_task_unlocked(self, task_id: str, reason: str = "") -> None:
+        rows = self._conn.execute(
+            "SELECT lease_id, data FROM resource_leases WHERE task_id = ? AND status = 'active'",
+            (task_id,),
+        ).fetchall()
         for row in rows:
-            self.release_leases_for_task(row["task_id"], reason=reason)
+            data = json.loads(row["data"])
+            data["status"] = "released"
+            data["released_at"] = datetime.now().isoformat()
+            data["reason"] = reason
+            self._conn.execute(
+                "UPDATE resource_leases SET status = 'released', data = ?, updated_at = ? WHERE lease_id = ?",
+                (json.dumps(data, ensure_ascii=False), datetime.now().isoformat(), row["lease_id"]),
+            )
 
     def save_mailbox_message(self, message: Message, dead_letter: bool = False) -> None:
         with self._lock:

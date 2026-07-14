@@ -10,7 +10,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field, field_validator
 
 from aruntime.core.acb import AgentControlBlock
-from aruntime.core.models import AgentSpec, FailurePolicy, FailureMode, TaskAttempt, TaskSpec, TaskStatus, AgentStatus
+from aruntime.core.models import AgentCapability, AgentSpec, FailurePolicy, FailureMode, SideEffectLevel, TaskAttempt, TaskSpec, TaskStatus, AgentStatus
 from aruntime.core.lifecycle import transition_to, InvalidTransitionError
 from aruntime.scheduler.fifo import FIFOScheduler
 from aruntime.scheduler.dag import DAGScheduler
@@ -126,12 +126,14 @@ if SCHEDULER_TYPE == "kernel":
     _inner: BaseScheduler = KernelScheduler(
         policy=SCHEDULER_POLICY,
         resource_checker=_kernel_resource_checker if resource_monitor is not None else None,
+        agent_provider=lambda: list(agents.values()),
     )
 elif SCHEDULER_TYPE in ("fifo", "priority", "resource_aware", "fair_share", "deadline"):
     policy = "resource_aware" if SCHEDULER_TYPE == "resource_aware" else SCHEDULER_TYPE
     _inner: BaseScheduler = KernelScheduler(
         policy=policy,
         resource_checker=_kernel_resource_checker if resource_monitor is not None else None,
+        agent_provider=lambda: list(agents.values()),
     )
 elif SCHEDULER_TYPE == "dag":
     _inner: BaseScheduler = DAGScheduler()
@@ -216,6 +218,15 @@ def _transition_agent(
     agent = agents[agent_name]
     transition_to(agent, new_status, task_id=task_id, reason=reason)
     _persist_agent(agent_name)
+
+
+def _recover_agent(agent_name: str, task_id: str | None = None, reason: str = "agent.recover") -> None:
+    agent = agents.get(agent_name)
+    if agent is None:
+        return
+    if agent.status == AgentStatus.FAILED:
+        _transition_agent(agent_name, AgentStatus.RECOVERING, task_id=task_id, reason=f"{reason}.start")
+        _transition_agent(agent_name, AgentStatus.READY, task_id=task_id, reason=f"{reason}.ready")
 
 
 def _set_current_task(agent_name: str, task_id: str | None) -> None:
@@ -355,8 +366,11 @@ def _prepare_agent_for_task(task: TaskSpec, reason: str) -> None:
     agent = agents.get(task.agent_name)
     if agent is None:
         return
-    if agent.status in (AgentStatus.COMPLETED, AgentStatus.FAILED):
-        _transition_agent(task.agent_name, AgentStatus.READY, task_id=task.task_id, reason=f"{reason}.ready")
+    if agent.status == AgentStatus.FAILED:
+        _recover_agent(task.agent_name, task.task_id, reason=f"{reason}.recover")
+    elif agent.status == AgentStatus.COMPLETED:
+        agent.status = AgentStatus.READY
+        _persist_agent(task.agent_name)
     _set_context_handle(task.agent_name, task.context_id or None)
     _transition_agent(task.agent_name, AgentStatus.RUNNING, task_id=task.task_id, reason=reason)
     _set_current_task(task.agent_name, task.task_id)
@@ -367,27 +381,36 @@ class CreateAgentRequest(BaseModel):
     role: str
     system_prompt: str = ""
     model: str = "gpt-4o-mini"
+    capability: AgentCapability = Field(default_factory=AgentCapability)
     max_retries: int = 3
+    restart_budget: int = 3
+    fault_domain: str = ""
     memory_max_bytes: int | None = None
     memory_high_bytes: int | None = None
     cpu_max: str = ""
     pids_max: int | None = None
 
 class SubmitTaskRequest(BaseModel):
-    agent_name: str
+    agent_name: str | None = None
     task_input: dict
     context_id: str = ""
     priority: int = 0
     deadline: Optional[datetime] = None
     resource_request: dict = Field(default_factory=dict)
+    required_capability: dict = Field(default_factory=dict)
     token_budget: Optional[int] = None
     timeout: Optional[float] = None
+    timeout_ms: Optional[int] = None
     parent_task_id: str = ""
+    children: list[str] = Field(default_factory=list)
     trace_id: str = ""
     dependencies: list[str] = Field(default_factory=list)
     dependency_failure_policies: dict[str, FailureMode] = Field(default_factory=dict)
     on_failure: dict[str, FailureMode] = Field(default_factory=dict)
     failure_policy: FailurePolicy = Field(default_factory=FailurePolicy)
+    idempotency_key: str | None = None
+    side_effect_level: SideEffectLevel = SideEffectLevel.NONE
+    compensation: dict = Field(default_factory=dict)
 
     @field_validator("failure_policy", mode="before")
     @classmethod
@@ -406,19 +429,25 @@ class SubmitTaskRequest(BaseModel):
 
 
 class SubmitDynamicTaskRequest(BaseModel):
-    agent_name: str
+    agent_name: str | None = None
     task_input: dict
     parent_task_id: str = ""
     context_id: str = ""
     priority: int = 0
     deadline: Optional[datetime] = None
     resource_request: dict = Field(default_factory=dict)
+    required_capability: dict = Field(default_factory=dict)
     token_budget: Optional[int] = None
     timeout: Optional[float] = None
+    timeout_ms: Optional[int] = None
     trace_id: str = ""
     dependency_failure_policies: dict[str, FailureMode] = Field(default_factory=dict)
     on_failure: dict[str, FailureMode] = Field(default_factory=dict)
     failure_policy: FailurePolicy = Field(default_factory=FailurePolicy)
+    idempotency_key: str | None = None
+    side_effect_level: SideEffectLevel = SideEffectLevel.NONE
+    compensation: dict = Field(default_factory=dict)
+    inherit_context: bool = True
 
     @field_validator("failure_policy", mode="before")
     @classmethod
@@ -441,6 +470,18 @@ class SendMessageRequest(BaseModel):
     to_agent: str
     payload: dict
     topic: str = ""
+
+
+class SpawnTaskRequest(BaseModel):
+    task_input: dict
+    agent_name: str | None = None
+    required_capability: dict = Field(default_factory=dict)
+    dependencies: list[str] = Field(default_factory=list)
+    priority: int = 0
+    resource_request: dict = Field(default_factory=dict)
+    inherit_context: bool = True
+    context_id: str = ""
+    timeout_ms: Optional[int] = None
 
 
 def _record_task_context(context_id: str, agent_name: str, task_input: dict) -> None:
@@ -474,6 +515,9 @@ def _make_task(**kwargs) -> TaskSpec:
     trace_id = kwargs.pop("trace_id", "")
     if trace_id:
         kwargs["trace_id"] = trace_id
+    explicit_fields = kwargs.pop("_explicit_fields", set())
+    if "failure_policy" not in explicit_fields:
+        kwargs.pop("failure_policy", None)
     return TaskSpec(**kwargs)
 
 
@@ -481,6 +525,43 @@ def _edge_failure_policies(req) -> dict[str, FailureMode]:
     result = dict(getattr(req, "dependency_failure_policies", {}) or {})
     result.update(getattr(req, "on_failure", {}) or {})
     return result
+
+
+def _explicit_fields(req) -> set[str]:
+    return set(getattr(req, "model_fields_set", set()))
+
+
+def _select_agent_name(agent_name: str | None, required_capability: dict | None) -> str | None:
+    if agent_name:
+        return agent_name
+    if not required_capability:
+        return None
+    req = required_capability or {}
+    matched: list[AgentSpec] = []
+    for agent in agents.values():
+        cap = agent.capability
+        if req.get("can_plan") and not cap.can_plan:
+            continue
+        if req.get("can_code") and not cap.can_code:
+            continue
+        if req.get("can_test") and not cap.can_test:
+            continue
+        if req.get("can_review") and not cap.can_review:
+            continue
+        if req.get("language") and req["language"] not in cap.languages:
+            continue
+        if req.get("tool") and req["tool"] not in cap.tools:
+            continue
+        matched.append(agent)
+    if matched:
+        matched.sort(key=lambda item: (-float(item.capability.reliability_score), int(item.capability.cost_level), item.agent_name))
+        return matched[0].agent_name
+    target = scheduler._inner if hasattr(scheduler, "_inner") else scheduler
+    if hasattr(target, "match_agent"):
+        probe = TaskSpec(agent_name=None, task_input={}, required_capability=required_capability or {})
+        selected = target.match_agent(probe, list(agents.values()))
+        return selected.agent_name if selected is not None else None
+    return None
 
 
 def _scheduler_metrics() -> dict:
@@ -582,7 +663,10 @@ async def create_agent(req: CreateAgentRequest):
         role=req.role,
         system_prompt=req.system_prompt,
         model=req.model,
+        capability=req.capability,
         max_retries=req.max_retries,
+        restart_budget=req.restart_budget,
+        fault_domain=req.fault_domain or None,
         memory_max_bytes=req.memory_max_bytes,
         memory_high_bytes=req.memory_high_bytes,
         cpu_max=req.cpu_max or None,
@@ -665,28 +749,35 @@ async def restart_agent(agent_name: str):
 
 @app.post("/tasks")
 async def submit_task(req: SubmitTaskRequest):
-    if req.agent_name not in agents:
-        raise HTTPException(status_code=404, detail=f"Agent '{req.agent_name}' 不存在")
+    selected_agent_name = _select_agent_name(req.agent_name, req.required_capability)
+    if selected_agent_name is None:
+        raise HTTPException(status_code=404, detail="没有匹配任务能力需求的 Agent")
+    if selected_agent_name not in agents:
+        raise HTTPException(status_code=404, detail=f"Agent '{selected_agent_name}' 不存在")
 
-    agent = agents[req.agent_name]
+    agent = agents[selected_agent_name]
     if agent.status in (AgentStatus.KILLED, AgentStatus.SUSPENDED, AgentStatus.ISOLATED):
         raise HTTPException(
             status_code=409,
-            detail=f"Agent '{req.agent_name}' 当前状态为 {agent.status}，无法接受新任务"
+            detail=f"Agent '{selected_agent_name}' 当前状态为 {agent.status}，无法接受新任务"
         )
     if agent.status in (AgentStatus.COMPLETED, AgentStatus.FAILED):
-        _transition_agent(req.agent_name, AgentStatus.READY, reason="task.submit")
+        if agent.status == AgentStatus.FAILED:
+            _recover_agent(selected_agent_name, reason="task.submit")
+        else:
+            agent.status = AgentStatus.READY
+            _persist_agent(selected_agent_name)
 
     # 验证依赖任务是否存在
     for dep_id in req.dependencies:
         if dep_id not in tasks:
             raise HTTPException(status_code=404, detail=f"依赖任务 '{dep_id}' 不存在")
 
-    _record_task_context(req.context_id, req.agent_name, req.task_input)
-    _set_context_handle(req.agent_name, req.context_id or None)
+    _record_task_context(req.context_id, selected_agent_name, req.task_input)
+    _set_context_handle(selected_agent_name, req.context_id or None)
 
     task = _make_task(
-        agent_name=req.agent_name,
+        agent_name=selected_agent_name,
         task_input=req.task_input,
         context_id=req.context_id,
         priority=req.priority,
@@ -694,18 +785,25 @@ async def submit_task(req: SubmitTaskRequest):
         resource_request=req.resource_request,
         token_budget=req.token_budget,
         timeout=req.timeout,
+        timeout_ms=req.timeout_ms,
         parent_task_id=req.parent_task_id or None,
+        children=req.children,
         trace_id=req.trace_id,
         dependencies=req.dependencies,
         dependency_failure_policies=_edge_failure_policies(req),
         failure_policy=req.failure_policy,
+        required_capability=req.required_capability,
+        idempotency_key=req.idempotency_key,
+        side_effect_level=req.side_effect_level,
+        compensation=req.compensation,
+        _explicit_fields=_explicit_fields(req),
     )
     tasks[task.task_id] = task
     trace_recorder.ensure_trace(task.trace_id, task.task_id)
-    _record_trace_event(task, "task.created", {"agent_name": task.agent_name})
+    _record_trace_event(task, "task.created", {"agent_name": task.agent_name, "required_capability": task.required_capability})
     scheduler.enqueue(task)
     _record_trace_event(task, "scheduler.enqueue", {"status": task.status})
-    agent_inflight_tasks[req.agent_name] = agent_inflight_tasks.get(req.agent_name, 0) + 1
+    agent_inflight_tasks[selected_agent_name] = agent_inflight_tasks.get(selected_agent_name, 0) + 1
     _persist_task(task)
     _wake_scheduler()
     logger.info(f"任务 {task.task_id} 已入队（依赖: {req.dependencies}，等待前面 {scheduler.pending_count - 1} 个任务）")
@@ -718,27 +816,34 @@ async def submit_dynamic_task(req: SubmitDynamicTaskRequest):
     """
     动态提交任务（由运行中的任务生成）
     """
-    if req.agent_name not in agents:
-        raise HTTPException(status_code=404, detail=f"Agent '{req.agent_name}' 不存在")
+    selected_agent_name = _select_agent_name(req.agent_name, req.required_capability)
+    if selected_agent_name is None:
+        raise HTTPException(status_code=404, detail="没有匹配任务能力需求的 Agent")
+    if selected_agent_name not in agents:
+        raise HTTPException(status_code=404, detail=f"Agent '{selected_agent_name}' 不存在")
 
-    agent = agents[req.agent_name]
+    agent = agents[selected_agent_name]
     if agent.status in (AgentStatus.KILLED, AgentStatus.SUSPENDED, AgentStatus.ISOLATED):
         raise HTTPException(
             status_code=409,
-            detail=f"Agent '{req.agent_name}' 当前状态为 {agent.status}，无法接受新任务"
+            detail=f"Agent '{selected_agent_name}' 当前状态为 {agent.status}，无法接受新任务"
         )
     if agent.status in (AgentStatus.COMPLETED, AgentStatus.FAILED):
-        _transition_agent(req.agent_name, AgentStatus.READY, reason="task.dynamic_submit")
+        if agent.status == AgentStatus.FAILED:
+            _recover_agent(selected_agent_name, reason="task.dynamic_submit")
+        else:
+            agent.status = AgentStatus.READY
+            _persist_agent(selected_agent_name)
     
     # 验证父任务是否存在
     if req.parent_task_id and req.parent_task_id not in tasks:
         raise HTTPException(status_code=404, detail=f"父任务 '{req.parent_task_id}' 不存在")
 
-    _record_task_context(req.context_id, req.agent_name, req.task_input)
-    _set_context_handle(req.agent_name, req.context_id or None)
+    _record_task_context(req.context_id, selected_agent_name, req.task_input)
+    _set_context_handle(selected_agent_name, req.context_id or None)
 
     task = _make_task(
-        agent_name=req.agent_name,
+        agent_name=selected_agent_name,
         task_input=req.task_input,
         context_id=req.context_id,
         priority=req.priority,
@@ -746,11 +851,17 @@ async def submit_dynamic_task(req: SubmitDynamicTaskRequest):
         resource_request=req.resource_request,
         token_budget=req.token_budget,
         timeout=req.timeout,
+        timeout_ms=req.timeout_ms,
         parent_task_id=req.parent_task_id or None,
         trace_id=req.trace_id,
         dependencies=[req.parent_task_id] if req.parent_task_id else [],
         dependency_failure_policies=_edge_failure_policies(req),
         failure_policy=req.failure_policy,
+        required_capability=req.required_capability,
+        idempotency_key=req.idempotency_key,
+        side_effect_level=req.side_effect_level,
+        compensation=req.compensation,
+        _explicit_fields=_explicit_fields(req),
     )
     tasks[task.task_id] = task
     trace_recorder.ensure_trace(task.trace_id, task.task_id)
@@ -762,12 +873,99 @@ async def submit_dynamic_task(req: SubmitDynamicTaskRequest):
     else:
         scheduler.enqueue(task)
     _record_trace_event(task, "scheduler.enqueue", {"status": task.status})
-    agent_inflight_tasks[req.agent_name] = agent_inflight_tasks.get(req.agent_name, 0) + 1
+    agent_inflight_tasks[selected_agent_name] = agent_inflight_tasks.get(selected_agent_name, 0) + 1
     _persist_task(task)
     _wake_scheduler()
     
     logger.info(f"动态任务 {task.task_id} 已入队（父任务: {req.parent_task_id}）")
     return {"task_id": task.task_id, "status": task.status, "message": "动态任务已加入调度队列"}
+
+
+@app.post("/tasks/{task_id}/spawn")
+async def spawn_task(task_id: str, req: SpawnTaskRequest):
+    if task_id not in tasks:
+        raise HTTPException(status_code=404, detail=f"父任务 '{task_id}' 不存在")
+    parent = tasks[task_id]
+    selected_agent_name = _select_agent_name(req.agent_name, req.required_capability)
+    if selected_agent_name is None:
+        raise HTTPException(status_code=404, detail="没有匹配任务能力需求的 Agent")
+    if selected_agent_name not in agents:
+        raise HTTPException(status_code=404, detail=f"Agent '{selected_agent_name}' 不存在")
+    for dep_id in req.dependencies:
+        if dep_id not in tasks:
+            raise HTTPException(status_code=404, detail=f"依赖任务 '{dep_id}' 不存在")
+
+    context_id = req.context_id or (parent.context_id if req.inherit_context else "")
+    dependency_ids = list(dict.fromkeys(req.dependencies))
+    child = _make_task(
+        agent_name=selected_agent_name,
+        task_input=req.task_input,
+        context_id=context_id or None,
+        priority=req.priority,
+        resource_request=req.resource_request,
+        timeout_ms=req.timeout_ms,
+        parent_task_id=task_id,
+        trace_id=parent.trace_id,
+        dependencies=dependency_ids,
+        required_capability=req.required_capability,
+    )
+    tasks[child.task_id] = child
+    parent.children.append(child.task_id)
+    trace_recorder.ensure_trace(child.trace_id, child.task_id)
+    _record_trace_event(child, "task.spawned", {"parent_task_id": task_id, "dependencies": dependency_ids})
+    scheduler.enqueue(child)
+    _record_trace_event(child, "scheduler.enqueue", {"status": child.status})
+    _persist_task(parent)
+    _persist_task(child)
+    _wake_scheduler()
+    return {"task_id": child.task_id, "status": child.status, "parent_task_id": task_id, "trace_id": child.trace_id}
+
+
+@app.get("/tasks/{task_id}/children")
+async def get_task_children(task_id: str):
+    if task_id not in tasks:
+        raise HTTPException(status_code=404, detail="Task not found")
+    return {"task_id": task_id, "children": tasks[task_id].children}
+
+
+@app.get("/tasks/{task_id}/dag")
+async def get_task_dag(task_id: str):
+    if task_id not in tasks:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    def walk(current_id: str) -> dict:
+        current = tasks[current_id]
+        return {
+            "task_id": current.task_id,
+            "agent_name": current.agent_name,
+            "status": current.status,
+            "dependencies": current.dependencies,
+            "children": [walk(child_id) for child_id in current.children if child_id in tasks],
+        }
+
+    return walk(task_id)
+
+
+@app.post("/tasks/{task_id}/dependencies")
+async def add_task_dependencies(task_id: str, dependencies: list[str]):
+    if task_id not in tasks:
+        raise HTTPException(status_code=404, detail="Task not found")
+    task = tasks[task_id]
+    for dep_id in dependencies:
+        if dep_id not in tasks:
+            raise HTTPException(status_code=404, detail=f"依赖任务 '{dep_id}' 不存在")
+    unique_ids = list(dict.fromkeys(dependencies))
+    try:
+        if hasattr(scheduler, "add_dependencies"):
+            scheduler.add_dependencies(task_id, unique_ids)
+        else:
+            for dep_id in unique_ids:
+                if dep_id not in task.dependencies:
+                    task.dependencies.append(dep_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    _persist_task(task)
+    return {"task_id": task_id, "dependencies": task.dependencies}
 
 @app.get("/tasks/{task_id}")
 async def get_task(task_id: str):
@@ -946,10 +1144,12 @@ async def _run_task_once(
         if not sent:
             raise RuntimeError("failed to send exec_task")
 
-        timeout_s = task.timeout or (task.failure_policy.timeout_ms / 1000.0)
+        timeout_s = (task.timeout_ms / 1000.0) if task.timeout_ms is not None else (task.timeout or (task.failure_policy.timeout_ms / 1000.0))
         try:
             result = await asyncio.wait_for(fut, timeout=timeout_s)
         except asyncio.TimeoutError:
+            task.transition_to(TaskStatus.TIMEOUT, "task.timeout")
+            _record_trace_event(task, "task.timeout", {"timeout_s": timeout_s})
             raise RuntimeError("task timeout")
 
         status = result.get("status")
@@ -997,6 +1197,11 @@ async def _run_task_with_policy(task: TaskSpec) -> tuple[bool, str]:
     max_attempts = max(int(task.failure_policy.max_retries or 0) + 1, 1)
     last_error = ""
     for attempt in range(max_attempts):
+        if task.status == TaskStatus.TIMEOUT:
+            task.transition_to(TaskStatus.RETRYING, "task.retry")
+            task.transition_to(TaskStatus.RUNNING, "task.retry.dispatch")
+        elif task.status == TaskStatus.RETRYING:
+            task.transition_to(TaskStatus.RUNNING, "task.retry.dispatch")
         task_attempt = task.create_attempt(
             task.agent_name,
             worker_pid=(agent_workers.get(task.agent_name).pid if task.agent_name in agent_workers else None),
@@ -1030,11 +1235,15 @@ async def _run_task_with_policy(task: TaskSpec) -> tuple[bool, str]:
                 continue
 
     if task.failure_policy.mode == FailureMode.FALLBACK.value and task.failure_policy.fallback_agent:
+        if task.status == TaskStatus.TIMEOUT:
+            task.transition_to(TaskStatus.FALLBACK, "task.fallback")
         fallback_agent_name = task.failure_policy.fallback_agent
         fallback_attempt = _prepare_fallback_attempt(task, fallback_agent_name)
         if fallback_attempt is not None:
             _record_trace_event(task, "task.fallback", {"fallback_agent": fallback_agent_name})
             agent = agents[fallback_agent_name]
+            if task.status == TaskStatus.FALLBACK:
+                task.transition_to(TaskStatus.RUNNING, "task.fallback.dispatch")
             try:
                 _transition_agent(fallback_agent_name, AgentStatus.RUNNING, task_id=task.task_id, reason="scheduler.fallback_dispatch")
             except InvalidTransitionError:
@@ -1104,7 +1313,7 @@ async def _execute_task(task: TaskSpec) -> None:
             task.result = {"role": agent.role if agent else "", "output": output_or_error}
             if agent is not None and agent.status != AgentStatus.KILLED:
                 if agent.status == AgentStatus.FAILED:
-                    _transition_agent(task.agent_name, AgentStatus.READY, task_id=task.task_id, reason="task.recovered")
+                    _recover_agent(task.agent_name, task.task_id, reason="task.recovered")
                 if agent.status == AgentStatus.RUNNING:
                     _transition_agent(task.agent_name, AgentStatus.COMPLETED, task_id=task.task_id, reason="task.success")
             scheduler.complete_task(task.task_id)

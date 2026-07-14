@@ -5,6 +5,15 @@ import sys
 from uuid import uuid4
 
 from aruntime.llm.gateway import LLMGateway
+from aruntime.executor.task_executor import TaskExecutor
+from aruntime.tools.base import ToolExecutionContext, ToolPermissionError, ToolTimeoutError
+from aruntime.tools.file_tools import ReadFileTool, WriteFileTool, SearchCodeTool
+from aruntime.tools.git_tools import GitDiffTool, GitStatusTool
+from aruntime.tools.pytest_tool import RunPytestTool
+from aruntime.tools.repo_scan_tool import RepoScanTool
+from aruntime.tools.registry import ToolRegistry
+from aruntime.tools.shell_tool import RunCommandTool
+from pathlib import Path
 
 
 def _encode_line(obj: dict) -> bytes:
@@ -25,6 +34,27 @@ async def _run() -> None:
     llm_backend = os.getenv("LLM_BACKEND", "mock")
     llm_api_key = os.getenv("LLM_API_KEY", "")
     llm_gateway = LLMGateway(backend=llm_backend, api_key=llm_api_key)
+    registry = ToolRegistry()
+    for tool in (
+        RepoScanTool(),
+        ReadFileTool(),
+        SearchCodeTool(),
+        WriteFileTool(),
+        GitDiffTool(),
+        GitStatusTool(),
+        RunPytestTool(),
+        RunCommandTool(),
+    ):
+        registry.register(tool)
+    executor = TaskExecutor(registry)
+    workspace_root = Path(os.getenv("AGENT_WORKSPACE", os.getcwd())).resolve()
+    tool_context = ToolExecutionContext(
+        workspace_root=workspace_root,
+        allowed_roots=[workspace_root],
+        allowed_shell_commands=set(filter(None, os.getenv("AGENTD_SHELL_ALLOWLIST", "").split(","))),
+        timeout_s=float(os.getenv("AGENTD_TOOL_TIMEOUT_S", "30")),
+        max_output_bytes=int(os.getenv("AGENTD_TOOL_MAX_OUTPUT", "65536")),
+    )
 
     reader, writer = await asyncio.open_unix_connection(uds_path)
     writer.write(_encode_line({"type": "register", "agent_name": agent_name, "token": auth_token}))
@@ -70,24 +100,35 @@ async def _run() -> None:
             error = ""
             usage = {}
             try:
-                if llm_gateway.backend == "mock" and isinstance(task_input, dict):
-                    test_cfg = task_input.get("__test", {})
-                    if isinstance(test_cfg, dict):
-                        sleep_ms = test_cfg.get("sleep_ms")
-                        if isinstance(sleep_ms, (int, float)) and sleep_ms > 0:
-                            await asyncio.sleep(float(sleep_ms) / 1000.0)
-                        if test_cfg.get("crash_worker") is True:
-                            os._exit(2)
-                        if test_cfg.get("force_error") is True:
-                            raise RuntimeError("forced error")
+                tool_request = None
+                if isinstance(task_input, dict):
+                    tool_request = task_input.get("__tool")
+                if isinstance(tool_request, dict) and tool_request.get("name"):
+                    tool_result = await executor.execute_tool(str(tool_request["name"]), dict(tool_request.get("arguments") or {}), tool_context)
+                    if not tool_result.ok:
+                        raise RuntimeError(tool_result.error or "tool error")
+                    output = json.dumps(tool_result.output, ensure_ascii=False)
+                    usage = {"tool": tool_request["name"]}
+                    llm_result = None
+                else:
+                    if llm_gateway.backend == "mock" and isinstance(task_input, dict):
+                        test_cfg = task_input.get("__test", {})
+                        if isinstance(test_cfg, dict):
+                            sleep_ms = test_cfg.get("sleep_ms")
+                            if isinstance(sleep_ms, (int, float)) and sleep_ms > 0:
+                                await asyncio.sleep(float(sleep_ms) / 1000.0)
+                            if test_cfg.get("crash_worker") is True:
+                                os._exit(2)
+                            if test_cfg.get("force_error") is True:
+                                raise RuntimeError("forced error")
 
-                llm_result = llm_gateway.chat_with_stats(
-                    system_prompt,
-                    user_message,
-                    prefix_cache_hit=logical_context_reuse_hit,
-                )
-                output = llm_result.output
-                usage = llm_result.to_dict()
+                    llm_result = llm_gateway.chat_with_stats(
+                        system_prompt,
+                        user_message,
+                        prefix_cache_hit=logical_context_reuse_hit,
+                    )
+                    output = llm_result.output
+                    usage = llm_result.to_dict()
             except Exception as e:
                 status = "FAILED"
                 error = str(e)

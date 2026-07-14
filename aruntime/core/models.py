@@ -15,6 +15,8 @@ class AgentStatus(str, Enum):
     COMPLETED = "COMPLETED"  # 执行成功
     SUSPENDED = "SUSPENDED"  # 已暂停
     ISOLATED = "ISOLATED"    # 已隔离
+    RECOVERING = "RECOVERING"  # 恢复中
+    LOST = "LOST"            # 心跳丢失
     KILLED = "KILLED"        # 被终止
 
 
@@ -22,10 +24,32 @@ class TaskStatus(str, Enum):
     PENDING = "PENDING"      # 等待调度
     READY = "READY"          # 就绪，可执行
     RUNNING = "RUNNING"      # 正在执行
+    BLOCKED = "BLOCKED"      # 等待资源
     ORPHANED = "ORPHANED"    # daemon 恢复时发现原执行者已失联
+    TIMEOUT = "TIMEOUT"      # 执行超时
+    RETRYING = "RETRYING"    # 正在重试
+    FALLBACK = "FALLBACK"    # 正在切换 Agent
     SUCCESS = "SUCCESS"      # 执行成功
     FAILED = "FAILED"        # 执行失败
     CANCELLED = "CANCELLED"  # 被取消
+
+
+class SideEffectLevel(str, Enum):
+    NONE = "none"
+    FILE_WRITE = "file_write"
+    NETWORK = "network"
+    EXTERNAL_API = "external_api"
+
+
+class AgentCapability(BaseModel):
+    can_plan: bool = False
+    can_code: bool = False
+    can_test: bool = False
+    can_review: bool = False
+    tools: List[str] = Field(default_factory=list)
+    languages: List[str] = Field(default_factory=list)
+    cost_level: int = 1
+    reliability_score: float = 1.0
 
 
 class FailureMode(str, Enum):
@@ -73,7 +97,7 @@ class FailurePolicy(BaseModel):
 
 
 class TaskDefinition(BaseModel):
-    agent_name: str
+    agent_name: Optional[str] = None
     task_input: Dict[str, Any]
     dependencies: List[str] = Field(default_factory=list)
     priority: int = 0
@@ -110,10 +134,23 @@ class TaskControlBlock(BaseModel):
     agent_runtime_ms: Optional[float] = None
 
     _ALLOWED: ClassVar[dict[TaskStatus, set[TaskStatus]]] = {
-        TaskStatus.PENDING: {TaskStatus.READY, TaskStatus.FAILED, TaskStatus.CANCELLED},
-        TaskStatus.READY: {TaskStatus.PENDING, TaskStatus.RUNNING, TaskStatus.FAILED, TaskStatus.CANCELLED},
-        TaskStatus.RUNNING: {TaskStatus.PENDING, TaskStatus.ORPHANED, TaskStatus.SUCCESS, TaskStatus.FAILED, TaskStatus.CANCELLED},
-        TaskStatus.ORPHANED: {TaskStatus.READY, TaskStatus.FAILED, TaskStatus.CANCELLED},
+        TaskStatus.PENDING: {TaskStatus.READY, TaskStatus.BLOCKED, TaskStatus.FAILED, TaskStatus.CANCELLED},
+        TaskStatus.READY: {TaskStatus.PENDING, TaskStatus.RUNNING, TaskStatus.BLOCKED, TaskStatus.FAILED, TaskStatus.CANCELLED},
+        TaskStatus.RUNNING: {
+            TaskStatus.PENDING,
+            TaskStatus.ORPHANED,
+            TaskStatus.TIMEOUT,
+            TaskStatus.RETRYING,
+            TaskStatus.FALLBACK,
+            TaskStatus.SUCCESS,
+            TaskStatus.FAILED,
+            TaskStatus.CANCELLED,
+        },
+        TaskStatus.BLOCKED: {TaskStatus.READY, TaskStatus.FAILED, TaskStatus.CANCELLED},
+        TaskStatus.ORPHANED: {TaskStatus.READY, TaskStatus.RETRYING, TaskStatus.FAILED, TaskStatus.CANCELLED},
+        TaskStatus.TIMEOUT: {TaskStatus.RETRYING, TaskStatus.FALLBACK, TaskStatus.FAILED, TaskStatus.CANCELLED},
+        TaskStatus.RETRYING: {TaskStatus.READY, TaskStatus.RUNNING, TaskStatus.FAILED, TaskStatus.CANCELLED},
+        TaskStatus.FALLBACK: {TaskStatus.READY, TaskStatus.RUNNING, TaskStatus.FAILED, TaskStatus.CANCELLED},
         TaskStatus.SUCCESS: set(),
         TaskStatus.FAILED: {TaskStatus.READY},
         TaskStatus.CANCELLED: set(),
@@ -128,7 +165,7 @@ class TaskControlBlock(BaseModel):
         if state == TaskStatus.RUNNING and self.started_at is None:
             self.started_at = now
             self.queue_info.queue_wait_ms = round((now - self.created_at).total_seconds() * 1000, 3)
-        if state in (TaskStatus.SUCCESS, TaskStatus.FAILED, TaskStatus.CANCELLED):
+        if state in (TaskStatus.SUCCESS, TaskStatus.FAILED, TaskStatus.CANCELLED, TaskStatus.TIMEOUT):
             self.completed_at = now
             started = self.started_at or self.created_at
             self.agent_runtime_ms = round((now - started).total_seconds() * 1000, 3)
@@ -136,7 +173,7 @@ class TaskControlBlock(BaseModel):
             self.queue_info.scheduler_decision_reason = reason
 
     def block(self, reason: str) -> None:
-        self.transition_to(TaskStatus.PENDING, "resource_blocked")
+        self.transition_to(TaskStatus.BLOCKED, "resource_blocked")
         self.queue_info.resource_block_reason = reason
 
     def unblock(self, reason: str = "dependencies_satisfied") -> None:
@@ -146,7 +183,7 @@ class TaskControlBlock(BaseModel):
 
 class TaskSpec(BaseModel):
     task_id: str = Field(default_factory=lambda: f"task_{uuid4().hex}")
-    agent_name: str
+    agent_name: Optional[str] = None
     task_input: Dict[str, Any]
     context_id: Optional[str] = None
     priority: int = 0
@@ -156,11 +193,17 @@ class TaskSpec(BaseModel):
     resource_lease: Optional[Dict[str, Any]] = None
     token_budget: Optional[int] = None
     timeout: Optional[float] = None
+    timeout_ms: Optional[int] = None
     parent_task_id: Optional[str] = None
+    children: List[str] = Field(default_factory=list)
     trace_id: str = Field(default_factory=lambda: f"trace_{uuid4().hex}")
     dependencies: List[str] = Field(default_factory=list)       # 依赖的任务 ID 列表
     dependency_failure_policies: Dict[str, FailureMode] = Field(default_factory=dict)
     failure_policy: FailurePolicy = Field(default_factory=FailurePolicy)
+    required_capability: Dict[str, Any] = Field(default_factory=dict)
+    idempotency_key: Optional[str] = None
+    side_effect_level: SideEffectLevel = SideEffectLevel.NONE
+    compensation: Dict[str, Any] = Field(default_factory=dict)
     status: TaskStatus = TaskStatus.PENDING
     result: Optional[Dict[str, Any]] = None
     error: Optional[str] = None
@@ -280,19 +323,30 @@ class TaskSpec(BaseModel):
             for dep_id, mode in dict(value).items()
         }
 
+    @field_validator("side_effect_level", mode="before")
+    @classmethod
+    def normalize_side_effect_level(cls, value):
+        if isinstance(value, SideEffectLevel):
+            return value
+        return SideEffectLevel(value or SideEffectLevel.NONE)
+
 
 class AgentSpec(BaseModel):
     agent_name: str
     role: str
     system_prompt: str = ""
     model: str = "gpt-4o-mini"
+    capability: AgentCapability = Field(default_factory=AgentCapability)
     status: AgentStatus = AgentStatus.CREATED
     current_task_id: Optional[str] = None
     created_at: datetime = Field(default_factory=datetime.now)
     updated_at: datetime = Field(default_factory=datetime.now)
     max_retries: int = 3
+    restart_budget: int = 3
+    fault_domain: Optional[str] = None
     memory_max_bytes: Optional[int] = None
     memory_high_bytes: Optional[int] = None
     cpu_max: Optional[str] = None
     pids_max: Optional[int] = None
     llm_max_concurrent: int = 1
+    token_quota: Optional[int] = None

@@ -146,6 +146,39 @@ class TestAgentLifecycleAPI:
         data = wait_task_done(client, task_id, timeout_s=10.0)
         assert data["status"] == "SUCCESS"
 
+    def test_spawn_task_api_returns_children_and_dag(self, client):
+        suffix = str(int(time.time() * 1000))
+        parent_agent = f"spawn_parent_{suffix}"
+        child_agent = f"spawn_child_{suffix}"
+        client.post("/agents", json={"agent_name": parent_agent, "role": "规划者"})
+        client.post("/agents", json={
+            "agent_name": child_agent,
+            "role": "编码者",
+            "capability": {"can_code": True, "languages": ["python"]},
+        })
+        parent = client.post("/tasks", json={
+            "agent_name": parent_agent,
+            "context_id": f"ctx_{suffix}",
+            "task_input": {"request": "root"},
+        }).json()
+
+        resp = client.post(f"/tasks/{parent['task_id']}/spawn", json={
+            "task_input": {"request": "implement"},
+            "required_capability": {"can_code": True, "language": "python"},
+            "dependencies": [parent["task_id"]],
+            "inherit_context": True,
+        })
+
+        assert resp.status_code == 200
+        child = resp.json()
+        assert child["trace_id"]
+        assert child["parent_task_id"] == parent["task_id"]
+
+        children = client.get(f"/tasks/{parent['task_id']}/children").json()
+        assert child["task_id"] in children["children"]
+        dag = client.get(f"/tasks/{parent['task_id']}/dag").json()
+        assert dag["children"][0]["task_id"] == child["task_id"]
+
     def test_submit_task_to_nonexistent_agent(self, client):
         """提交给不存在的 Agent 返回 404"""
         suffix = str(int(time.time() * 1000))
