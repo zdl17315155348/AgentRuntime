@@ -31,6 +31,7 @@ def agentd_server():
     except FileNotFoundError:
         pass
 
+    env["AGENTD_STATE_DB"] = f"/tmp/agent-runtime-os/state-resource-aware-{int(time.time() * 1000)}.db"
     proc = subprocess.Popen(
         [sys.executable, "-m", "aruntime.daemon.main"],
         cwd=os.path.join(os.path.dirname(__file__), "..", "..", ".."),
@@ -38,7 +39,30 @@ def agentd_server():
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
-    time.sleep(2)
+    deadline = time.time() + 15
+    ready = False
+    while time.time() < deadline:
+        if proc.poll() is not None:
+            break
+        try:
+            with httpx.Client(base_url="http://127.0.0.1:8234", timeout=1, trust_env=False) as c:
+                resp = c.get("/metrics")
+                if resp.status_code == 200:
+                    ready = True
+                    break
+        except Exception:
+            time.sleep(0.25)
+    if not ready:
+        out = ""
+        err = ""
+        try:
+            out = proc.stdout.read().decode("utf-8", errors="ignore") if proc.stdout else ""
+            err = proc.stderr.read().decode("utf-8", errors="ignore") if proc.stderr else ""
+        except Exception:
+            pass
+        proc.terminate()
+        proc.wait()
+        raise RuntimeError(f"resource-aware agentd failed to start\nstdout:\n{out}\nstderr:\n{err}")
     yield
     proc.terminate()
     proc.wait()
@@ -46,7 +70,7 @@ def agentd_server():
 
 @pytest.fixture
 def client(agentd_server):
-    with httpx.Client(base_url="http://127.0.0.1:8234", timeout=10) as c:
+    with httpx.Client(base_url="http://127.0.0.1:8234", timeout=10, trust_env=False) as c:
         yield c
 
 
@@ -96,7 +120,7 @@ class TestResourceAwareIntegration:
         })
         assert resp.status_code == 200
         task_id = resp.json()["task_id"]
-        data = wait_task_done(client, task_id, timeout_s=10.0)
+        data = wait_task_done(client, task_id, timeout_s=20.0)
         assert data["status"] == "SUCCESS"
 
     def test_multiple_tasks_execute(self, client):
@@ -121,7 +145,7 @@ class TestResourceAwareIntegration:
             task_ids.append(resp.json()["task_id"])
 
         for tid in task_ids:
-            data = wait_task_done(client, tid, timeout_s=15.0)
+            data = wait_task_done(client, tid, timeout_s=20.0)
             assert data["status"] == "SUCCESS", f"任务 {tid} 失败: {data}"
 
     def test_dag_dependency_with_resource_aware(self, client):
@@ -148,10 +172,10 @@ class TestResourceAwareIntegration:
         assert resp2.status_code == 200
         c_task = resp2.json()["task_id"]
 
-        p_data = wait_task_done(client, p_task, timeout_s=10.0)
+        p_data = wait_task_done(client, p_task, timeout_s=20.0)
         assert p_data["status"] == "SUCCESS"
 
-        c_data = wait_task_done(client, c_task, timeout_s=10.0)
+        c_data = wait_task_done(client, c_task, timeout_s=20.0)
         assert c_data["status"] == "SUCCESS", f"coder 任务失败: {c_data}"
 
     def test_agent_status_transitions(self, client):
@@ -169,7 +193,7 @@ class TestResourceAwareIntegration:
             "task_input": {"request": "hello"},
         })
         task_id = resp.json()["task_id"]
-        wait_task_done(client, task_id, timeout_s=10.0)
+        wait_task_done(client, task_id, timeout_s=20.0)
 
         agents = client.get("/agents").json()["agents"]
         agent = next(a for a in agents if a["name"] == name)

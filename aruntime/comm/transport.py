@@ -65,6 +65,7 @@ async def _handle_uds_client(
     task_result_handler,
     auth_tokens: dict[str, str] | None = None,
     heartbeat_handler=None,
+    agent_message_ack_handler=None,
 ) -> None:
     agent_name = ""
     seen_message_ids: set[str] = set()
@@ -127,16 +128,31 @@ async def _handle_uds_client(
                     continue
                 message_id = str(data.get("message_id") or "")
                 if message_id and message_id in seen_message_ids:
-                    writer.write(_encode_line({"type": "ack", "task_id": data.get("task_id"), "message_id": message_id}))
-                    await writer.drain()
+                    try:
+                        writer.write(_encode_line({"type": "ack", "task_id": data.get("task_id"), "message_id": message_id}))
+                        await writer.drain()
+                    except Exception:
+                        break
                     continue
                 if message_id:
                     seen_message_ids.add(message_id)
                 await task_result_handler(agent_name, data)
                 task_id = data.get("task_id")
                 if task_id:
-                    writer.write(_encode_line({"type": "ack", "task_id": task_id, "message_id": data.get("message_id", "")}))
-                    await writer.drain()
+                    try:
+                        writer.write(_encode_line({"type": "ack", "task_id": task_id, "message_id": data.get("message_id", "")}))
+                        await writer.drain()
+                    except Exception:
+                        break
+                continue
+            if msg_type == "agent_message_ack":
+                message_id = str(data.get("message_id") or "")
+                if message_id:
+                    if agent_message_ack_handler is not None:
+                        await agent_message_ack_handler(agent_name, data)
+                    else:
+                        await router.ack(agent_name, message_id)
+                continue
     finally:
         if agent_name:
             await router.unregister(agent_name, writer)
@@ -153,12 +169,13 @@ async def start_uds_server(
     task_result_handler=None,
     auth_tokens: dict[str, str] | None = None,
     heartbeat_handler=None,
+    agent_message_ack_handler=None,
 ) -> asyncio.AbstractServer:
     if os.path.exists(path):
         os.remove(path)
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     server = await asyncio.start_unix_server(
-        lambda r, w: _handle_uds_client(r, w, router, task_result_handler, auth_tokens, heartbeat_handler),
+        lambda r, w: _handle_uds_client(r, w, router, task_result_handler, auth_tokens, heartbeat_handler, agent_message_ack_handler),
         path=path,
     )
     os.chmod(path, 0o660)

@@ -12,6 +12,6 @@ def test_benchmark_generates_required_artifacts():
     assert (RESULTS_DIR / "summary.csv").exists()
     assert figures
     assert FIGURES_DIR.exists()
-    assert any(row["experiment"] == "调度公平对照" for row in rows)
-    assert any(row["experiment"] == "容错故障注入" for row in rows)
-    assert any(row["experiment"] == "通信公平对照" for row in rows)
+    assert any(row["experiment"] == "调度策略" for row in rows)
+    assert any(row["experiment"] == "上下文优化" for row in rows)
+    assert any(row["experiment"] == "容错策略" for row in rows)

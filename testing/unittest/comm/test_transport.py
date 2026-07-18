@@ -9,18 +9,11 @@ from aruntime.comm.router import MessageRouter
 from aruntime.comm.transport import UDSMessageClient, start_uds_server
 
 
-async def _start_server_or_skip(sock_path, router, **kwargs):
-    try:
-        return await start_uds_server(str(sock_path), router, **kwargs)
-    except PermissionError:
-        pytest.skip("当前环境不允许创建 UNIX socket，Docker OpenEuler 中验证")
-
-
 @pytest.mark.anyio
 async def test_uds_offline_queue_flush(tmp_path):
     sock_path = tmp_path / "agentd.sock"
     router = MessageRouter()
-    server = await _start_server_or_skip(sock_path, router)
+    server = await start_uds_server(str(sock_path), router)
     a = None
     b = None
     try:
@@ -53,7 +46,7 @@ async def test_uds_offline_queue_flush(tmp_path):
 async def test_uds_online_push(tmp_path):
     sock_path = tmp_path / "agentd.sock"
     router = MessageRouter()
-    server = await _start_server_or_skip(sock_path, router)
+    server = await start_uds_server(str(sock_path), router)
     a = None
     b = None
     try:
@@ -85,7 +78,7 @@ async def test_uds_online_push(tmp_path):
 async def test_uds_socket_has_0660_permissions(tmp_path):
     sock_path = tmp_path / "agentd.sock"
     router = MessageRouter()
-    server = await _start_server_or_skip(sock_path, router)
+    server = await start_uds_server(str(sock_path), router)
     try:
         mode = stat.S_IMODE(os.stat(sock_path).st_mode)
         assert mode == 0o660
@@ -100,7 +93,7 @@ async def test_uds_socket_has_0660_permissions(tmp_path):
 async def test_uds_rejects_oversized_message(tmp_path):
     sock_path = tmp_path / "agentd.sock"
     router = MessageRouter()
-    server = await _start_server_or_skip(sock_path, router)
+    server = await start_uds_server(str(sock_path), router)
     client = None
     try:
         client = UDSMessageClient(str(sock_path), "A")
@@ -128,7 +121,7 @@ async def test_uds_register_token_is_forwarded(tmp_path):
         seen["agent_name"] = agent_name
         seen["data"] = data
 
-    server = await _start_server_or_skip(sock_path, router, auth_tokens={"A": "secret"}, heartbeat_handler=heartbeat)
+    server = await start_uds_server(str(sock_path), router, auth_tokens={"A": "secret"}, heartbeat_handler=heartbeat)
     client = None
     try:
         client = UDSMessageClient(str(sock_path), "A", token="secret")

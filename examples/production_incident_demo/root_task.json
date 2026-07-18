@@ -1,0 +1,9 @@
+{
+  "task_input": {
+    "request": "修复订单服务中的登录500、越权访问、重复下单和JWT过期问题，补充测试并保持接口兼容",
+    "workspace": "examples/production_incident_demo/target_repo"
+  },
+  "required_capability": {"can_plan": true},
+  "priority": 10,
+  "resource_request": {"token_budget": 12000, "llm_max_concurrent": 1}
+}

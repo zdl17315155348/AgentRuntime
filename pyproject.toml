@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agent-runtime-os"
-version = "0.1.18"
+version = "0.1.19"
 description = "面向多智能体的操作系统级执行时（Agent Runtime），支持 AgentCapability、动态任务、ACB/LOST 状态机、统一资源管理、可靠通信、受控工具执行与 benchmark"
 requires-python = ">=3.10"
 dependencies = [
@@ -24,3 +24,6 @@ agentctl = "aruntime.cli.main:app"
 
 [tool.setuptools.packages.find]
 include = ["aruntime*"]
+
+[tool.pytest.ini_options]
+addopts = "--import-mode=importlib"

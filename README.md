@@ -129,8 +129,8 @@ curl -s http://127.0.0.1:8234/tasks/<task_id>
 | Dynamic Task | spawn children、DAG、依赖、trace/context 继承 | `aruntime/daemon/main.py`, `aruntime/scheduler/kernel.py` | 已实现 | `/tasks/{task_id}/spawn`, `/children`, `/dag`, `/dependencies` |
 | Context | shared/private/readonly/version/diff/compression/prefix metrics | `aruntime/context/manager.py`, `aruntime/context/types.py` | 部分实现 | readonly 用版本追加；LLM 语义摘要为结构化实现 |
 | Resource | ResourceLease、LLM 并发、cgroup v2、pressure 读取 | `aruntime/resource/monitor.py`, `aruntime/resource/cgroup.py`, `aruntime/resource/types.py` | 已实现 | 真实 cgroup 依赖宿主权限 |
-| Timeout/Kill | timeout_ms、task.timeout trace、lease 回收、cgroup kill | `aruntime/daemon/main.py`, `aruntime/resource/cgroup.py` | 部分实现 | preemption 仍为规划中 |
-| Communication | UDS、mailbox、ack、去重、重放、dead-letter | `aruntime/comm/message.py`, `aruntime/comm/router.py`, `aruntime/comm/transport.py` | 部分实现 | ACK/重放为 router 层语义，worker 端 E2E 待强化 |
+| Timeout/Kill | timeout_ms、attempt_id、task.timeout trace、cancel、lease 回收、cgroup kill | `aruntime/daemon/main.py`, `aruntime/resource/cgroup.py`, `aruntime/core/models.py` | 已实现 | 超时后进入 TIMEOUT 并丢弃迟到结果 |
+| Communication | UDS、mailbox、ack、去重、重放、dead-letter、agent_message/cancel/context_update | `aruntime/comm/message.py`, `aruntime/comm/router.py`, `aruntime/comm/transport.py`, `aruntime/worker/agent_worker.py` | 已实现 | worker 端处理完成后再 ACK |
 | Tool Execution | repo_scan、read/write_file、search_code、git_status/diff、run_pytest、run_command | `aruntime/tools/*`, `aruntime/executor/*`, `aruntime/worker/agent_worker.py` | 已实现 | 受控工作区、路径白名单、Shell allowlist、超时和输出限制 |
 | Persistence | SQLite/WAL、agents/tasks/attempts/leases/mailbox/trace 恢复 | `aruntime/daemon/store.py`, `aruntime/daemon/recovery_service.py` | 已实现 | 单元测试覆盖 READY/RUNNING 恢复 |
 | Heartbeat/Fault | worker heartbeat、restart_budget、fallback attempt | `aruntime/daemon/fault_service.py`, `aruntime/worker/agent_worker.py` | 部分实现 | 端到端恢复测试待继续扩展 |
@@ -151,7 +151,7 @@ Agent Runtime Scheduler：支持 `fifo` / `priority` / `resource_aware` / `fair_
 
 故障策略：任务未显式配置时默认不失败级联；显式 `failure_policy` 支持 `fail_open`、`fail_closed`、`retry`、`fallback`、`degrade` 以及 `max_retries`、`fallback_agent`、`timeout_ms`。DAG 边支持 `on_failure`，可对单条依赖边设置 `retry`、`fallback`、`fail_open`、`fail_closed`；无边策略时会按显式任务默认策略处理。
 
-Worker 故障处理：worker 崩溃后 Runtime 标记 Agent 为 `FAILED`，记录 `worker.isolated`，释放资源并重启 worker；任务按策略 retry / fallback / degrade / fail_closed 处理，下游任务按边 `on_failure` 决策。
+Worker 故障处理：worker 崩溃后 Runtime 标记 Agent 为 `FAILED`，记录 `worker.isolated`，释放资源并重启 worker；任务按策略 retry / fallback / degrade / fail_closed 处理，下游任务按边 `on_failure` 决策。超时任务会发送 `cancel_task`，等待宽限期后 kill worker/cgroup，并校验 `attempt_id` 丢弃迟到结果。
 
 受控工具执行：worker 支持 `__tool` 请求直达真实工具执行层，内置 `repo_scan`、`read_file`、`search_code`、`write_file`、`git_status`、`git_diff`、`run_pytest`、`run_command`。默认工作区路径受限，禁止越界访问，Shell 仅允许白名单命令，命令超时和输出大小受控。
 
@@ -169,7 +169,7 @@ LLM 统计：LLM Gateway 返回 `input_tokens`、`output_tokens`、`total_tokens
 
 系统级可观测性：每个任务自动生成 `trace_id`，每次 Agent worker 执行生成 `agent.execute` span；LLM、context、IPC、resource 操作写入 trace event。`/tasks/{task_id}/trace` 输出 JSON trace，包含 `critical_path`、`queue_wait_ms`、`llm_calls`、`token_used`、`context_hit_ratio`、`retry_count`；`/metrics.histograms` 输出 queue wait、Agent runtime、LLM latency、context build time、resource lease 直方图。
 
-Benchmark：根目录 `BENCHMARK.md` 记录调度公平对照、cgroup 隔离/压力、vLLM APC、容错故障注入、通信公平对照、扩展性、复杂 E2E 和 Runtime 开销实验；通过 `bash scripts/benchmark_docker_openeuler.sh` 在 openEuler Docker 中生成，并输出 `benchmark/results/raw.csv`、`benchmark/results/summary.csv` 与 `benchmark/figures/*.svg`。真实 vLLM APC 依赖 `VLLM_BASE_URL`，真实 cgroup 隔离和压力采集依赖宿主机 cgroup v2 写权限，环境不可用时报告会明确标记降级/跳过。
+Benchmark：根目录 `BENCHMARK.md` 记录三组真实性能实验：调度策略、上下文优化、容错策略；通过 `bash scripts/benchmark_docker_openeuler.sh` 在 openEuler Docker 中生成，并输出 `benchmark/results/raw.csv`、`benchmark/results/summary.csv` 与 `benchmark/figures/*.svg`。
 
 Agent 生命周期管理：支持注册、提交任务、查询任务状态。
 
@@ -197,7 +197,7 @@ Agent 间通信：UDS 流式通信 + agentd 路由（在线 push，离线 mailbo
 
 UDS 安全：worker 启动时注入一次性认证 token，UDS 注册校验 token 并读取 SO_PEERCRED；socket 权限设为 0660；单条消息限制大小，task_result 使用严格 schema、message_id、ack 和去重；mailbox 满后进入 dead-letter queue。
 
-daemon 拆分：新增 daemon/app.py、store.py、recovery_service.py、fault_service.py、worker_service.py，将持久化、恢复、故障状态和 worker 启动日志从 main.py 中拆出。
+daemon 拆分：新增 daemon/app.py、store.py、recovery_service.py、fault_service.py、worker_service.py，将持久化、恢复、故障状态和 worker 启动日志从 main.py 中拆出。集成测试直接拉起 agentd，并用 `/metrics` 轮询确认就绪；资源感知测试使用独立 `AGENTD_STATE_DB`，避免共享状态库互相污染。
 
 可观测性：worker stdout/stderr 写入 `AGENTD_LOG_DIR` 下独立日志文件，agentd 写结构化 JSONL；`/metrics` 增加 persistence 与 faults 快照，trace event 同步持久化。
 

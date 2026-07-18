@@ -128,7 +128,6 @@ class TestAgentLifecycleAPI:
             "agent_name": agent_name,
             "role": "测试员",
         })
-
         resp = client.post("/tasks", json={
             "agent_name": agent_name,
             "task_input": {"request": "第一个任务", "__test": {"sleep_ms": 2000}},
@@ -222,8 +221,6 @@ class TestAgentLifecycleAPI:
             "payload": {"text": "hello"},
             "topic": "demo",
         })
-        if resp.status_code == 404 and resp.json().get("detail") == "Not Found":
-            pytest.skip("agentd 未启用 /messages")
         assert resp.status_code == 200
         msg = resp.json()
         assert msg["from_agent"] == agent_a
@@ -232,8 +229,6 @@ class TestAgentLifecycleAPI:
         assert msg["topic"] == "demo"
 
         resp = client.get(f"/messages/{agent_b}")
-        if resp.status_code == 404 and resp.json().get("detail") == "Not Found":
-            pytest.skip("agentd 未启用 /messages")
         assert resp.status_code == 200
         data = resp.json()
         assert len(data["messages"]) == 1
@@ -254,8 +249,6 @@ class TestAgentLifecycleAPI:
             "to_agent": f"not_exist_{suffix}",
             "payload": {"text": "x"},
         })
-        if resp.status_code == 404 and resp.json().get("detail") == "Not Found":
-            pytest.skip("agentd 未启用 /messages")
         assert resp.status_code == 404
 
     def test_metrics_show_correct_counts(self, client):

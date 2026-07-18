@@ -5,6 +5,7 @@ from datetime import datetime
 from typing import Dict, Optional
 import subprocess
 import secrets
+from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field, field_validator
@@ -156,7 +157,7 @@ message_router = MessageRouter(store=state_store)
 cgroup_bindings: Dict[str, dict] = {}
 uds_server = None
 agent_workers: Dict[str, subprocess.Popen] = {}
-pending_task_results: Dict[str, asyncio.Future] = {}
+pending_task_results: Dict[str, dict] = {}
 trace_recorder = TraceRecorder()
 scheduler_event: asyncio.Event | None = None
 global_dispatch_semaphore: asyncio.Semaphore | None = None
@@ -1115,7 +1116,8 @@ async def _run_task_once(
     agent_name = _attempt_agent(task, attempt)
     loop = asyncio.get_running_loop()
     fut = loop.create_future()
-    pending_task_results[task.task_id] = fut
+    attempt_id = attempt.attempt_id if attempt is not None else ""
+    pending_task_results[task.task_id] = {"attempt_id": attempt_id, "future": fut}
     span_id = trace_recorder.start_span(task.trace_id, task.task_id, "agent.execute", agent_name)
     try:
         trace_recorder.span_event(task.task_id, span_id, "agent.dispatch", {"agent_name": agent_name})
@@ -1134,9 +1136,12 @@ async def _run_task_once(
                 raise RuntimeError(f"resource limit exceeded: {limit_reason}")
 
         _record_trace_event(task, "ipc.send_task", {"agent_name": agent_name})
+        message_id = f"exec_{task.task_id}_{uuid4().hex}"
         sent = await message_router.send_event(agent_name, {
             "type": "exec_task",
+            "message_id": message_id,
             "task_id": task.task_id,
+            "attempt_id": attempt_id,
             "system_prompt": agent.system_prompt or f"你是一个{agent.role}",
             "user_message": user_message,
             "task_input": task_payload,
@@ -1148,8 +1153,26 @@ async def _run_task_once(
         try:
             result = await asyncio.wait_for(fut, timeout=timeout_s)
         except asyncio.TimeoutError:
+            if attempt is not None:
+                attempt.status = "TIMEOUT"
+                task.finish_attempt(attempt, failure_reason="task timeout")
+                attempt.status = "TIMEOUT"
+                _persist_task(task)
             task.transition_to(TaskStatus.TIMEOUT, "task.timeout")
             _record_trace_event(task, "task.timeout", {"timeout_s": timeout_s})
+            await message_router.send_event(agent_name, {
+                "type": "cancel_task",
+                "task_id": task.task_id,
+                "attempt_id": attempt_id,
+                "reason": "timeout",
+            })
+            _record_trace_event(task, "task.cancel", {"agent_name": agent_name, "attempt_id": attempt_id})
+            await asyncio.sleep(float(os.getenv("AGENTD_CANCEL_GRACE_S", "0.2")))
+            cgroup_manager.kill(agent_name)
+            _record_trace_event(task, "worker.kill", {"agent_name": agent_name, "attempt_id": attempt_id})
+            await resource_monitor.reclaim_async(task.task_id, reason="task timeout")
+            state_store.release_leases_for_task(task.task_id, reason="task timeout")
+            _record_trace_event(task, "lease.reclaim", {"reason": "task timeout"})
             raise RuntimeError("task timeout")
 
         status = result.get("status")
@@ -1429,12 +1452,25 @@ async def startup():
             task_id = str(data.get("task_id") or "").strip()
             if not task_id:
                 return
-            fut = pending_task_results.get(task_id)
+            pending = pending_task_results.get(task_id)
+            if not pending:
+                return
+            fut = pending.get("future")
+            active_attempt_id = str(pending.get("attempt_id") or "")
+            result_attempt_id = str(data.get("attempt_id") or "")
+            task = tasks.get(task_id)
+            if active_attempt_id and result_attempt_id != active_attempt_id:
+                if task is not None:
+                    _record_trace_event(task, "task.late_result", {"attempt_id": result_attempt_id, "active_attempt_id": active_attempt_id})
+                return
             if fut is None or fut.done():
+                if task is not None:
+                    _record_trace_event(task, "task.late_result", {"attempt_id": result_attempt_id, "reason": "future_done"})
                 return
             fut.set_result({
                 "agent_name": agent_name,
                 "task_id": task_id,
+                "attempt_id": result_attempt_id,
                 "status": data.get("status"),
                 "output": data.get("output"),
                 "error": data.get("error"),
@@ -1446,12 +1482,23 @@ async def startup():
             fault.heartbeat()
             _persist_agent(agent_name)
 
+        async def _on_agent_message_ack(agent_name: str, data: dict) -> None:
+            message_id = str(data.get("message_id") or "")
+            if not message_id:
+                return
+            if state_store.processed_message_exists(message_id, agent_name):
+                await message_router.ack(agent_name, message_id)
+                return
+            state_store.save_processed_message(message_id, agent_name, status="processed", generated_task_id=str(data.get("generated_task_id") or ""))
+            await message_router.ack(agent_name, message_id)
+
         uds_server = await start_uds_server(
             uds_path,
             message_router,
             task_result_handler=_on_task_result,
             auth_tokens=agent_auth_tokens,
             heartbeat_handler=_on_heartbeat,
+            agent_message_ack_handler=_on_agent_message_ack,
         )
         for agent_name in restored_agent_names:
             _start_worker(agent_name)

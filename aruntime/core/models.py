@@ -114,6 +114,7 @@ class TaskAttempt(BaseModel):
     attempt_id: str
     worker_pid: Optional[int] = None
     agent_name: str
+    status: str = "RUNNING"
     failure_reason: str = ""
     token_usage: Dict[str, Any] = Field(default_factory=dict)
     result: Optional[Dict[str, Any]] = None
@@ -146,7 +147,7 @@ class TaskControlBlock(BaseModel):
             TaskStatus.FAILED,
             TaskStatus.CANCELLED,
         },
-        TaskStatus.BLOCKED: {TaskStatus.READY, TaskStatus.FAILED, TaskStatus.CANCELLED},
+        TaskStatus.BLOCKED: {TaskStatus.PENDING, TaskStatus.READY, TaskStatus.FAILED, TaskStatus.CANCELLED},
         TaskStatus.ORPHANED: {TaskStatus.READY, TaskStatus.RETRYING, TaskStatus.FAILED, TaskStatus.CANCELLED},
         TaskStatus.TIMEOUT: {TaskStatus.RETRYING, TaskStatus.FALLBACK, TaskStatus.FAILED, TaskStatus.CANCELLED},
         TaskStatus.RETRYING: {TaskStatus.READY, TaskStatus.RUNNING, TaskStatus.FAILED, TaskStatus.CANCELLED},
@@ -293,6 +294,7 @@ class TaskSpec(BaseModel):
         attempt.result = result
         attempt.failure_reason = failure_reason
         attempt.token_usage = token_usage or {}
+        attempt.status = "FAILED" if failure_reason else "SUCCESS"
 
     def _sync_from_tcb(self) -> None:
         if self.tcb is None:

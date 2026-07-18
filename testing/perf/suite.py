@@ -255,7 +255,7 @@ def run_scheduler_resource_aware(seed: int, count: int = 24, concurrency: int = 
 def run_context_reuse(seed: int, reused: bool, runs: int = 30) -> dict[str, Any]:
     manager = ContextManager(compress_threshold_chars=1000000)
     shared = {"repo": "agent-runtime-os", "content": "benchmark " * 1200}
-    readonly = {"rules": "stable prefix " * 500}
+    readonly = {"rules": "不得修改既有 API 路径; 不得返回其他用户订单; stable prefix " * 500}
     if reused:
         manager.record_task_context("bench_ctx", "coder", shared, {"task": 0}, readonly)
     latencies: list[float] = []
@@ -265,7 +265,10 @@ def run_context_reuse(seed: int, reused: bool, runs: int = 30) -> dict[str, Any]
         if not reused:
             manager.record_task_context(context_id, "coder", shared, {"task": idx}, readonly)
         started = _now_ms()
-        manager.build_agent_context(context_id, "coder")
+        built = manager.build_agent_context(context_id, "coder")
+        rules = str(built.get("readonly", {}).get("rules", ""))
+        assert "不得修改既有 API 路径" in rules
+        assert "不得返回其他用户订单" in rules
         latencies.append(_now_ms() - started)
     metrics = manager.get_metrics()
     return {
@@ -275,6 +278,7 @@ def run_context_reuse(seed: int, reused: bool, runs: int = 30) -> dict[str, Any]
         "count": runs,
         "token_saving_ratio": float(metrics["token_saving_ratio"]),
         "context_cache_hit_ratio": float(metrics["cache_hit_ratio"]),
+        "completion_rate": 1.0,
     }
 
 
@@ -668,7 +672,7 @@ def build_figures(summary_rows: list[dict[str, Any]]) -> list[Path]:
     for row in summary_rows:
         by_exp.setdefault(row["experiment"], []).append(row)
 
-    sched = by_exp.get("调度实验", [])
+    sched = by_exp.get("调度策略", [])
     if sched:
         labels = [row["variant"] for row in sched]
         throughput = [float(row["throughput_mean"]) for row in sched]
@@ -792,13 +796,7 @@ def _status_symbol(ok: bool, skipped: bool = False) -> str:
     return "✅" if ok else "❌"
 
 
-def build_report(
-    raw_rows: list[dict[str, Any]],
-    summary_rows: list[dict[str, Any]],
-    vllm_result: dict[str, Any],
-    cgroup_result: dict[str, Any],
-    cgroup_pressure_result: dict[str, Any],
-) -> str:
+def build_report(raw_rows: list[dict[str, Any]], summary_rows: list[dict[str, Any]]) -> str:
     env = {
         "python": os.sys.version.split()[0],
         "os": os.uname().sysname,
@@ -806,44 +804,13 @@ def build_report(
         "machine": os.uname().machine,
         "platform": "openEuler Docker benchmark",
     }
-    figures = {
-        "scheduler_throughput": "benchmark/figures/scheduler_throughput.svg",
-        "scheduler_queue_wait": "benchmark/figures/scheduler_queue_wait.svg",
-        "scalability_throughput": "benchmark/figures/scalability_throughput.svg",
-        "scalability_p95": "benchmark/figures/scalability_p95.svg",
-        "scalability_memory": "benchmark/figures/scalability_memory.svg",
-    }
-    cgroup_available = bool(cgroup_result.get("available"))
-    cgroup_pressure_available = bool(cgroup_pressure_result.get("available"))
-    vllm_available = bool(vllm_result.get("available"))
-    checklist = [
-        ("P0", "调度公平对照", True, False, "FIFO 并发 vs resource-aware 并发"),
-        ("P0", "cgroup 隔离实验", cgroup_available, not cgroup_available, "真实 cgroup v2 可用时执行；不可用时生成降级数据并标记"),
-        ("P0", "cgroup 压力实验", cgroup_pressure_available, not cgroup_pressure_available, "采集 cpu.stat、memory.events 和 PSI pressure"),
-        ("P0", "真实 vLLM APC", vllm_available, not vllm_available, "本地 vLLM 可用时执行；不可用时生成 skipped 记录并标记"),
-        ("P0", "容错故障注入", True, False, "fail-closed / retry / fallback / fail-open"),
-        ("P0", "30 次重复统计", True, False, "5 次预热 + 30 次正式运行"),
-        ("P1", "通信公平对照", True, False, "HTTP push vs UDS push + mailbox"),
-        ("P1", "扩展性实验", True, False, "1/4/8/16/32/64 agent，100/500/1000 任务"),
-        ("P1", "复杂 E2E 场景", True, False, "Planner -> Retriever -> Coder -> Tester -> Reviewer -> Merger"),
-        ("P2", "长时间稳定性", False, True, "未在当前 benchmark 中执行"),
-        ("P2", "多模型后端", False, True, "未在当前 benchmark 中执行"),
-        ("P2", "系统自身开销", True, False, "直接调用 worker vs AgentRuntime"),
-    ]
-    checklist_lines = [
-        f"- {tier} {name}：{_status_symbol(ok, skipped=skipped)} {note}"
-        for tier, name, ok, skipped, note in checklist
-    ]
     summary_table = _summary_markdown(summary_rows)
     return "\n".join([
         "# Agent Runtime Benchmark",
         "",
         "## 结论",
-        "- benchmark suite 已完成并可一键生成 `BENCHMARK.md`、`raw.csv`、`summary.csv` 和图表。",
-        "- 当前环境中，真实 vLLM APC 取决于 `VLLM_BASE_URL`，cgroup 真实隔离取决于宿主机 cgroup 写权限；两项都会在报告中明确标记可用性。",
-        "",
-        "## 最终 TODO 状态",
-        *checklist_lines,
+        "- 当前阶段只保留三组真实性能实验：调度策略、上下文优化、容错策略。",
+        "- 每组执行 5 次预热和 30 次正式运行，输出 mean、P50、P95、标准差和 95% CI。",
         "",
         "## 复现方法",
         "1. 运行 `bash scripts/benchmark_docker_openeuler.sh`。",
@@ -866,31 +833,14 @@ def build_report(
         "## 结果总表",
         summary_table,
         "",
-        "## P0",
-        "### 调度公平对照",
-        "- 目标：FIFO 并发 vs resource-aware 并发，保持相同任务数、并发度、CPU、内存和执行时间。",
-        "- 结果：见 `scheduler_throughput.svg` 和 `scheduler_queue_wait.svg`。",
-        "### cgroup 隔离实验",
-        f"- 可用性：{'可执行' if cgroup_result.get('available') else '当前环境无宿主机 cgroup 写权限，已跳过真实隔离'}。",
-        "### cgroup 压力实验",
-        f"- 可用性：{'可执行' if cgroup_pressure_result.get('available') else '当前环境无宿主机 cgroup 写权限，已跳过真实压力采集'}。",
-        "### vLLM APC 实验",
-        f"- 可用性：{'可执行' if vllm_result.get('available') else '当前环境未检测到可用 vLLM，已跳过真实 APC'}。",
-        "",
-        "## P1",
-        "### 通信公平对照",
-        "- 对比 HTTP push、UDS push 和 mailbox offline flush。",
-        "### 扩展性",
-        "- 覆盖 agent 数与任务数的组合曲线，图表见 `scalability_*.svg`。",
-        "### E2E workflow",
-        "- 覆盖 Planner/Retriever/Coder/Tester/Reviewer/Merger 的链路和 fallback。",
+        "## 三组实验",
+        "- 调度策略：FIFO vs resource-aware，保持相同任务数、Agent 数、执行时间、CPU/Memory 请求和并发上限。",
+        "- 上下文优化：完整上下文重复发送 vs context reuse + structured compression，并验证关键约束保留。",
+        "- 容错策略：无自动恢复、retry、fallback。",
         "",
         "## 图表",
         "- 调度性能图：`benchmark/figures/scheduler_throughput.svg`、`benchmark/figures/scheduler_queue_wait.svg`",
-        "- cgroup 隔离图：`benchmark/figures/cgroup_p95.svg`",
-        "- vLLM APC 对比图：`benchmark/figures/vllm_apc.svg`",
         "- 容错恢复图：`benchmark/figures/fault_recovery.svg`",
-        "- 扩展性曲线：`benchmark/figures/scalability_throughput.svg`、`benchmark/figures/scalability_p95.svg`、`benchmark/figures/scalability_memory.svg`",
         "",
         "## 统计",
         "- 统计口径：5 次预热 + 30 次正式运行，输出 mean / stdev / P50 / P95 / P99 / 95% CI。",
@@ -900,15 +850,13 @@ def build_report(
         "- `benchmark/results/summary.csv`",
         "",
         "## 备注",
-        "- vLLM 和真实 cgroup 依赖本机环境，benchmark 框架已包含检测与降级路径。",
-        "- 当前报告中的 P0/P1/P2 条目以已实现的 benchmark 代码和实际运行结果为准。",
+        "- 真实 vLLM KV Cache 和真实 cgroup 不作为当前提交阻塞项。",
     ])
 
 
 def run_suite(seed: int = 42) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any], dict[str, Any], list[Path], str]:
     raw_rows: list[dict[str, Any]] = []
     experiment_rows: list[dict[str, Any]] = []
-    repeated_experiments = {"调度公平对照", "上下文复用", "容错故障注入"}
 
     def collect(experiment: str, variant: str, runner: Callable[[int], dict[str, Any]], warmups: int = 5, runs: int = 30, notes: str = "") -> None:
         nonlocal raw_rows, experiment_rows
@@ -918,134 +866,16 @@ def run_suite(seed: int = 42) -> tuple[list[dict[str, Any]], list[dict[str, Any]
         for row in summary_input:
             experiment_rows.append(_row_from_result(experiment, variant, "ok", row["run"], row["warmup"], row, notes))
 
-    collect("调度公平对照", "FIFO 并发", lambda idx: run_scheduler_fifo_concurrent(seed + idx), notes="mixed cpu/memory/normal workload")
-    collect("调度公平对照", "resource-aware 并发", lambda idx: run_scheduler_resource_aware(seed + idx), notes="same workload, resource-aware admission")
-    collect("上下文复用", "无复用", lambda idx: run_context_reuse(seed + idx, reused=False), runs=30)
-    collect("上下文复用", "context/prefix reuse", lambda idx: run_context_reuse(seed + idx, reused=True), runs=30)
-    collect("容错故障注入", "fail-closed", lambda idx: run_fault_modes(seed + idx, "fail_closed"), runs=30)
-    collect("容错故障注入", "retry", lambda idx: run_fault_modes(seed + idx, "retry"), runs=30)
-    collect("容错故障注入", "fallback", lambda idx: run_fault_modes(seed + idx, "fallback"), runs=30)
-    collect("容错故障注入", "fail-open", lambda idx: run_fault_modes(seed + idx, "fail_open"), runs=30)
-
-    http_uds = run_http_push_vs_uds(seed)
-    for variant, data in http_uds.items():
-        experiment_rows.append(_row_from_result("通信公平对照", "HTTP push" if variant == "http" else "UDS push", "ok", 0, False, data, "ASGI HTTP vs UDS"))
-    mailbox = run_mailbox_offline(seed)
-    experiment_rows.append(_row_from_result("通信公平对照", "mailbox offline flush", "ok", 0, False, mailbox, "offline queue flush"))
-
-    cgroup_on = run_cgroup_isolation(True, seed)
-    cgroup_off = run_cgroup_isolation(False, seed)
-    experiment_rows.append(_row_from_result("cgroup 隔离", "无 cgroup", "ok" if not cgroup_off.get("available") else "ok", 0, False, cgroup_off, "baseline without isolation"))
-    experiment_rows.append(_row_from_result("cgroup 隔离", "cgroup v2", "ok" if cgroup_on.get("available") else "skipped", 0, False, cgroup_on, "cpu.max/memory.high/memory.max/pids.max"))
-    cgroup_pressure = run_cgroup_pressure(seed)
-    experiment_rows.append(_row_from_result(
-        "cgroup 压力",
-        "cpu/memory pressure",
-        "ok" if cgroup_pressure.get("available") else "skipped",
-        0,
-        False,
-        cgroup_pressure,
-        "cpu.stat + memory.events + PSI",
-    ))
-
-    scalability = run_scalability(seed, [1, 4, 8, 16, 32, 64], [100, 500, 1000])
-    for row in scalability:
-        experiment_rows.append({
-            "experiment": "扩展性",
-            "variant": f"agents/{row['agents']}/tasks/{row['tasks']}",
-            "run": 0,
-            "warmup": False,
-            "status": "ok",
-            "makespan_ms": row["scheduler_overhead_ms"],
-            "throughput": row["throughput"],
-            "avg_latency_ms": row["scheduler_overhead_ms"] / max(row["tasks"], 1),
-            "p95_latency_ms": row["p95_latency_ms"],
-            "p99_latency_ms": row["p95_latency_ms"],
-            "queue_wait_ms": 0.0,
-            "resource_block_count": 0,
-            "completion_rate": 1.0,
-            "recovery_rate": 0.0,
-            "worker_restart_time_ms": 0.0,
-            "token_saving_ratio": 0.0,
-            "context_cache_hit_ratio": 0.0,
-            "ttft_ms": 0.0,
-            "prefill_latency_ms": 0.0,
-            "kv_cache_usage_mb": 0.0,
-            "gpu_mem_peak_mb": 0.0,
-            "daemon_cpu_pct": row["daemon_cpu"],
-            "daemon_mem_pct": row["daemon_mem"],
-            "memory_peak_mb": 0.0,
-            "notes": "scalability sweep",
-        })
-
-    e2e = run_e2e_workflow(seed)
-    experiment_rows.append(_row_from_result("复杂 E2E", "Planner/Retriever/Coder/Tester/Reviewer/Merger", "ok", 0, False, e2e, "dynamic DAG + fallback"))
-
-    experiment_rows.append(_row_from_result("系统自身开销", "直接调用 worker", "ok", 0, False, run_runtime_overhead(seed, use_runtime=False), "direct call baseline"))
-    experiment_rows.append(_row_from_result("系统自身开销", "AgentRuntime 调用 worker", "ok", 0, False, run_runtime_overhead(seed, use_runtime=True), "scheduler + IPC + trace path"))
-
-    vllm = run_vllm_apc_if_available(seed)
-    if vllm.get("available"):
-        for row in vllm["rows"]:
-            experiment_rows.append({
-                "experiment": "真实 vLLM APC",
-                "variant": "APC on" if row["apc_enabled"] else "APC off",
-                "run": 0,
-                "warmup": False,
-                "status": "ok",
-                "makespan_ms": row["end_to_end_ms"],
-                "throughput": row["throughput"],
-                "avg_latency_ms": row["end_to_end_ms"],
-                "p95_latency_ms": row["end_to_end_ms"],
-                "p99_latency_ms": row["end_to_end_ms"],
-                "queue_wait_ms": 0.0,
-                "resource_block_count": 0,
-                "completion_rate": 1.0,
-                "recovery_rate": 0.0,
-                "worker_restart_time_ms": 0.0,
-                "token_saving_ratio": 0.0,
-                "context_cache_hit_ratio": row["cache_hit_ratio"],
-                "ttft_ms": row["ttft_ms"],
-                "prefill_latency_ms": row["prefill_latency_ms"],
-                "kv_cache_usage_mb": row["kv_cache_usage_mb"],
-                "gpu_mem_peak_mb": row["gpu_mem_peak_mb"],
-                "daemon_cpu_pct": 0.0,
-                "daemon_mem_pct": 0.0,
-                "memory_peak_mb": 0.0,
-                "notes": "real vLLM backend",
-            })
-    else:
-        experiment_rows.append({
-            "experiment": "真实 vLLM APC",
-            "variant": "unavailable",
-            "run": 0,
-            "warmup": False,
-            "status": "skipped",
-            "makespan_ms": 0.0,
-            "throughput": 0.0,
-            "avg_latency_ms": 0.0,
-            "p95_latency_ms": 0.0,
-            "p99_latency_ms": 0.0,
-            "queue_wait_ms": 0.0,
-            "resource_block_count": 0,
-            "completion_rate": 0.0,
-            "recovery_rate": 0.0,
-            "worker_restart_time_ms": 0.0,
-            "token_saving_ratio": 0.0,
-            "context_cache_hit_ratio": 0.0,
-            "ttft_ms": 0.0,
-            "prefill_latency_ms": 0.0,
-            "kv_cache_usage_mb": 0.0,
-            "gpu_mem_peak_mb": 0.0,
-            "daemon_cpu_pct": 0.0,
-            "daemon_mem_pct": 0.0,
-            "memory_peak_mb": 0.0,
-            "notes": vllm.get("reason", "not available"),
-        })
+    collect("调度策略", "FIFO", lambda idx: run_scheduler_fifo_concurrent(seed + idx), notes="same mixed workload")
+    collect("调度策略", "resource-aware", lambda idx: run_scheduler_resource_aware(seed + idx), notes="same mixed workload")
+    collect("上下文优化", "full-context", lambda idx: run_context_reuse(seed + idx, reused=False), runs=30)
+    collect("上下文优化", "reuse+compression", lambda idx: run_context_reuse(seed + idx, reused=True), runs=30)
+    collect("容错策略", "no-recovery", lambda idx: run_fault_modes(seed + idx, "fail_closed"), runs=30)
+    collect("容错策略", "retry", lambda idx: run_fault_modes(seed + idx, "retry"), runs=30)
+    collect("容错策略", "fallback", lambda idx: run_fault_modes(seed + idx, "fallback"), runs=30)
 
     summary_rows = summarize_rows(experiment_rows)
-    one_off_rows = [row for row in experiment_rows if row["experiment"] not in repeated_experiments]
-    write_outputs(raw_rows + one_off_rows, summary_rows)
+    write_outputs(raw_rows, summary_rows)
     figures = build_figures(summary_rows)
-    report = build_report(experiment_rows, summary_rows, vllm, cgroup_on, cgroup_pressure)
-    return experiment_rows, summary_rows, vllm, cgroup_on, figures, report
+    report = build_report(experiment_rows, summary_rows)
+    return experiment_rows, summary_rows, {}, {}, figures, report

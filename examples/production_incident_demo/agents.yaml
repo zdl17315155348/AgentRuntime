@@ -1,0 +1,20 @@
+agents:
+  - name: architect
+    role: Architect
+    capability: {can_plan: true}
+  - name: coder_a
+    role: Coder A
+    capability: {can_code: true, tools: [read_file, write_file, run_pytest], languages: [python]}
+    failure_policy: {mode: fallback, fallback_agent: coder_b, timeout_ms: 30000}
+  - name: coder_b
+    role: Coder B
+    capability: {can_code: true, tools: [read_file, write_file, run_pytest], languages: [python]}
+  - name: tester
+    role: Tester
+    capability: {can_test: true, tools: [run_pytest]}
+  - name: repair
+    role: Repair
+    capability: {can_code: true, can_test: true, tools: [read_file, write_file, run_pytest], languages: [python]}
+  - name: reviewer
+    role: Reviewer
+    capability: {can_review: true}

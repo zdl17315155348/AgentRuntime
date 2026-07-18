@@ -85,10 +85,14 @@ class KernelScheduler(BaseScheduler):
             dep_node = self.nodes.get(dep_id)
             if dep_node is None:
                 raise KeyError(dep_id)
+            if self._has_dependent_path(task_id, dep_id):
+                raise ValueError("cyclic dependency is not allowed")
 
         for dep_id in unique_ids:
             if dep_id in task_node.dependencies:
                 continue
+            if dep_id not in task.dependencies:
+                task.dependencies.append(dep_id)
             dep_node = self.nodes[dep_id]
             task_node.dependencies.add(dep_id)
             dep_node.dependents.add(task_id)
@@ -105,6 +109,21 @@ class KernelScheduler(BaseScheduler):
         else:
             task.transition_to(TaskStatus.PENDING, "waiting_dependencies")
             self.waiting_queue.append(task)
+
+    def _has_dependent_path(self, start_id: str, target_id: str) -> bool:
+        seen: set[str] = set()
+        stack = [start_id]
+        while stack:
+            current = stack.pop()
+            if current == target_id:
+                return True
+            if current in seen:
+                continue
+            seen.add(current)
+            node = self.nodes.get(current)
+            if node is not None:
+                stack.extend(node.dependents)
+        return False
 
     def dequeue(self) -> Optional[TaskSpec]:
         dispatched = self.dispatch_ready(limit=1)

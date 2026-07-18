@@ -189,6 +189,42 @@ def test_kernel_scheduler_default_fail_open_releases_dependent_task():
     assert scheduler.queue_snapshot()["ready"] == ["t2"]
 
 
+def test_kernel_scheduler_add_dependencies_moves_ready_task_back_to_pending():
+    scheduler = KernelScheduler()
+    dep = TaskSpec(task_id="dep", agent_name="agent1", task_input={})
+    task = TaskSpec(task_id="task", agent_name="agent1", task_input={})
+
+    scheduler.enqueue(dep)
+    scheduler.enqueue(task)
+    scheduler.add_dependencies("task", ["dep"])
+
+    assert task.dependencies == ["dep"]
+    assert scheduler.queue_snapshot()["ready"] == ["dep"]
+    assert scheduler.queue_snapshot()["waiting"] == ["task"]
+    scheduler.dequeue()
+    scheduler.complete_task("dep")
+    assert scheduler.queue_snapshot()["ready"] == ["task"]
+
+
+def test_kernel_scheduler_add_dependencies_rejects_cycle_without_mutation():
+    scheduler = KernelScheduler()
+    a = TaskSpec(task_id="a", agent_name="agent1", task_input={})
+    b = TaskSpec(task_id="b", agent_name="agent1", task_input={}, dependencies=["a"])
+
+    scheduler.enqueue(a)
+    scheduler.enqueue(b)
+
+    try:
+        scheduler.add_dependencies("a", ["b"])
+    except ValueError as exc:
+        assert "cyclic" in str(exc)
+    else:
+        raise AssertionError("cycle was accepted")
+
+    assert a.dependencies == []
+    assert scheduler.nodes["a"].dependencies == set()
+
+
 def test_kernel_scheduler_resource_aware_score_uses_normalized_ratios():
     scheduler = KernelScheduler(policy="resource_aware", resource_checker=lambda task: (True, "resource_available"))
     low_ratio = TaskSpec(

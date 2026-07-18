@@ -33,10 +33,14 @@ def recover_tasks(store: SQLiteStateStore) -> tuple[list[TaskSpec], dict[str, st
             decisions[task.task_id] = "READY->READY"
             recovered.append(task)
         elif task.status == TaskStatus.PENDING:
-            decisions[task.task_id] = "PENDING->READY"
-            task.transition_to(TaskStatus.READY, "daemon.recovery.pending_ready")
-            store.save_task(task)
-            recovered.append(task)
+            if task.dependencies:
+                decisions[task.task_id] = "PENDING->PENDING"
+                store.save_task(task)
+            else:
+                decisions[task.task_id] = "PENDING->READY"
+                task.transition_to(TaskStatus.READY, "daemon.recovery.pending_ready")
+                store.save_task(task)
+                recovered.append(task)
         else:
             continue
     store.release_all_active_leases(reason="daemon.recovery")

@@ -56,6 +56,11 @@ class SQLiteStateStore:
             "id INTEGER PRIMARY KEY AUTOINCREMENT, trace_id TEXT, task_id TEXT, name TEXT, "
             "data TEXT NOT NULL, created_at TEXT NOT NULL)"
         )
+        cur.execute(
+            "CREATE TABLE IF NOT EXISTS processed_messages ("
+            "message_id TEXT NOT NULL, receiver TEXT NOT NULL, status TEXT NOT NULL, "
+            "processed_at TEXT, generated_task_id TEXT, PRIMARY KEY(message_id, receiver))"
+        )
         self._conn.commit()
 
     def save_agent(
@@ -222,10 +227,33 @@ class SQLiteStateStore:
             )
             self._conn.commit()
 
+    def save_processed_message(
+        self,
+        message_id: str,
+        receiver: str,
+        status: str = "processed",
+        generated_task_id: str = "",
+    ) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO processed_messages "
+                "(message_id, receiver, status, processed_at, generated_task_id) VALUES (?, ?, ?, ?, ?)",
+                (message_id, receiver, status, datetime.now().isoformat(), generated_task_id),
+            )
+            self._conn.commit()
+
+    def processed_message_exists(self, message_id: str, receiver: str) -> bool:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT 1 FROM processed_messages WHERE message_id = ? AND receiver = ?",
+                (message_id, receiver),
+            ).fetchone()
+            return row is not None
+
     def counts(self) -> dict[str, int]:
         result = {}
         with self._lock:
-            for table in ("agents", "tasks", "task_attempts", "resource_leases", "mailbox_messages", "trace_events"):
+            for table in ("agents", "tasks", "task_attempts", "resource_leases", "mailbox_messages", "trace_events", "processed_messages"):
                 result[table] = int(self._conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
             result["dead_letter_messages"] = int(
                 self._conn.execute("SELECT COUNT(*) FROM mailbox_messages WHERE dead_letter = 1").fetchone()[0]
