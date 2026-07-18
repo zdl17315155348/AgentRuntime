@@ -264,7 +264,8 @@ def _agent_semaphore(agent_name: str) -> asyncio.Semaphore:
 def _start_worker(agent_name: str) -> subprocess.Popen:
     uds_path = os.getenv("AGENTD_UDS_PATH", "/tmp/agent-runtime-agentd.sock")
     token = agent_auth_tokens.setdefault(agent_name, secrets.token_urlsafe(24))
-    proc = start_worker_process(agent_name, uds_path, llm_gateway.backend, llm_gateway.api_key or "", token)
+    workspace_root = os.getenv("AGENT_WORKSPACE", "")
+    proc = start_worker_process(agent_name, uds_path, llm_gateway.backend, llm_gateway.api_key or "", token, workspace_root or None)
     agent_workers[agent_name] = proc
     fault_states.setdefault(agent_name, WorkerFaultState(agent_name=agent_name, fault_domain=agent_name)).heartbeat()
     acb = agent_controls.get(agent_name)
@@ -371,6 +372,10 @@ def _prepare_agent_for_task(task: TaskSpec, reason: str) -> None:
         _recover_agent(task.agent_name, task.task_id, reason=f"{reason}.recover")
     elif agent.status == AgentStatus.COMPLETED:
         agent.status = AgentStatus.READY
+        acb = agent_controls.get(task.agent_name)
+        if acb is not None:
+            acb.status = AgentStatus.READY
+            acb.record_event("agent.reused", task_id=task.task_id, reason=reason)
         _persist_agent(task.agent_name)
     _set_context_handle(task.agent_name, task.context_id or None)
     _transition_agent(task.agent_name, AgentStatus.RUNNING, task_id=task.task_id, reason=reason)
@@ -483,6 +488,24 @@ class SpawnTaskRequest(BaseModel):
     inherit_context: bool = True
     context_id: str = ""
     timeout_ms: Optional[int] = None
+    failure_policy: FailurePolicy = Field(default_factory=FailurePolicy)
+    dependency_failure_policies: dict[str, FailureMode] = Field(default_factory=dict)
+    on_failure: dict[str, FailureMode] = Field(default_factory=dict)
+
+    @field_validator("failure_policy", mode="before")
+    @classmethod
+    def normalize_failure_policy(cls, value):
+        return FailurePolicy.from_legacy(value)
+
+    @field_validator("dependency_failure_policies", "on_failure", mode="before")
+    @classmethod
+    def normalize_edge_failure_policy(cls, value):
+        if not value:
+            return {}
+        return {
+            str(dep_id): FailureMode(mode.value if isinstance(mode, FailureMode) else str(mode).replace("-", "_"))
+            for dep_id, mode in dict(value).items()
+        }
 
 
 def _record_task_context(context_id: str, agent_name: str, task_input: dict) -> None:
@@ -908,12 +931,32 @@ async def spawn_task(task_id: str, req: SpawnTaskRequest):
         parent_task_id=task_id,
         trace_id=parent.trace_id,
         dependencies=dependency_ids,
+        dependency_failure_policies=_edge_failure_policies(req),
+        failure_policy=req.failure_policy,
         required_capability=req.required_capability,
+        _explicit_fields=_explicit_fields(req),
     )
     tasks[child.task_id] = child
     parent.children.append(child.task_id)
     trace_recorder.ensure_trace(child.trace_id, child.task_id)
     _record_trace_event(child, "task.spawned", {"parent_task_id": task_id, "dependencies": dependency_ids})
+    if dependency_ids and all(
+        tasks[dep_id].status == TaskStatus.SUCCESS
+        or (
+            tasks[dep_id].status in (TaskStatus.FAILED, TaskStatus.TIMEOUT, TaskStatus.CANCELLED)
+            and child.dependency_failure_policies.get(dep_id) == FailureMode.FAIL_OPEN
+        )
+        for dep_id in dependency_ids
+    ):
+        child.dependencies = [
+            dep_id
+            for dep_id in child.dependencies
+            if not (
+                tasks[dep_id].status in (TaskStatus.FAILED, TaskStatus.TIMEOUT, TaskStatus.CANCELLED)
+                and child.dependency_failure_policies.get(dep_id) == FailureMode.FAIL_OPEN
+            )
+        ]
+        child.transition_to(TaskStatus.READY, "dependencies_satisfied")
     scheduler.enqueue(child)
     _record_trace_event(child, "scheduler.enqueue", {"status": child.status})
     _persist_task(parent)
@@ -1167,7 +1210,7 @@ async def _run_task_once(
                 "reason": "timeout",
             })
             _record_trace_event(task, "task.cancel", {"agent_name": agent_name, "attempt_id": attempt_id})
-            await asyncio.sleep(float(os.getenv("AGENTD_CANCEL_GRACE_S", "0.2")))
+            await asyncio.sleep(float(os.getenv("AGENTD_CANCEL_GRACE_MS", "500")) / 1000.0)
             cgroup_manager.kill(agent_name)
             _record_trace_event(task, "worker.kill", {"agent_name": agent_name, "attempt_id": attempt_id})
             await resource_monitor.reclaim_async(task.task_id, reason="task timeout")
@@ -1192,9 +1235,12 @@ async def _run_task_once(
             trace_recorder.finish_span(task.task_id, span_id, "success")
             return output
         if attempt is not None:
-            task.finish_attempt(attempt, failure_reason=error or "worker error", token_usage=usage if isinstance(usage, dict) else {})
+            task.finish_attempt(attempt, result={"output": output}, failure_reason=error or output or "worker error", token_usage=usage if isinstance(usage, dict) else {})
             _persist_task(task)
-        raise RuntimeError(error or "worker error")
+        raise RuntimeError(error or output or "worker error")
+    except asyncio.CancelledError:
+        trace_recorder.finish_span(task.task_id, span_id, "cancelled")
+        raise
     except Exception:
         if attempt is not None and attempt.completed_at is None:
             task.finish_attempt(attempt, failure_reason="worker error")
@@ -1452,20 +1498,21 @@ async def startup():
             task_id = str(data.get("task_id") or "").strip()
             if not task_id:
                 return
+            task = tasks.get(task_id)
+            if task is None:
+                return
             pending = pending_task_results.get(task_id)
             if not pending:
                 return
             fut = pending.get("future")
-            active_attempt_id = str(pending.get("attempt_id") or "")
+            active_attempt = task.active_attempt
+            active_attempt_id = active_attempt.attempt_id if active_attempt is not None else ""
             result_attempt_id = str(data.get("attempt_id") or "")
-            task = tasks.get(task_id)
-            if active_attempt_id and result_attempt_id != active_attempt_id:
-                if task is not None:
-                    _record_trace_event(task, "task.late_result", {"attempt_id": result_attempt_id, "active_attempt_id": active_attempt_id})
+            if active_attempt is None or result_attempt_id != active_attempt_id:
+                _record_trace_event(task, "task.late_result", {"result_attempt_id": result_attempt_id, "active_attempt_id": active_attempt_id or None})
                 return
             if fut is None or fut.done():
-                if task is not None:
-                    _record_trace_event(task, "task.late_result", {"attempt_id": result_attempt_id, "reason": "future_done"})
+                _record_trace_event(task, "task.late_result", {"result_attempt_id": result_attempt_id, "reason": "future_done"})
                 return
             fut.set_result({
                 "agent_name": agent_name,
@@ -1490,6 +1537,10 @@ async def startup():
                 await message_router.ack(agent_name, message_id)
                 return
             state_store.save_processed_message(message_id, agent_name, status="processed", generated_task_id=str(data.get("generated_task_id") or ""))
+            for task in tasks.values():
+                if task.agent_name == agent_name and task.status == TaskStatus.SUCCESS:
+                    _record_trace_event(task, "agent_message_ack", {"message_id": message_id, "agent_name": agent_name})
+                    break
             await message_router.ack(agent_name, message_id)
 
         uds_server = await start_uds_server(
@@ -1518,6 +1569,13 @@ async def startup():
                         continue
                     fault = fault_states.setdefault(name, WorkerFaultState(agent_name=name, fault_domain=name))
                     if proc.poll() is not None or fault.heartbeat_stale(10.0):
+                        current_task_id = agent.current_task_id
+                        if current_task_id and current_task_id in tasks:
+                            _record_trace_event(
+                                tasks[current_task_id],
+                                "worker.lost",
+                                {"agent_name": name, "reason": "proc_exit" if proc.poll() is not None else "heartbeat_stale"},
+                            )
                         _stop_worker(name)
                         if fault.can_restart():
                             fault.record_restart()

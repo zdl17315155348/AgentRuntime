@@ -14,7 +14,13 @@ class RunPytestTool:
         extra_args = arguments.get("args", [])
         if not isinstance(extra_args, list):
             extra_args = []
-        argv = ["python3", "-m", "pytest", *[str(arg) for arg in extra_args]]
+        paths = arguments.get("paths", [])
+        if not isinstance(paths, list):
+            paths = []
+        argv = ["python3", "-m", "pytest", *[str(arg) for arg in extra_args], *[str(path) for path in paths]]
+        junit_xml = arguments.get("junit_xml")
+        if isinstance(junit_xml, str) and junit_xml:
+            argv.append(f"--junitxml={junit_xml}")
         try:
             proc = subprocess.run(
                 argv,

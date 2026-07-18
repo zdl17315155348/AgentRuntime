@@ -24,23 +24,20 @@ def _decode_line(line: bytes) -> dict:
     return json.loads(line.decode("utf-8").strip())
 
 
-async def _send_result(writer: asyncio.StreamWriter, result_msg: dict) -> None:
-    for _ in range(3):
-        writer.write(_encode_line(result_msg))
-        await writer.drain()
-        await asyncio.sleep(0)
+async def _send_result(send_json, result_msg: dict) -> None:
+    await send_json(result_msg)
 
 
 async def _run_exec_task(
     data: dict,
-    writer: asyncio.StreamWriter,
+    send_json,
     llm_gateway: LLMGateway,
     executor: TaskExecutor,
     tool_context: ToolExecutionContext,
 ) -> None:
     task_id = str(data.get("task_id") or "").strip()
     attempt_id = str(data.get("attempt_id") or "").strip()
-    if not task_id:
+    if not task_id or not attempt_id:
         return
     system_prompt = str(data.get("system_prompt") or "")
     user_message = str(data.get("user_message") or "")
@@ -62,24 +59,26 @@ async def _run_exec_task(
                         or execution.get("cache_hit")
                     )
 
+        if llm_gateway.backend == "mock" and isinstance(task_input, dict):
+            test_cfg = task_input.get("__test", {})
+            if isinstance(test_cfg, dict):
+                sleep_ms = test_cfg.get("sleep_ms")
+                if isinstance(sleep_ms, (int, float)) and sleep_ms > 0:
+                    await asyncio.sleep(float(sleep_ms) / 1000.0)
+                if test_cfg.get("crash_worker") is True:
+                    os._exit(2)
+                if test_cfg.get("force_error") is True:
+                    raise RuntimeError("forced error")
+
         tool_request = task_input.get("__tool") if isinstance(task_input, dict) else None
         if isinstance(tool_request, dict) and tool_request.get("name"):
             tool_result = await executor.execute_tool(str(tool_request["name"]), dict(tool_request.get("arguments") or {}), tool_context)
-            if not tool_result.ok:
-                raise RuntimeError(tool_result.error or "tool error")
             output = json.dumps(tool_result.output, ensure_ascii=False)
-            usage = {"tool": tool_request["name"]}
+            usage = {"tool": tool_request["name"], "metadata": tool_result.metadata}
+            if not tool_result.ok:
+                status = "FAILED"
+                error = tool_result.error or "tool error"
         else:
-            if llm_gateway.backend == "mock" and isinstance(task_input, dict):
-                test_cfg = task_input.get("__test", {})
-                if isinstance(test_cfg, dict):
-                    sleep_ms = test_cfg.get("sleep_ms")
-                    if isinstance(sleep_ms, (int, float)) and sleep_ms > 0:
-                        await asyncio.sleep(float(sleep_ms) / 1000.0)
-                    if test_cfg.get("crash_worker") is True:
-                        os._exit(2)
-                    if test_cfg.get("force_error") is True:
-                        raise RuntimeError("forced error")
             llm_result = llm_gateway.chat_with_stats(
                 system_prompt,
                 user_message,
@@ -88,14 +87,20 @@ async def _run_exec_task(
             output = llm_result.output
             usage = llm_result.to_dict()
     except asyncio.CancelledError:
-        status = "FAILED"
-        error = "cancelled"
+        await send_json(
+            {
+                "type": "task_cancelled",
+                "task_id": task_id,
+                "attempt_id": attempt_id,
+            }
+        )
+        raise
     except Exception as exc:
         status = "FAILED"
         error = str(exc)
 
     await _send_result(
-        writer,
+        send_json,
         {
             "type": "task_result",
             "message_id": f"result_{uuid4().hex}",
@@ -134,15 +139,21 @@ async def _run() -> None:
     writer.write(_encode_line({"type": "register", "agent_name": agent_name, "token": auth_token}))
     await writer.drain()
 
-    running: dict[str, asyncio.Task] = {}
+    writer_lock = asyncio.Lock()
+
+    async def send_json(payload: dict) -> None:
+        async with writer_lock:
+            writer.write(_encode_line(payload))
+            await writer.drain()
+
+    running: dict[tuple[str, str], asyncio.Task] = {}
     processed_messages: set[str] = set()
     context_updates: list[dict] = []
 
     async def heartbeat_loop() -> None:
         while True:
             await asyncio.sleep(1.0)
-            writer.write(_encode_line({"type": "heartbeat", "agent_name": agent_name}))
-            await writer.drain()
+            await send_json({"type": "heartbeat", "agent_name": agent_name})
 
     heartbeat_task = asyncio.create_task(heartbeat_loop())
     try:
@@ -155,31 +166,66 @@ async def _run() -> None:
 
             if msg_type == "exec_task":
                 task_id = str(data.get("task_id") or "").strip()
-                if task_id:
-                    running[task_id] = asyncio.create_task(_run_exec_task(data, writer, llm_gateway, executor, tool_context))
+                attempt_id = str(data.get("attempt_id") or "").strip()
+                if not task_id or not attempt_id:
+                    await send_json(
+                        {
+                            "type": "protocol_error",
+                            "task_id": task_id,
+                            "attempt_id": attempt_id,
+                            "error": "task_id and attempt_id are required",
+                        }
+                    )
+                    continue
+                key = (task_id, attempt_id)
+                if key in running:
+                    await send_json(
+                        {
+                            "type": "protocol_error",
+                            "task_id": task_id,
+                            "attempt_id": attempt_id,
+                            "error": "attempt already running",
+                        }
+                    )
+                    continue
+                task = asyncio.create_task(_run_exec_task(data, send_json, llm_gateway, executor, tool_context))
+                running[key] = task
+
+                def cleanup(done_task: asyncio.Task, task_key=key) -> None:
+                    if running.get(task_key) is done_task:
+                        running.pop(task_key, None)
+
+                task.add_done_callback(cleanup)
                 continue
 
             if msg_type == "cancel_task":
                 task_id = str(data.get("task_id") or "").strip()
-                task = running.pop(task_id, None)
+                attempt_id = str(data.get("attempt_id") or "").strip()
+                key = (task_id, attempt_id)
+                task = running.get(key)
                 if task is not None:
                     task.cancel()
-                writer.write(_encode_line({"type": "cancel_ack", "task_id": task_id, "attempt_id": data.get("attempt_id", "")}))
-                await writer.drain()
+                await send_json(
+                    {
+                        "type": "cancel_ack",
+                        "task_id": task_id,
+                        "attempt_id": attempt_id,
+                        "cancelled": task is not None,
+                        **({} if task is not None else {"reason": "attempt_not_running"}),
+                    }
+                )
                 continue
 
             if msg_type == "agent_message" or (msg_type == "message" and data.get("payload")):
                 message_id = str(data.get("message_id") or "")
                 if message_id and message_id not in processed_messages:
                     processed_messages.add(message_id)
-                writer.write(_encode_line({"type": "agent_message_ack", "message_id": message_id, "agent_name": agent_name}))
-                await writer.drain()
+                await send_json({"type": "agent_message_ack", "message_id": message_id, "agent_name": agent_name})
                 continue
 
             if msg_type == "context_update":
                 context_updates.append(dict(data.get("payload") or {}))
-                writer.write(_encode_line({"type": "context_update_ack", "message_id": data.get("message_id", ""), "agent_name": agent_name}))
-                await writer.drain()
+                await send_json({"type": "context_update_ack", "message_id": data.get("message_id", ""), "agent_name": agent_name})
                 continue
     finally:
         heartbeat_task.cancel()

@@ -283,6 +283,13 @@ class TaskSpec(BaseModel):
         self.attempts.append(attempt)
         return attempt
 
+    @property
+    def active_attempt(self) -> TaskAttempt | None:
+        for attempt in reversed(self.attempts):
+            if attempt.completed_at is None:
+                return attempt
+        return None
+
     def finish_attempt(
         self,
         attempt: TaskAttempt,

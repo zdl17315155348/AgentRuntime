@@ -39,10 +39,11 @@ def test_worker_fallback_attempt_and_downstream_continue():
         }).json()
 
         data = wait_task_done(client, task["task_id"])
-        assert data["status"] == "TIMEOUT"
-        assert len(data["attempts"]) >= 1
+        assert data["status"] == "SUCCESS"
+        assert len(data["attempts"]) >= 2
         assert data["definition"]["agent_name"] == coder_a
-        assert any(attempt["agent_name"] == coder_a for attempt in data["attempts"])
+        assert any(attempt["agent_name"] == coder_a and attempt["status"] in ("FAILED", "TIMEOUT") for attempt in data["attempts"])
+        assert any(attempt["agent_name"] == coder_b and attempt["status"] == "SUCCESS" for attempt in data["attempts"])
         down = wait_task_done(client, downstream["task_id"])
         assert down["status"] == "SUCCESS"
         metrics = client.get("/metrics").json()

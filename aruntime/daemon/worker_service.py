@@ -21,13 +21,15 @@ def json_log(event: str, **fields: Any) -> None:
         f.write(json.dumps(line, ensure_ascii=False) + "\n")
 
 
-def start_worker_process(agent_name: str, uds_path: str, llm_backend: str, llm_api_key: str, auth_token: str) -> subprocess.Popen:
+def start_worker_process(agent_name: str, uds_path: str, llm_backend: str, llm_api_key: str, auth_token: str, workspace_root: str | None = None) -> subprocess.Popen:
     env = os.environ.copy()
     env["AGENT_NAME"] = agent_name
     env["AGENTD_UDS_PATH"] = uds_path
     env["AGENT_AUTH_TOKEN"] = auth_token
     env["LLM_BACKEND"] = llm_backend
     env["LLM_API_KEY"] = llm_api_key or ""
+    if workspace_root:
+        env["AGENT_WORKSPACE"] = workspace_root
     logs = log_dir()
     stdout_path = os.path.join(logs, f"{agent_name}.stdout.log")
     stderr_path = os.path.join(logs, f"{agent_name}.stderr.log")

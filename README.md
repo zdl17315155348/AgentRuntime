@@ -129,11 +129,11 @@ curl -s http://127.0.0.1:8234/tasks/<task_id>
 | Dynamic Task | spawn children、DAG、依赖、trace/context 继承 | `aruntime/daemon/main.py`, `aruntime/scheduler/kernel.py` | 已实现 | `/tasks/{task_id}/spawn`, `/children`, `/dag`, `/dependencies` |
 | Context | shared/private/readonly/version/diff/compression/prefix metrics | `aruntime/context/manager.py`, `aruntime/context/types.py` | 部分实现 | readonly 用版本追加；LLM 语义摘要为结构化实现 |
 | Resource | ResourceLease、LLM 并发、cgroup v2、pressure 读取 | `aruntime/resource/monitor.py`, `aruntime/resource/cgroup.py`, `aruntime/resource/types.py` | 已实现 | 真实 cgroup 依赖宿主权限 |
-| Timeout/Kill | timeout_ms、attempt_id、task.timeout trace、cancel、lease 回收、cgroup kill | `aruntime/daemon/main.py`, `aruntime/resource/cgroup.py`, `aruntime/core/models.py` | 已实现 | 超时后进入 TIMEOUT 并丢弃迟到结果 |
+| Timeout/Kill | timeout_ms、attempt_id、task.timeout trace、cancel、lease 回收、cgroup kill | `aruntime/daemon/main.py`, `aruntime/resource/cgroup.py`, `aruntime/core/models.py` | 已实现 | 超时后进入 TIMEOUT，迟到结果按 active attempt 隔离 |
 | Communication | UDS、mailbox、ack、去重、重放、dead-letter、agent_message/cancel/context_update | `aruntime/comm/message.py`, `aruntime/comm/router.py`, `aruntime/comm/transport.py`, `aruntime/worker/agent_worker.py` | 已实现 | worker 端处理完成后再 ACK |
 | Tool Execution | repo_scan、read/write_file、search_code、git_status/diff、run_pytest、run_command | `aruntime/tools/*`, `aruntime/executor/*`, `aruntime/worker/agent_worker.py` | 已实现 | 受控工作区、路径白名单、Shell allowlist、超时和输出限制 |
 | Persistence | SQLite/WAL、agents/tasks/attempts/leases/mailbox/trace 恢复 | `aruntime/daemon/store.py`, `aruntime/daemon/recovery_service.py` | 已实现 | 单元测试覆盖 READY/RUNNING 恢复 |
-| Heartbeat/Fault | worker heartbeat、restart_budget、fallback attempt | `aruntime/daemon/fault_service.py`, `aruntime/worker/agent_worker.py` | 部分实现 | 端到端恢复测试待继续扩展 |
+| Heartbeat/Fault | worker heartbeat、restart_budget、fallback attempt | `aruntime/daemon/fault_service.py`, `aruntime/worker/agent_worker.py` | 已实现 | 记录 worker.lost、worker.isolated、task.fallback |
 | Benchmark | Scheduler/Context/Fault/IPC/Scalability 输出 CSV/SVG | `testing/perf/*`, `scripts/benchmark_docker_openeuler.sh`, `BENCHMARK.md` | 已实现 | vLLM APC 真实实验需 `VLLM_BASE_URL` |
 | LangGraph 对比 | 系统层 Runtime vs 应用层图编排 | `docs/langgraph_compare.md`, `docs/architecture.md` | 已实现 | 文档定位，不引入依赖 |
 
@@ -151,7 +151,7 @@ Agent Runtime Scheduler：支持 `fifo` / `priority` / `resource_aware` / `fair_
 
 故障策略：任务未显式配置时默认不失败级联；显式 `failure_policy` 支持 `fail_open`、`fail_closed`、`retry`、`fallback`、`degrade` 以及 `max_retries`、`fallback_agent`、`timeout_ms`。DAG 边支持 `on_failure`，可对单条依赖边设置 `retry`、`fallback`、`fail_open`、`fail_closed`；无边策略时会按显式任务默认策略处理。
 
-Worker 故障处理：worker 崩溃后 Runtime 标记 Agent 为 `FAILED`，记录 `worker.isolated`，释放资源并重启 worker；任务按策略 retry / fallback / degrade / fail_closed 处理，下游任务按边 `on_failure` 决策。超时任务会发送 `cancel_task`，等待宽限期后 kill worker/cgroup，并校验 `attempt_id` 丢弃迟到结果。
+Worker 故障处理：worker 崩溃后 Runtime 标记 Agent 为 `FAILED`，记录 `worker.lost` / `worker.isolated`，释放资源并重启 worker；任务按策略 retry / fallback / degrade / fail_closed 处理，下游任务按边 `on_failure` 决策。超时任务会发送 `cancel_task`，等待宽限期后 kill worker/cgroup，并校验 `attempt_id` 丢弃迟到结果。
 
 受控工具执行：worker 支持 `__tool` 请求直达真实工具执行层，内置 `repo_scan`、`read_file`、`search_code`、`write_file`、`git_status`、`git_diff`、`run_pytest`、`run_command`。默认工作区路径受限，禁止越界访问，Shell 仅允许白名单命令，命令超时和输出大小受控。
 
@@ -177,7 +177,7 @@ Agent 生命周期管理：支持注册、提交任务、查询任务状态。
 
 Agent 执行模型：每个 Agent 为独立进程（worker），agentd 通过 UDS 下发任务并回传结果。
 
-Agent 间通信：UDS 流式通信 + agentd 路由（在线 push，离线 mailbox，上线补发）。MessageRouter 使用 asyncio.Lock 保护连接表和 mailbox，锁内只读写内存状态，网络 drain、连接等待均在锁外执行；慢连接 drain 不阻塞其他 Agent mailbox 操作，断线写失败会回投 mailbox，同名重连不会被旧连接注销覆盖。HTTP 仍保留 /messages 作为调试接口。
+Agent 间通信：UDS 流式通信 + agentd 路由（在线 push，离线 mailbox，上线补发）。MessageRouter 使用 asyncio.Lock 保护连接表和 mailbox，锁内只读写内存状态，网络 drain、连接等待均在锁外执行；慢连接 drain 不阻塞其他 Agent mailbox 操作，断线写失败会回投 mailbox，同名重连不会被旧连接注销覆盖；消息 ACK、context_update ACK 和 cancel ACK 统一走单连接锁。HTTP 仍保留 /messages 作为调试接口。
 
 任务状态：TaskDefinition / TaskControlBlock / TaskAttempt 三层拆分，TCB 作为唯一运行时状态源，状态转换统一走 FSM，fallback 通过新 attempt 记录，不改原始任务归属。
 

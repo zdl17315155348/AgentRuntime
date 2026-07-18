@@ -82,8 +82,12 @@ class MessageRouter:
                         self._store.save_mailbox_message(msg, dead_letter=True)
                 else:
                     replay.append(msg)
-                    self._mailboxes[agent_name].appendleft(msg)
-            return len(replay)
+        for msg in replay:
+            async with self._lock:
+                self._mailboxes[agent_name].appendleft(msg)
+                if self._store is not None:
+                    self._store.save_mailbox_message(msg, dead_letter=False)
+        return len(replay)
 
     async def dead_letters(self, agent_name: str | None = None, limit: int = 50) -> list[Message]:
         async with self._lock:
@@ -97,26 +101,29 @@ class MessageRouter:
 
     async def register(self, agent_name: str, writer: asyncio.StreamWriter) -> None:
         async with self._lock:
+            connection_lock = asyncio.Lock()
             self._connections[agent_name] = writer
-            self._conn_locks[agent_name] = asyncio.Lock()
+            self._conn_locks[agent_name] = connection_lock
             ev = self._connected_events.get(agent_name)
             if ev is None:
                 ev = asyncio.Event()
                 self._connected_events[agent_name] = ev
             queued = list(self._mailboxes.get(agent_name, deque()))
             queued_ids = {msg.message_id for msg in queued}
-            queued.extend([
-                msg for msg in self._unacked.values()
+            queued.extend(
+                msg
+                for msg in self._unacked.values()
                 if msg.to_agent == agent_name and msg.message_id not in queued_ids
-            ])
-            if queued:
-                self._mailboxes[agent_name] = deque()
-        ev.set()
+            )
+            self._mailboxes[agent_name] = deque()
+            ev.set()
         if self._store is not None and queued:
             self._store.delete_mailbox_messages([msg.message_id for msg in queued])
 
         for msg in queued:
-            await self._send_to_writer(agent_name, msg)
+            ok = await self._send_to_writer(agent_name, msg, writer, connection_lock)
+            if not ok:
+                await self._requeue_after_send_failure(agent_name, msg, writer)
 
     async def unregister(self, agent_name: str, writer: asyncio.StreamWriter | None = None) -> None:
         async with self._lock:
@@ -131,34 +138,39 @@ class MessageRouter:
     async def route(self, message: Message) -> None:
         async with self._lock:
             writer = self._connections.get(message.to_agent)
-            w_lock = self._conn_locks.get(message.to_agent)
-            if writer is None or w_lock is None:
+            connection_lock = self._conn_locks.get(message.to_agent)
+            if writer is None or connection_lock is None:
                 self._enqueue_locked(message)
                 return
-        await self._send_to_writer(message.to_agent, message, writer, w_lock)
+        ok = await self._send_to_writer(message.to_agent, message, writer, connection_lock)
+        if not ok:
+            await self._requeue_after_send_failure(message.to_agent, message, writer)
 
     async def wait_connected(self, agent_name: str, timeout_s: float = 5.0) -> bool:
         async with self._lock:
+            if agent_name in self._connections:
+                return True
             ev = self._connected_events.get(agent_name)
             if ev is None:
                 ev = asyncio.Event()
                 self._connected_events[agent_name] = ev
         try:
             await asyncio.wait_for(ev.wait(), timeout=timeout_s)
-            return True
-        except Exception:
+        except asyncio.TimeoutError:
             return False
+        async with self._lock:
+            return agent_name in self._connections
 
     async def send_event(self, agent_name: str, event: dict) -> bool:
         async with self._lock:
             writer = self._connections.get(agent_name)
-            w_lock = self._conn_locks.get(agent_name)
-        if writer is None or w_lock is None:
+            connection_lock = self._conn_locks.get(agent_name)
+        if writer is None or connection_lock is None:
             return False
 
         line = (json.dumps(event, ensure_ascii=False) + "\n").encode("utf-8")
         try:
-            async with w_lock:
+            async with connection_lock:
                 writer.write(line)
                 await writer.drain()
             return True
@@ -170,29 +182,50 @@ class MessageRouter:
         self,
         agent_name: str,
         message: Message,
-        writer: asyncio.StreamWriter | None = None,
-        w_lock: asyncio.Lock | None = None,
-    ) -> None:
-        if writer is None or w_lock is None:
-            async with self._lock:
-                writer = self._connections.get(agent_name)
-                w_lock = self._conn_locks.get(agent_name)
-        if writer is None or w_lock is None:
-            await self.send(message)
-            return
-
+        writer: asyncio.StreamWriter,
+        connection_lock: asyncio.Lock,
+    ) -> bool:
         data = {"type": "message", **message.model_dump(mode="json")}
         line = (json.dumps(data, ensure_ascii=False) + "\n").encode("utf-8")
         try:
-            async with w_lock:
+            async with connection_lock:
                 writer.write(line)
                 await writer.drain()
+            return True
         except Exception:
             await self.unregister(agent_name, writer)
-            async with self._lock:
-                current_writer = self._connections.get(agent_name)
-                current_lock = self._conn_locks.get(agent_name)
-                if current_writer is None or current_lock is None:
+            return False
+
+    async def _requeue_after_send_failure(
+        self,
+        agent_name: str,
+        message: Message,
+        failed_writer: asyncio.StreamWriter,
+    ) -> None:
+        retry_writer = None
+        retry_lock = None
+
+        async with self._lock:
+            current_writer = self._connections.get(agent_name)
+            current_lock = self._conn_locks.get(agent_name)
+
+            if (
+                current_writer is not None
+                and current_lock is not None
+                and current_writer is not failed_writer
+            ):
+                retry_writer = current_writer
+                retry_lock = current_lock
+            else:
+                self._enqueue_locked(message)
+
+        if retry_writer is not None and retry_lock is not None:
+            ok = await self._send_to_writer(
+                agent_name,
+                message,
+                retry_writer,
+                retry_lock,
+            )
+            if not ok:
+                async with self._lock:
                     self._enqueue_locked(message)
-                    return
-            await self._send_to_writer(agent_name, message, current_writer, current_lock)

@@ -47,6 +47,7 @@ async def test_agent_worker_process_exec_task_roundtrip(tmp_path):
         sent = await router.send_event("A", {
             "type": "exec_task",
             "task_id": "t1",
+            "attempt_id": "a1",
             "system_prompt": "你是一个测试员",
             "user_message": "{'request': 'hi'}",
             "task_input": {"request": "hi"},
@@ -56,6 +57,7 @@ async def test_agent_worker_process_exec_task_roundtrip(tmp_path):
         with anyio.fail_after(5):
             data = await fut
         assert data["status"] == "SUCCESS"
+        assert data["attempt_id"] == "a1"
         assert isinstance(data.get("output"), str)
     finally:
         server.close()
