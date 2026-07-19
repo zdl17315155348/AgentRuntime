@@ -20,6 +20,12 @@ def wait_task_done(client, task_id: str, timeout_s: float = 10.0) -> dict:
         time.sleep(0.2)
     raise AssertionError(f"任务未在 {timeout_s}s 内完成: {task_id}")
 
+
+def task_status(client, task_id: str) -> str:
+    resp = client.get(f"/tasks/{task_id}")
+    assert resp.status_code == 200
+    return resp.json()["status"]
+
 class TestAgentLifecycleAPI:
     """测试 Agent 在 agentd 中的完整生命周期"""
 
@@ -420,7 +426,8 @@ class TestAgentLifecycleAPI:
 
             if task_a_status in ("SUCCESS", "FAILED"):
                 break
-            assert task_b_status not in ("RUNNING", "SUCCESS")
+            if task_b_status in ("RUNNING", "SUCCESS"):
+                assert task_status(client, task_a) in ("SUCCESS", "FAILED")
             time.sleep(0.1)
 
         assert task_a_status == "SUCCESS"

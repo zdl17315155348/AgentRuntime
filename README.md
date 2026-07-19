@@ -119,21 +119,24 @@ curl -s http://127.0.0.1:8234/tasks/<task_id>
 成功判定：`status` 为 `SUCCESS`，并且 `result.output` 为真实模型输出（例如 `OK`）。
 
 ## 当前进度
-实现状态总表见 `docs/implementation_status.md`；进度记录见 `docs/progress.md`。
+实现状态总表见 `docs/implementation_status.md`；进度记录见 `docs/progress.md`。比赛要求范围内的核心机制已经完成；通用抢占、生产级多节点部署和 LLM 语义摘要不在当前实现范围内。
 
 | 模块 | README 声明能力 | 源码实现位置 | 当前状态 | 备注 |
 |---|---|---|---|---|
 | Core Model | AgentCapability、Task required_capability、状态机、幂等字段 | `aruntime/core/models.py` | 已实现 | Agent/Task 已建模为 runtime 一等公民 |
 | ACB | Agent lifecycle、timeline、/agents/{agent_name}/acb | `aruntime/core/acb.py`, `aruntime/core/lifecycle.py`, `aruntime/daemon/main.py` | 已实现 | FAILED/LOST 需经 RECOVERING 回 READY |
 | Scheduler | fifo/priority/deadline/fair_share/resource_aware/capability_aware/cost_aware/reliability_aware | `aruntime/scheduler/kernel.py` | 已实现 | 支持能力匹配、资源重检和资源阻塞 BLOCKED |
-| Dynamic Task | spawn children、DAG、依赖、trace/context 继承 | `aruntime/daemon/main.py`, `aruntime/scheduler/kernel.py` | 已实现 | `/tasks/{task_id}/spawn`, `/children`, `/dag`, `/dependencies` |
+| Dynamic Task | spawn children、DAG、依赖、trace/context 继承、真实 Demo | `aruntime/daemon/main.py`, `aruntime/scheduler/kernel.py`, `examples/production_incident_demo/scripts/run_demo.py` | 已实现 | `/tasks/{task_id}/spawn`, `/children`, `/dag`, `/dependencies`，Demo 至少 12 个子任务 |
 | Context | shared/private/readonly/version/diff/compression/prefix metrics | `aruntime/context/manager.py`, `aruntime/context/types.py` | 部分实现 | readonly 用版本追加；LLM 语义摘要为结构化实现 |
 | Resource | ResourceLease、LLM 并发、cgroup v2、pressure 读取 | `aruntime/resource/monitor.py`, `aruntime/resource/cgroup.py`, `aruntime/resource/types.py` | 已实现 | 真实 cgroup 依赖宿主权限 |
-| Timeout/Kill | timeout_ms、attempt_id、task.timeout trace、cancel、lease 回收、cgroup kill | `aruntime/daemon/main.py`, `aruntime/resource/cgroup.py`, `aruntime/core/models.py` | 已实现 | 超时后进入 TIMEOUT，迟到结果按 active attempt 隔离 |
-| Communication | UDS、mailbox、ack、去重、重放、dead-letter、agent_message/cancel/context_update | `aruntime/comm/message.py`, `aruntime/comm/router.py`, `aruntime/comm/transport.py`, `aruntime/worker/agent_worker.py` | 已实现 | worker 端处理完成后再 ACK |
+| Timeout/Kill | timeout_ms、attempt_id、task.timeout trace、cancel、lease 回收、cgroup kill、fallback | `aruntime/daemon/main.py`, `aruntime/resource/cgroup.py`, `aruntime/core/models.py`, `aruntime/worker/agent_worker.py` | 已实现基础闭环 | 超时后进入 TIMEOUT，迟到结果按 active attempt 隔离；通用抢占未实现 |
+| Communication | UDS、mailbox、ack、去重、重放、dead-letter、agent_message/cancel/context_update、Worker ACK | `aruntime/comm/message.py`, `aruntime/comm/router.py`, `aruntime/comm/transport.py`, `aruntime/worker/agent_worker.py` | 已实现 | worker 端处理完成后再 ACK，Demo 验证消息只处理一次 |
 | Tool Execution | repo_scan、read/write_file、search_code、git_status/diff、run_pytest、run_command | `aruntime/tools/*`, `aruntime/executor/*`, `aruntime/worker/agent_worker.py` | 已实现 | 受控工作区、路径白名单、Shell allowlist、超时和输出限制 |
 | Persistence | SQLite/WAL、agents/tasks/attempts/leases/mailbox/trace 恢复 | `aruntime/daemon/store.py`, `aruntime/daemon/recovery_service.py` | 已实现 | 单元测试覆盖 READY/RUNNING 恢复 |
-| Heartbeat/Fault | worker heartbeat、restart_budget、fallback attempt | `aruntime/daemon/fault_service.py`, `aruntime/worker/agent_worker.py` | 已实现 | 记录 worker.lost、worker.isolated、task.fallback |
+| Heartbeat/Fault | worker heartbeat、restart_budget、fallback attempt、daemon recovery | `aruntime/daemon/fault_service.py`, `aruntime/worker/agent_worker.py`, `aruntime/daemon/recovery_service.py` | 已实现基础 E2E | 记录 worker.lost、worker.isolated、task.fallback，集成测试覆盖恢复 |
+| Complex Demo | 真实 agentd、Scheduler、Worker、Tool、pytest、Trace | `examples/production_incident_demo/*`, `testing/integration/test_demo.py` | 已实现 | `make test-demo`、`make test-demo-fault` 校验 `final.patch`、Trace、ACK、fallback、Lease |
+| Preemption | 通用任务抢占 | - | 未实现 | 非赛题必要功能 |
+| 多节点部署 | 跨节点 Runtime 部署 | - | 未实现 | 当前为单节点 Runtime |
 | Benchmark | Scheduler/Context/Fault/IPC/Scalability 输出 CSV/SVG | `testing/perf/*`, `scripts/benchmark_docker_openeuler.sh`, `BENCHMARK.md` | 已实现 | vLLM APC 真实实验需 `VLLM_BASE_URL` |
 | LangGraph 对比 | 系统层 Runtime vs 应用层图编排 | `docs/langgraph_compare.md`, `docs/architecture.md` | 已实现 | 文档定位，不引入依赖 |
 

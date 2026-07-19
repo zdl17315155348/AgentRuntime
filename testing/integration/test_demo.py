@@ -24,6 +24,7 @@ def test_production_incident_demo_normal_runs():
     dag = json.loads((out / "task_dag.json").read_text())
     trace = json.loads((out / "trace.json").read_text())
     report = json.loads((out / "final_report.md").read_text())
+    patch = (out / "final.patch").read_text(encoding="utf-8")
 
     assert metrics["agents"]["total"] >= 6
     assert metrics["resource"]["leases"] == []
@@ -36,7 +37,10 @@ def test_production_incident_demo_normal_runs():
     assert report["final_pytest_returncode"] == 0
     assert any(item["status"] in ("FAILED", "TIMEOUT") for item in attempts)
     assert any(item["status"] == "SUCCESS" for item in attempts)
-    assert (out / "final.patch").exists()
+    assert patch.strip()
+    assert "app/auth.py" in patch
+    assert "app/orders.py" in patch
+    assert "tests/test_security_regression.py" in patch
     assert (out / "pytest.xml").read_text().strip()
     assert "agent_message_ack" in _events(trace)
 
@@ -47,10 +51,12 @@ def test_production_incident_demo_fault_uses_runtime_fallback():
     attempts = json.loads((out / "attempts.json").read_text())
     trace = json.loads((out / "trace.json").read_text())
     report = json.loads((out / "final_report.md").read_text())
+    patch = (out / "final.patch").read_text(encoding="utf-8")
     t6_id = report["tasks"]["T6"]
     t6 = next(item for item in attempts if item["task_id"] == t6_id)
     event_names = _events(trace)
 
+    assert patch.strip()
     assert t6["status"] == "SUCCESS"
     assert t6["definition"]["agent_name"] == "coder_a"
     assert any(attempt["agent_name"] == "coder_a" and attempt["status"] in ("FAILED", "TIMEOUT") for attempt in t6["attempts"])

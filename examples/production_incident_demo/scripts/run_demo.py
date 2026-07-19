@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import shutil
+import subprocess
 import time
 from pathlib import Path
 
@@ -35,12 +36,35 @@ def write(path: Path, text: str) -> None:
     path.write_text(text, encoding="utf-8")
 
 
+def run_git(*args: str) -> None:
+    result = subprocess.run(
+        ["git", *args],
+        cwd=TARGET,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"git {' '.join(args)} failed:\n{result.stdout}\n{result.stderr}")
+
+
 def reset_repo() -> None:
     if TARGET.exists():
         shutil.rmtree(TARGET)
+
     shutil.copytree(TEMPLATE, TARGET)
+
+    run_git("init")
+    run_git("config", "user.name", "AgentRuntime Demo")
+    run_git("config", "user.email", "demo@agentruntime.local")
+    run_git("add", ".")
+    run_git("commit", "-m", "demo baseline")
+    (TARGET / "tests" / "test_security_regression.py").touch()
+    run_git("add", "-N", "tests/test_security_regression.py")
+
     if OUTPUT.exists():
         shutil.rmtree(OUTPUT)
+
     OUTPUT.mkdir(parents=True, exist_ok=True)
     print(f"demo target reset: {TARGET}")
 
@@ -267,7 +291,7 @@ def main() -> int:
         attempts = [client.get(f"/tasks/{info['task_id']}").json() for info in tasks.values()]
         patch = task_output(final_tasks["T12"])
         if not patch.strip():
-            print("demo git_diff output is empty; target repo has no git baseline")
+            raise RuntimeError("final patch is empty")
         report = {
             "mode": args.mode,
             "root_task_id": root_task_id,

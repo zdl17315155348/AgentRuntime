@@ -11,10 +11,7 @@ app = FastAPI(title="Order Incident Demo")
 def current_user(authorization: str | None):
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="missing token")
-    try:
-        user_id = decode_token(authorization.removeprefix("Bearer "))
-    except Exception:
-        raise HTTPException(status_code=401, detail="invalid token")
+    user_id = decode_token(authorization.removeprefix("Bearer "))
     for user in users.values():
         if user.id == user_id:
             return user

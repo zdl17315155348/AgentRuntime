@@ -5,9 +5,9 @@
 <line x1="80" y1="50" x2="80" y2="340" stroke="#333"/>
 <rect x="136.43" y="50.00" width="282.14" height="290.00" fill="#4f46e5"/>
 <text x="277.50" y="366" text-anchor="middle" font-size="11" font-family="Arial" fill="#111">FIFO</text>
-<text x="277.50" y="44.00" text-anchor="middle" font-size="11" font-family="Arial" fill="#111">76.00/s</text>
-<rect x="531.43" y="56.73" width="282.14" height="283.27" fill="#4f46e5"/>
+<text x="277.50" y="44.00" text-anchor="middle" font-size="11" font-family="Arial" fill="#111">75.64/s</text>
+<rect x="531.43" y="56.80" width="282.14" height="283.20" fill="#4f46e5"/>
 <text x="672.50" y="366" text-anchor="middle" font-size="11" font-family="Arial" fill="#111">resource-aware</text>
-<text x="672.50" y="50.73" text-anchor="middle" font-size="11" font-family="Arial" fill="#111">74.24/s</text>
+<text x="672.50" y="50.80" text-anchor="middle" font-size="11" font-family="Arial" fill="#111">73.86/s</text>
 <text x="16" y="62" font-size="12" font-family="Arial" fill="#444">unit: /s</text>
 </svg>

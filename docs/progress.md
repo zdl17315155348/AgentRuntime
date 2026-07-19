@@ -10,3 +10,10 @@
 - `aruntime/context/manager.py` 和 `aruntime/context/types.py` 增加 readonly 版本追加、private 隔离和 rollback diff 测试依据。
 - `aruntime/comm/message.py` 和 `aruntime/comm/router.py` 增加 message_id、ACK、去重、未 ACK 重放。
 - Demo TODO 暂未执行，按用户要求等待后续设计。
+
+## 2026-07-19
+
+- `Makefile` 的 `test-demo` / `test-demo-fault` 改为执行 `testing/integration/test_demo.py` 中的强断言，`final-check` 保持包含 Demo 门禁。
+- `examples/production_incident_demo/scripts/run_demo.py` 在重置模板后创建 Git baseline，`final.patch` 为空时直接失败。
+- `testing/integration/test_demo.py` 增加 `final.patch` 非空、认证修复、订单权限/幂等修复、新增回归测试文件断言。
+- 状态文档同步为比赛范围内核心机制完成；通用抢占、生产级多节点部署和 LLM 语义摘要不在当前实现范围内。

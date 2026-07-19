@@ -8,7 +8,7 @@ def wait_task_done(client, task_id: str, timeout_s: float = 15.0) -> dict:
     start = time.time()
     while time.time() - start < timeout_s:
         data = client.get(f"/tasks/{task_id}").json()
-        if data["status"] in ("SUCCESS", "FAILED", "TIMEOUT"):
+        if data["status"] in ("SUCCESS", "FAILED", "CANCELLED"):
             return data
         time.sleep(0.2)
     raise AssertionError(task_id)

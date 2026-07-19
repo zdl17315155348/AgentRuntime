@@ -32,10 +32,14 @@ test-integration:
 	python3 -m pytest testing/integration/test_worker_fallback.py -q
 
 test-demo:
-	bash examples/production_incident_demo/scripts/run_normal.sh
+	python3 -m pytest \
+		testing/integration/test_demo.py::test_production_incident_demo_normal_runs \
+		-q
 
 test-demo-fault:
-	bash examples/production_incident_demo/scripts/run_fault.sh
+	python3 -m pytest \
+		testing/integration/test_demo.py::test_production_incident_demo_fault_uses_runtime_fallback \
+		-q
 
 final-check:
 	$(MAKE) smoke
