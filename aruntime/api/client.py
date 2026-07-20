@@ -106,6 +106,11 @@ class AgentRuntimeClient:
         resp.raise_for_status()
         return resp.json()
 
+    def cancel_task(self, task_id: str) -> dict:
+        resp = self.client.post(f"{self.base_url}/tasks/{task_id}/cancel", json={})
+        resp.raise_for_status()
+        return resp.json()
+
     def get_task(self, task_id: str) -> dict:
         resp = self.client.get(f"{self.base_url}/tasks/{task_id}")
         resp.raise_for_status()

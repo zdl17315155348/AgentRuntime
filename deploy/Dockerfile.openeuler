@@ -1,0 +1,28 @@
+FROM openeuler/openeuler:24.03-lts
+
+RUN dnf install -y python3 python3-pip procps-ng psmisc git curl && \
+    dnf clean all
+
+WORKDIR /app
+
+COPY requirements.txt pyproject.toml ./
+RUN pip3 install --no-cache-dir -r requirements.txt
+
+COPY . .
+
+RUN if [ -f third_party/codex/codex ]; then \
+      cp third_party/codex/codex /usr/local/bin/codex && chmod 0755 /usr/local/bin/codex; \
+    fi && \
+    python3 --version && git --version && \
+    if command -v codex >/dev/null 2>&1; then codex --version; else echo "codex missing"; fi && \
+    mkdir -p /runtime/workspaces /runtime/artifacts /runtime/state /runtime/logs
+
+ENV AGENTD_WORKSPACE_ROOT=/runtime/workspaces
+ENV AGENTD_ARTIFACT_ROOT=/runtime/artifacts
+ENV AGENTD_STATE_DB=/runtime/state/state.db
+ENV AGENTD_LOG_DIR=/runtime/logs
+ENV RUNTIME_CONFIG=/app/configs/runtime.json
+
+EXPOSE 8234
+
+ENTRYPOINT ["bash", "deploy/entrypoint.sh"]

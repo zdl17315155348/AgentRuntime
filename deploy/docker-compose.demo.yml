@@ -1,0 +1,24 @@
+services:
+  agent-runtime:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.openeuler
+    ports:
+      - "8234:8234"
+    environment:
+      RUNTIME_CONFIG: /app/configs/runtime.json
+      AGENTD_STATE_DB: /runtime/state/state.db
+      AGENTD_WORKSPACE_ROOT: /runtime/workspaces
+      AGENTD_ARTIFACT_ROOT: /runtime/artifacts
+      AGENTD_ENABLE_FAULT_INJECTION: ${AGENTD_ENABLE_FAULT_INJECTION:-true}
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      CODEX_API_KEY: ${CODEX_API_KEY:-}
+    volumes:
+      - ../configs/runtime.json:/app/configs/runtime.json:ro
+      - ${CODEX_HOME:-${HOME}/.codex}/config.toml:/root/.codex/config.toml:ro
+      - agent-runtime-state:/runtime
+
+volumes:
+  agent-runtime-state:

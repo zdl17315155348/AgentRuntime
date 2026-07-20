@@ -12,6 +12,7 @@ from applications.incident_repair.direct.tool import run_pytest_direct
 from applications.incident_repair.direct.workspace import DirectWorkspaceManager
 from applications.incident_repair.execution.base import AgentExecutionRequest, AgentExecutionResult, ExecutionProvider
 from applications.incident_repair.execution.instrumentation import ExecutionTimer
+from applications.incident_repair.schemas import ReviewSummaryModel
 
 
 class DirectExecutionProvider(ExecutionProvider):
@@ -37,12 +38,32 @@ class DirectExecutionProvider(ExecutionProvider):
             if request.run_id in self._cancelled:
                 return AgentExecutionResult(status="CANCELLED", metrics=timer.finish(queue_wait_ms=queue_wait_ms))
             if request.backend == "deepseek":
-                inspection = {"files": [], "searches": [], "summary": "direct inspection placeholder"}
-                result = await self.deepseek.execute_plan(request.system_prompt, request.goal, inspection)
+                available_roles = request.task_input.get("available_roles")
+                if not isinstance(available_roles, list) or not available_roles:
+                    available_roles = ["coder", "tester", "reviewer"]
+                result = await self.deepseek.execute_plan(request.system_prompt, request.goal, request.source_repo, [str(role) for role in available_roles])
                 return AgentExecutionResult(status="SUCCESS", structured_result=result, output=str(result), metrics=timer.finish(queue_wait_ms=queue_wait_ms))
             if request.backend == "direct_tool":
+                workspace = None
                 workspace_path = request.workspace_path or request.source_repo
-                summary = await run_pytest_direct(workspace_path, request.timeout_s)
+                try:
+                    if request.role == "tester" and isinstance(request.task_input, dict) and request.task_input.get("integrated_commit"):
+                        workspace = self.workspace_manager.create_attempt_workspace(
+                            request.source_repo,
+                            request.graph_node,
+                            request.idempotency_key[:16],
+                            str(request.task_input["integrated_commit"]),
+                            read_only=True,
+                            root_task_id=request.run_id,
+                        )
+                        workspace_path = workspace.workspace_path or workspace_path
+                    summary = await run_pytest_direct(workspace_path, request.timeout_s)
+                except Exception as exc:
+                    if workspace is not None:
+                        self.workspace_manager.cleanup_workspace(workspace, force=True)
+                    return AgentExecutionResult(status="FAILED", error_message=str(exc), workspace_path=workspace_path, metrics=timer.finish(queue_wait_ms=queue_wait_ms))
+                if workspace is not None:
+                    self.workspace_manager.cleanup_workspace(workspace, force=True)
                 return AgentExecutionResult(status="SUCCESS", structured_result=summary, workspace_path=workspace_path, metrics=timer.finish(queue_wait_ms=queue_wait_ms, tool_calls=1))
             if request.backend == "codex_cli":
                 workspace = self.workspace_manager.create_attempt_workspace(
@@ -53,15 +74,38 @@ class DirectExecutionProvider(ExecutionProvider):
                     read_only=request.role == "reviewer",
                     root_task_id=request.run_id,
                 )
-                rc, stdout, stderr, _pid = await self.codex.execute(request.goal, workspace.workspace_path or request.source_repo, request.role, request.timeout_s)
+                final_json = str(Path(workspace.workspace_path or request.source_repo) / ".codex-final.json")
+                schema = "configs/schemas/codex_reviewer_result.schema.json" if request.role == "reviewer" else "configs/schemas/codex_coder_result.schema.json"
+                rc, stdout, stderr, _pid = await self.codex.execute(
+                    request.goal,
+                    workspace.workspace_path or request.source_repo,
+                    request.role,
+                    request.timeout_s,
+                    system_prompt=request.system_prompt,
+                    task_input=request.task_input,
+                    runtime_context={"context_refs": request.context_refs, "artifact_refs": request.artifact_refs, "base_commit": request.base_commit},
+                    output_schema=schema,
+                    output_last_message=final_json,
+                )
+                if stdout:
+                    Path(workspace.workspace_path or request.source_repo, ".codex-events.jsonl").write_text(stdout, encoding="utf-8")
+                final_output = Path(final_json).read_text(encoding="utf-8", errors="replace") if Path(final_json).exists() else last_agent_message(stdout)
                 if request.role == "reviewer":
-                    approved = rc == 0
+                    try:
+                        review = ReviewSummaryModel.model_validate_json(final_output)
+                        structured = review.model_dump()
+                        status = "SUCCESS"
+                        error = None
+                    except Exception as exc:
+                        structured = {"approved": False, "requirements_covered": [], "issues": [str(exc)], "summary": "invalid reviewer output", "artifact_id": None}
+                        status = "FAILED"
+                        error = str(exc)
                     return AgentExecutionResult(
-                        status="SUCCESS" if rc == 0 else "FAILED",
-                        output=last_agent_message(stdout),
-                        error_message=stderr or None,
+                        status=status,
+                        output=final_output,
+                        error_message=error or stderr or None,
                         workspace_path=workspace.workspace_path,
-                        structured_result={"approved": approved, "requirements_covered": [], "issues": [] if approved else [stderr or "review failed"], "artifact_id": None},
+                        structured_result=structured,
                         metrics=timer.finish(queue_wait_ms=queue_wait_ms),
                     )
                 patch = self.workspace_manager.create_patch_artifact(workspace, request.graph_node, request.idempotency_key[:16], root_task_id=request.run_id)
@@ -76,7 +120,7 @@ class DirectExecutionProvider(ExecutionProvider):
                     }
                 return AgentExecutionResult(
                     status="SUCCESS" if rc == 0 else ("TIMEOUT" if rc is None else "FAILED"),
-                    output=last_agent_message(stdout),
+                    output=final_output,
                     error_message=stderr or None,
                     workspace_path=workspace.workspace_path,
                     patch_ref=patch_ref,

@@ -19,6 +19,8 @@ class BenchmarkConfig(BaseModel):
     base_commit: str
     prompt_hash: str
     graph_version: str
+    data_kind: str = "real_agent"
+    performance_claim_allowed: bool = True
 
 
 class RunMetric(BaseModel):
@@ -33,6 +35,35 @@ class RunMetric(BaseModel):
     backend_ms: float = 0
     peak_rss_mb: float = 0
     error: str = ""
+
+
+class WorkflowMetric(BaseModel):
+    trial_id: str
+    workflow_index: int
+    benchmark_id: str
+    run_id: str
+    mode: str
+    concurrency: int
+    measured: bool
+    latency_ms: float
+    success: bool
+    queue_wait_ms: float = 0
+    backend_ms: float = 0
+    peak_rss_mb: float = 0
+    error: str = ""
+
+
+class TrialMetric(BaseModel):
+    trial_id: str
+    benchmark_id: str
+    mode: str
+    concurrency: int
+    measured: bool
+    batch_makespan_ms: float
+    throughput_per_min: float
+    success_count: int
+    failure_count: int
+    peak_rss_mb: float = 0
 
 
 class PairedRun(BaseModel):

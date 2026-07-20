@@ -51,3 +51,12 @@
 
 ## 备注
 - 真实 vLLM KV Cache 和真实 cgroup 不作为当前提交阻塞项。
+# Benchmark Classification
+
+本仓库 benchmark 分三类：
+
+- Synthetic Smoke：使用 `--smoke`，输出 `data_kind=synthetic_smoke` 和 `performance_claim_allowed=false`，只验证框架。
+- Deterministic Microbenchmark：`testing/perf/suite.py` 中的本地确定性调度、上下文、容错、cgroup 指标。
+- Real Agent Macrobenchmark：`testing/perf/comparison/runner.py` 中 DirectExecutionProvider 与 AgentRuntimeExecutionProvider 的真实对比。
+
+真实性能结论只能来自 `performance_claim_allowed=true` 的报告。

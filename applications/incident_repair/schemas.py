@@ -26,8 +26,16 @@ class TestSummaryModel(BaseModel):
     report_artifact_id: str | None = None
 
 
+class CoderResultModel(BaseModel):
+    completed: bool
+    summary: str
+    tests_run: list[str] = Field(default_factory=list)
+    remaining_issues: list[str] = Field(default_factory=list)
+
+
 class ReviewSummaryModel(BaseModel):
     approved: bool = False
     requirements_covered: list[str] = Field(default_factory=list)
     issues: list[str] = Field(default_factory=list)
+    summary: str = ""
     artifact_id: str | None = None

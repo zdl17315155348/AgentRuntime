@@ -1,4 +1,4 @@
-.PHONY: install run-agentd run-demo smoke test test-integration test-demo test-demo-fault benchmark final-check clean
+.PHONY: install run-agentd run-demo smoke test test-integration test-demo test-demo-fault test-app test-app-integration e2e-direct-real e2e-runtime-real benchmark benchmark-smoke benchmark-real-small final-acceptance final-check clean
 
 install:
 	pip install -e .
@@ -41,16 +41,49 @@ test-demo-fault:
 		testing/integration/test_demo.py::test_production_incident_demo_fault_uses_runtime_fallback \
 		-q
 
+test-app:
+	python3 -m pytest testing/unittest/applications -q
+
+test-app-integration:
+	python3 -m pytest testing/integration/test_demo.py testing/integration/test_worker_fallback.py -q
+
+e2e-direct-real:
+	python3 scripts/run_real_direct.py --require-real
+
+e2e-runtime-real:
+	python3 scripts/run_real_runtime.py --require-real
+
 final-check:
 	$(MAKE) smoke
 	$(MAKE) test
 	$(MAKE) test-integration
 	$(MAKE) test-demo
 	$(MAKE) test-demo-fault
+	$(MAKE) test-app
 	$(MAKE) benchmark
 
 benchmark:
 	python3 -m pytest testing/perf/test_benchmark.py -q
+
+benchmark-smoke:
+	python3 -m testing.perf.comparison.runner \
+		--task-case incident_repair_v1 \
+		--modes direct,runtime \
+		--concurrency 1,2,4 \
+		--warmup 1 \
+		--runs 3 \
+		--smoke
+
+benchmark-real-small:
+	python3 -m testing.perf.comparison.runner \
+		--task-case incident_repair_v1 \
+		--modes direct,runtime \
+		--concurrency 1,2 \
+		--warmup 1 \
+		--runs 3
+
+final-acceptance:
+	python3 scripts/final_acceptance.py
 
 clean:
 	find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true

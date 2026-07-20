@@ -64,6 +64,18 @@ class RunStore:
             },
         )
 
+    def load_events(self, run_id: str) -> list[dict[str, Any]]:
+        path = self.run_dir(run_id) / "unified_events.jsonl"
+        if not path.exists():
+            return []
+        events: list[dict[str, Any]] = []
+        for line in path.read_text(encoding="utf-8").splitlines():
+            try:
+                events.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+        return events
+
     def list_runs(self) -> list[dict[str, Any]]:
         runs = []
         for path in sorted(self.root.iterdir()) if self.root.exists() else []:

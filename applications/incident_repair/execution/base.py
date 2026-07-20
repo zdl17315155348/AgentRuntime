@@ -5,13 +5,14 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
+
 class AgentExecutionRequest(BaseModel):
     run_id: str
     thread_id: str
     graph_node: str
     graph_step: int
-    role: Literal["planner", "coder", "tester", "repair", "reviewer", "integrator"]
-    backend: Literal["deepseek", "codex_cli", "direct_tool", "runtime_internal"]
+    role: Literal["planner", "coder", "tester", "repair", "reviewer"]
+    backend: Literal["deepseek", "codex_cli", "direct_tool"]
     goal: str
     system_prompt: str = ""
     task_input: dict[str, Any] = Field(default_factory=dict)

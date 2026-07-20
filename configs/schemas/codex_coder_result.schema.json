@@ -2,10 +2,11 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "type": "object",
   "additionalProperties": true,
+  "required": ["completed", "summary", "tests_run"],
   "properties": {
+    "completed": {"type": "boolean"},
     "summary": {"type": "string"},
-    "tests": {"type": "array", "items": {"type": "string"}},
-    "risk": {"type": "string"}
-  },
-  "required": ["summary"]
+    "tests_run": {"type": "array", "items": {"type": "string"}},
+    "remaining_issues": {"type": "array", "items": {"type": "string"}}
+  }
 }

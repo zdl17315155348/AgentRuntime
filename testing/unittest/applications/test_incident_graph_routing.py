@@ -22,6 +22,6 @@ def test_tester_route_success_failure_and_repair_limit():
 
 
 def test_review_route_respects_repair_limit():
-    assert route_after_review({"review_summary": {"approved": True}, "repair_round": 0}) == "end"
+    assert route_after_review({"review_summary": {"approved": True}, "repair_round": 0}) == "success"
     assert route_after_review({"review_summary": {"approved": False}, "repair_round": 0}) == "repair"
-    assert route_after_review({"review_summary": {"approved": False}, "repair_round": 2}) == "end"
+    assert route_after_review({"review_summary": {"approved": False}, "repair_round": 2}) == "failed"

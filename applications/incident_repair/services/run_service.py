@@ -10,7 +10,9 @@ from aruntime.api.client import AgentRuntimeClient
 from applications.incident_repair.config import GraphRuntimeContext, IncidentRunConfig
 from applications.incident_repair.execution.factory import create_execution_provider
 from applications.incident_repair.runner import IncidentGraphRunner
+from applications.incident_repair.services.summary_aggregator import RunSummaryAggregator
 from applications.incident_repair.services.event_bus import RunEventBus
+from applications.incident_repair.services.patch_integration import PatchIntegrationService
 from applications.incident_repair.services.run_store import RunStore
 
 
@@ -23,7 +25,7 @@ class IncidentRunService:
         run_dir = self.store.run_dir(config.run_id)
         bus = RunEventBus(config.run_id, config.thread_id, config.execution_mode.value, run_dir / "unified_events.jsonl")
         provider = create_execution_provider(config, dependencies or {})
-        context = GraphRuntimeContext(provider=provider, run_config=config, event_bus=bus)
+        context = GraphRuntimeContext(provider=provider, run_config=config, event_bus=bus, integration_service=(dependencies or {}).get("integration_service") or PatchIntegrationService())
         started = time.time()
         bus.emit("langgraph", "graph.run.started")
         state = {
@@ -35,13 +37,17 @@ class IncidentRunService:
             "plan": None,
             "planned_tasks": [],
             "patch_refs": [],
+            "all_patch_refs": [],
+            "pending_patch_refs": [],
             "integrated_commit": None,
+            "integration_result": None,
             "test_summary": None,
             "review_summary": None,
             "repair_round": 0,
             "workflow_status": "PENDING",
             "error": None,
             "runtime_task_ids": [],
+            "execution_records": [],
             "event_count": 0,
             "active_coder_task": None,
         }
@@ -82,29 +88,20 @@ class IncidentRunService:
             context.event_bus.emit("langgraph", "graph.run.failed", attributes={"error": error})
         finished = time.time()
         context.event_bus.emit("langgraph", "graph.run.completed", attributes={"status": status})
-        summary = bundle["summary"]
+        events = self.store.load_events(config.run_id) if hasattr(self.store, "load_events") else []
+        provider = context.provider
+        summary = RunSummaryAggregator().build(
+            config,
+            final_state,
+            events,
+            final_state.get("execution_records", []),
+            provider_snapshot=await _maybe_snapshot(provider) if hasattr(provider, "get_execution_snapshot") else {},
+        )
         summary.update(
             {
                 "status": status,
                 "finished_at": finished,
                 "duration_ms": round((finished - started) * 1000, 3),
-                "graph": {
-                    "nodes_started": 0,
-                    "nodes_completed": 0,
-                    "repair_rounds": int(final_state.get("repair_round", 0)),
-                },
-                "execution": {
-                    "tasks": len(final_state.get("runtime_task_ids", [])),
-                    "attempts": 0,
-                    "queue_wait_ms": 0,
-                    "backend_ms": 0,
-                    "setup_ms": 0,
-                },
-                "result": {
-                    "patch_non_empty": bool(final_state.get("patch_refs")),
-                    "pytest_returncode": (final_state.get("test_summary") or {}).get("returncode"),
-                    "review_approved": bool((final_state.get("review_summary") or {}).get("approved")),
-                },
             }
         )
         if error:
@@ -112,6 +109,13 @@ class IncidentRunService:
         self.store.write_json(config.run_id, "graph_state.json", final_state)
         self.store.write_json(config.run_id, "summary.json", summary)
         return {"run_id": config.run_id, "thread_id": config.thread_id, "state": final_state, "summary": summary}
+
+
+async def _maybe_snapshot(provider) -> dict:
+    snapshot = provider.get_execution_snapshot("")
+    if hasattr(snapshot, "__await__"):
+        snapshot = await snapshot
+    return snapshot or {}
 
 
 def new_run_config(**kwargs) -> IncidentRunConfig:

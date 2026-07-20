@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agent-runtime-os"
-version = "0.1.40"
+version = "0.1.49"
 description = "面向多智能体的操作系统级执行时（Agent Runtime），支持 AgentCapability、异构 Backend、LangGraph 双执行模式、Planner 动态 DAG、Attempt 级 worktree/artifact、Run Dashboard、统一资源管理、可靠通信、受控工具执行、fallback、Demo pytest 门禁与 benchmark"
 requires-python = ">=3.10"
 dependencies = [
@@ -25,7 +25,10 @@ agentd = "aruntime.daemon.main:main"
 agentctl = "aruntime.cli.main:app"
 
 [tool.setuptools.packages.find]
-include = ["aruntime*"]
+include = ["aruntime*", "applications*"]
+
+[project.optional-dependencies]
+test = ["pytest>=8.0", "pytest-asyncio>=0.23"]
 
 [tool.pytest.ini_options]
 addopts = "--import-mode=importlib"

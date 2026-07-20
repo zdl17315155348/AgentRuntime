@@ -41,7 +41,7 @@ class LLMGateway:
 
     def __init__(self, backend: str = "mock", api_key: Optional[str] = None):
         self.backend = backend
-        self.api_key = api_key or os.getenv("LLM_API_KEY", "")
+        self.api_key = api_key or os.getenv("LLM_API_KEY", "") or os.getenv("DEEPSEEK_API_KEY", "")
         self.vllm_base_url = os.getenv("VLLM_BASE_URL", "http://127.0.0.1:8000/v1")
         self.vllm_model = os.getenv("VLLM_MODEL", "default")
 

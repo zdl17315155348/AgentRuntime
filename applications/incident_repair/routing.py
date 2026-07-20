@@ -27,8 +27,7 @@ def route_after_test(state: dict[str, Any], max_repair_rounds: int = 2) -> str:
 def route_after_review(state: dict[str, Any], max_repair_rounds: int = 2) -> str:
     review = state.get("review_summary") or {}
     if review.get("approved"):
-        return "end"
+        return "success"
     if int(state.get("repair_round", 0)) >= max_repair_rounds:
-        return "end"
+        return "failed"
     return "repair"
-

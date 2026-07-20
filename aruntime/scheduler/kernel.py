@@ -417,6 +417,9 @@ class KernelScheduler(BaseScheduler):
         language = req.get("language")
         if language and language not in cap.languages:
             return False
+        languages = req.get("languages")
+        if languages and not any(language in cap.languages for language in languages):
+            return False
         tool = req.get("tool")
         if tool and tool not in cap.tools:
             return False

@@ -66,7 +66,12 @@ class AgentRuntimeExecutionProvider(ExecutionProvider):
         return self._convert_result(request, result, timer)
 
     async def cancel_run(self, run_id: str) -> None:
-        return None
+        task_ids = self.dependencies.get("run_task_ids", {}).get(run_id, set())
+        for task_id in list(task_ids):
+            try:
+                self.client.cancel_task(task_id)
+            except Exception:
+                continue
 
     async def inject_fault(self, run_id: str, target: dict[str, Any]) -> dict[str, Any]:
         agent_name = str(target.get("agent_name") or target.get("role") or "")
@@ -82,12 +87,13 @@ class AgentRuntimeExecutionProvider(ExecutionProvider):
         result = task.get("result") or {}
         attempts = task.get("attempts") or []
         status = str(task.get("status") or "FAILED")
-        if request.backend == "direct_tool":
-            structured = result.get("output") if isinstance(result, dict) and isinstance(result.get("output"), dict) else result if isinstance(result, dict) else {}
-            status = "SUCCESS"
-        elif status not in ("SUCCESS", "FAILED", "TIMEOUT", "CANCELLED"):
+        if status not in ("SUCCESS", "FAILED", "TIMEOUT", "CANCELLED"):
             status = "FAILED"
             raise RuntimeSystemError(f"unexpected runtime task status: {task.get('status')}")
+        if request.backend == "direct_tool":
+            structured = result.get("output") if isinstance(result, dict) and isinstance(result.get("output"), dict) else result if isinstance(result, dict) else {}
+        else:
+            structured = self._structured_result_for_backend(request, result)
         patch_ref = None
         artifact_refs: list[str] = []
         artifacts = result.get("artifacts") if isinstance(result, dict) else None
@@ -104,7 +110,6 @@ class AgentRuntimeExecutionProvider(ExecutionProvider):
                         "sha256": str(artifact.get("sha256") or ""),
                         "changed_files": list((artifact.get("metadata") or {}).get("changed_files", [])),
                     }
-        structured_result = structured if request.backend == "direct_tool" else self._structured_result_for_backend(request, result)
         metrics = timer.finish(
             queue_wait_ms=float(scheduler.get("queue_wait_ms") or 0),
             total_tokens=float((task.get("llm_usage") or {}).get("total_tokens") or 0),
@@ -117,7 +122,7 @@ class AgentRuntimeExecutionProvider(ExecutionProvider):
             attempt_ids=[str(attempt.get("attempt_id")) for attempt in attempts if isinstance(attempt, dict)],
             artifact_refs=[ref for ref in artifact_refs if ref],
             patch_ref=patch_ref,
-            structured_result=structured_result,
+            structured_result=structured,
             metrics=metrics,
         )
 
@@ -141,7 +146,7 @@ class AgentRuntimeExecutionProvider(ExecutionProvider):
         if role == "planner":
             return {"can_plan": True}
         if role in ("coder", "repair"):
-            return {"can_code": True, "language": "python"}
+            return {"can_code": True, "languages": ["python"]}
         if role == "tester":
             return {"can_test": True}
         return {}

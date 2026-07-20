@@ -10,7 +10,7 @@ from uuid import uuid4
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
 
@@ -660,6 +660,9 @@ def _select_agent_name(agent_name: str | None, required_capability: dict | None)
         if req.get("can_review") and not cap.can_review:
             continue
         if req.get("language") and req["language"] not in cap.languages:
+            continue
+        requested_languages = req.get("languages")
+        if requested_languages and not any(language in cap.languages for language in requested_languages):
             continue
         if req.get("tool") and req["tool"] not in cap.tools:
             continue
@@ -1336,6 +1339,24 @@ async def get_demo_events(run_id: str, after_id: int = 0):
         if int(event.get("event_id", 0)) > after_id:
             events.append(event)
     return {"events": events}
+
+
+@app.get("/demo/runs/{run_id}/stream")
+async def stream_demo_events(run_id: str, after_id: int = 0):
+    async def event_stream():
+        last_id = after_id
+        while True:
+            payload = await get_demo_events(run_id, last_id)
+            events = payload.get("events", [])
+            for event in events:
+                last_id = max(last_id, int(event.get("event_id", 0)))
+                yield f"id: {last_id}\nevent: run_event\ndata: {json.dumps(event, ensure_ascii=False)}\n\n"
+            task = demo_run_tasks.get(run_id)
+            if task is not None and task.done() and not events:
+                break
+            await asyncio.sleep(1)
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
 
 
 @app.get("/demo/runs/{run_id}/graph")

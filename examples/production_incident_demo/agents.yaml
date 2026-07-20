@@ -2,7 +2,7 @@ agents:
   - name: architect
     role: Architect
     system_prompt: |
-      你负责检查仓库并生成结构化任务计划。
+      检查代码仓库并输出符合PlanSpec的结构化计划。
       不得修改代码。
     backend:
       type: native_planner
@@ -12,13 +12,12 @@ agents:
       max_inspection_files: 6
     capability:
       can_plan: true
-      tools: [repo_scan, search_code, read_file]
+      tools: [repo_scan, read_file, search_code]
 
   - name: coder_a
     role: Coder A
     system_prompt: |
-      在当前Git工作区完成指定代码修复。
-      必须运行相关测试。
+      在当前工作区完成指定代码修复，并运行相关测试。
     backend:
       type: codex_cli
       sandbox: workspace-write
@@ -36,7 +35,7 @@ agents:
   - name: coder_b
     role: Coder B
     system_prompt: |
-      作为备用Coder，根据原任务和恢复上下文完成修复。
+      根据任务目标和Runtime恢复上下文完成修复。
     backend:
       type: codex_cli
       sandbox: workspace-write
@@ -52,7 +51,7 @@ agents:
     backend:
       type: direct_tool
       sandbox: read-only
-      timeout_s: 120
+      timeout_s: 180
     capability:
       can_test: true
       tools: [run_pytest]
@@ -73,7 +72,7 @@ agents:
   - name: reviewer
     role: Reviewer
     system_prompt: |
-      只读审查Patch、测试结果和需求覆盖情况。
+      只读审查最终Diff、测试结果和需求覆盖情况。
       不得修改文件。
     backend:
       type: codex_cli

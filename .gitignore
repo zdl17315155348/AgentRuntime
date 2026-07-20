@@ -147,6 +147,12 @@ cython_debug/
 .codex-local/
 third_party/codex/
 run-data/
+benchmark/results/
+examples/production_incident_demo/output/
+*.db-wal
+*.db-shm
+*.sqlite-wal
+*.sqlite-shm
 *.swp
 *.swo
 *~

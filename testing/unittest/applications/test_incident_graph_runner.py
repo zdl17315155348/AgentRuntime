@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pytest
+from pathlib import Path
 
 from applications.incident_repair.config import ExecutionMode, IncidentRunConfig
 from applications.incident_repair.execution.base import AgentExecutionRequest, AgentExecutionResult, ExecutionMetrics, ExecutionProvider
@@ -60,6 +61,22 @@ class FakeGraphProvider(ExecutionProvider):
         return {}
 
 
+class _Integration:
+    def integrate(self, source_repo, base_commit, patch_refs, run_id, repair_round):
+        class _Result:
+            status = "SUCCESS"
+            workspace_path = source_repo
+            integrated_commit = base_commit
+            applied_artifact_ids = [str(ref.get("artifact_id") or "") for ref in patch_refs]
+            changed_files = ["app.py"]
+            conflict_files = []
+            error = None
+
+        result = _Result()
+        result.base_commit = base_commit
+        return result
+
+
 @pytest.mark.anyio
 async def test_langgraph_runner_joins_parallel_coders_once(tmp_path):
     pytest.importorskip("langgraph")
@@ -67,9 +84,9 @@ async def test_langgraph_runner_joins_parallel_coders_once(tmp_path):
     provider = FakeGraphProvider()
     service = IncidentRunService(store=RunStore(tmp_path / "live"))
     service.runner.checkpoint_path = tmp_path / "checkpoints.sqlite"
-    config = IncidentRunConfig(execution_mode=ExecutionMode.DIRECT, run_id="run_graph", thread_id="thread_graph", source_repo="/data1/projects/agent-runtime-os", base_commit="HEAD")
+    config = IncidentRunConfig(execution_mode=ExecutionMode.DIRECT, run_id="run_graph", thread_id="thread_graph", source_repo=str(Path.cwd()), base_commit="HEAD")
 
-    result = await service.execute_run(config, "fix", {"provider": provider})
+    result = await service.execute_run(config, "fix", {"provider": provider, "integration_service": _Integration()})
 
     roles = [call.role for call in provider.calls]
     assert roles.count("planner") == 1

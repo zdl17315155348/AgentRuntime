@@ -4,7 +4,7 @@ import asyncio
 
 import pytest
 
-from aruntime.daemon.main import CreateDemoRunRequest, create_demo_run, get_demo_events, get_demo_replay, get_demo_run
+from aruntime.daemon.main import CreateDemoRunRequest, create_demo_run, get_demo_events, get_demo_replay, get_demo_run, stream_demo_events
 
 
 @pytest.mark.anyio
@@ -28,3 +28,5 @@ async def test_demo_run_api_creates_bundle(tmp_path, monkeypatch):
     assert events[0]["name"] == "graph.run.started"
     replay = await get_demo_replay(run_id)
     assert replay["source"] == "recorded"
+    stream = await stream_demo_events(run_id)
+    assert stream.media_type == "text/event-stream"

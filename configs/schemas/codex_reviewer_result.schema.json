@@ -2,10 +2,11 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "type": "object",
   "additionalProperties": true,
+  "required": ["approved", "requirements_covered", "issues", "summary"],
   "properties": {
     "approved": {"type": "boolean"},
-    "findings": {"type": "array", "items": {"type": "string"}},
+    "requirements_covered": {"type": "array", "items": {"type": "string"}},
+    "issues": {"type": "array", "items": {"type": "string"}},
     "summary": {"type": "string"}
-  },
-  "required": ["approved", "summary"]
+  }
 }

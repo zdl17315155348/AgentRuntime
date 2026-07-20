@@ -39,6 +39,7 @@ class GraphRuntimeContext:
     provider: object
     run_config: IncidentRunConfig
     event_bus: object
+    integration_service: object | None = None
 
 
 def default_checkpoint_path() -> Path:

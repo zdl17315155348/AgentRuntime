@@ -14,6 +14,9 @@
 | Heartbeat/Fault | worker crash、fallback attempt、daemon recovery | `aruntime/daemon/fault_service.py`, `aruntime/worker/agent_worker.py`, `aruntime/daemon/main.py`, `aruntime/daemon/recovery_service.py` | 已实现基础 E2E | `testing/integration/test_worker_fallback.py`, `testing/integration/test_daemon_restart.py`, `testing/integration/test_demo.py` | Trace 记录 `worker.lost` 与 `task.fallback` |
 | Complex Demo | 真实 agentd、Scheduler、Worker、Tool、pytest、Trace | `examples/production_incident_demo/*`, `testing/integration/test_demo.py` | 已实现 | `make test-demo`, `make test-demo-fault` | `final.patch` 来自真实 `git_diff` tool result |
 | Benchmark | raw.csv、summary.csv、svg、vLLM APC mock/real | `testing/perf/*`, `scripts/benchmark_docker_openeuler.sh`, `BENCHMARK.md` | 已实现 | `testing/perf/test_benchmark.py` | 真实 APC 需要 `VLLM_BASE_URL` |
+| LangGraph Incident Repair | Direct/Runtime 双模式、共享 Planner、Patch Integration、Reviewer/Repair 闭环 | `applications/incident_repair/*`, `scripts/run_real_direct.py`, `scripts/run_real_runtime.py` | 已实现入口 | `testing/unittest/applications/*`, `scripts/final_acceptance.py` | 真实 E2E 需 DeepSeek/Codex key |
+| Dashboard | demo/compare/benchmarks 数据化页面、SSE、Replay manifest | `aruntime/dashboard/*`, `aruntime/daemon/main.py` | 已实现 | `testing/unittest/applications/test_demo_api.py` | 前端从 run bundle/report 读取真实数据 |
+| openEuler packaging | Dockerfile、compose、entrypoint、preflight、acceptance | `deploy/*`, `scripts/preflight_openeuler.py`, `scripts/final_acceptance.py` | 已实现 | `bash scripts/test_docker_openeuler.sh` | API Key 只从环境变量读取 |
 | LangGraph 对比 | Runtime vs workflow 定位 | `docs/langgraph_compare.md`, `docs/architecture.md` | 已实现 | 文档依据 | LangGraph 可作为执行后端，不替代 Runtime |
 | Preemption | 通用任务抢占 | - | 未实现 | - | 非赛题必要功能 |
 | 多节点部署 | 跨节点 Runtime 部署 | - | 未实现 | - | 当前为单节点 Runtime |
