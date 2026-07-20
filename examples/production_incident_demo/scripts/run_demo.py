@@ -22,7 +22,7 @@ AGENTS = {
     "architect": {"role": "architect", "capability": {"can_plan": True, "tools": ["repo_scan"]}},
     "coder_a": {"role": "coder", "capability": {"can_code": True, "tools": ["read_file", "write_file", "git_diff"]}},
     "coder_b": {"role": "coder", "capability": {"can_code": True, "tools": ["read_file", "write_file", "git_diff"]}},
-    "tester": {"role": "tester", "capability": {"can_test": True, "tools": ["run_pytest"]}},
+    "tester": {"role": "tester", "capability": {"can_test": True, "tools": ["run_pytest", "write_file"]}},
     "repair": {"role": "repair", "capability": {"can_code": True, "can_test": True, "tools": ["read_file", "write_file", "run_pytest"]}},
     "reviewer": {"role": "reviewer", "capability": {"can_review": True, "tools": ["git_diff", "run_pytest"]}},
 }

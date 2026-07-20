@@ -119,11 +119,34 @@ curl -s http://127.0.0.1:8234/tasks/<task_id>
 成功判定：`status` 为 `SUCCESS`，并且 `result.output` 为真实模型输出（例如 `OK`）。
 
 ## 当前进度
+2026-07-19 更新：新增 AgentBackendType/AgentBackendConfig、WorkspaceSpec、ArtifactReference 和 TaskAttempt backend/workspace 字段；新增 backends 基础接口、LegacyLLMBackend、DirectToolBackend、CodexCLIBackend 初版、WorkspaceManager、ArtifactStore、Planner DAG 模型/验证/Materializer，以及 `/runs/{root_task_id}/summary`、`/runs/{root_task_id}/events`、`/artifacts/{artifact_id}`、`/debug/faults/workers/{agent_name}/sigkill` 和 `/dashboard/`。`run_pytest` 返回真实退出码和结构化 passed/failed 摘要。修改前基线依据：`bash scripts/final_check.sh` 中单元/集成前段 168+1+1 通过，Demo reset 因 `target_repo` 内 nobody 文件权限导致 `PermissionError`。
+旧 demo 的 `tester` Agent 已显式声明 `write_file`，用于保持既有安全回归测试写入链路与新的 DirectTool 权限校验兼容。
+新增 NativePlannerBackend 两阶段流程：Runtime 先执行 repo_scan，再由 LLM 输出 InspectionRequest，Runtime 校验并执行 read_file/search_code，随后 LLM 输出 PlanSpec，由 WorkflowService 校验并通过 Scheduler 入口物化动态子任务。新增 WorkflowService 负责 Planner 子任务创建、Coder/Repair patch 集成基线、Tester 失败触发 Repair、RecoveryContext readonly 记录和 worker 进程组清理。
+Docker 默认状态库迁移到 `/runtime/state/state.db`，`final_check.sh` 与 demo 脚本已按 `AGENTD_STATE_DB` 清理 WAL/SHM，避免连续 normal/fault demo 复用旧 Agent 注册状态。
+Fake Codex 测试覆盖 success、timeout、JSONL 事件净化和文件变更 patch 生成；timeout 测试清理环境变量，避免影响后续 file_change 用例。
+真实 E2E 可通过 `bash scripts/test_real_demo_docker_openeuler.sh` 启动；脚本要求 `OPENAI_API_KEY` 以及 `DEEPSEEK_API_KEY` 或 `LLM_API_KEY` 存在于环境变量，只注入容器运行时，不写入镜像或仓库。
+真实 demo 启动脚本会等待 agentd `/metrics` 就绪后再执行 preflight，避免服务未监听时误报失败。
+Run summary 的 `leases_reclaimed` 从 ResourceMonitor snapshot 读取，避免直接访问内部实现字段。
+Planner parser 支持受控规范化 DeepSeek 等价输出：只接受 `{"plan":[...]}` 到 `PlanSpec.tasks` 的字段名映射，随后仍执行完整 DAG/角色/依赖校验。
+CodexCLIBackend 会把相对 `output_schema` 转为仓库根目录下的绝对路径，避免每个 Attempt worktree 中找不到 schema。
+2026-07-20 更新：Planner 物化的 coder/tester 子任务默认使用 `fail_closed`，避免 Coder 超时或失败后下游 Tester/Reviewer 误放行；Planner inspection/summary 会进入子任务输入，Codex prompt 同步包含 Task input JSON。PatchArtifact 只在 coder/repair 成功后生成，pytest 工具禁用 bytecode/cache 写入，并且 Git patch 计算排除 `__pycache__` 与 `.pytest_cache`，避免测试运行产物污染补丁。
+Planner inspection parser 增加受控兼容：当 DeepSeek 返回 `tasks[].file` 或同类检查任务列表时，Runtime 会提取候选文件并继续执行路径安全校验、文件数量限制和真实 read/search 工具调用。
+当 LLM 返回空 InspectionRequest 时，NativePlannerBackend 会从 repo_scan 结果中选择 `app/` 和 `tests/` 下的关键 Python 文件作为受控兜底检查输入，仍限制最多文件数并通过 read_file 工具读取，避免真实 Planner 因格式漂移跳过仓库内容。
+真实 Codex/DeepSeek Demo 的 Docker 脚本保留宿主传入的代理环境变量，仅设置 `NO_PROXY/no_proxy=127.0.0.1,localhost`，避免容器内 Codex CLI 直连 OpenAI 时因代理被清空出现 `request timed out`。
+当前服务器 Codex 使用 `~/.codex/config.toml` 中的自定义 provider；真实 Demo Docker 脚本会只读挂载宿主 Codex config 到 `/root/.codex/config.toml`，使容器内 Codex 与宿主走同一 provider。Preflight 新增 `codex api` 最小连通性检查，可用 `SKIP_CODEX_PREFLIGHT=1` 显式跳过。
+2026-07-20 更新：`scripts/test_docker_openeuler.sh` 也会只读挂载宿主 `~/.codex/config.toml`，并透传 `OPENAI_API_KEY/CODEX_API_KEY`；在同一 OpenEuler 容器内直接执行 `codex --sandbox read-only ... exec --ephemeral --json --skip-git-repo-check "Return the word OK."` 已返回 `OK`，可验证配置生效。
+2026-07-20 更新：新增 `applications/incident_repair` LangGraph 代码修复应用骨架，使用同一 Graph State 和 `ExecutionProvider` 切换 direct/runtime/replay；Runtime Provider 复用现有 `AgentRuntimeClient`，SDK 已补齐 `required_capability`、`required_backend`、`timeout_ms`、`task_role`、`trace_id`、`root_task_id`、`idempotency_key` 和 `wait_task`。Direct Provider 使用公平 `asyncio.Semaphore`、共享 worktree/patch 实现、Codex CLI 子进程和 pytest 工具；新增 Run Bundle/Replay manifest、统一事件模型，以及 `testing/perf/comparison` 的统计、成对公平性检查和 CSV/JSON 输出骨架。当前依据：`python3 -m pytest testing/unittest/applications testing/unittest/api/test_client.py -q` 为 17 passed。
+2026-07-20 更新：`IncidentGraphRunner` 已使用 `AsyncSqliteSaver.from_conn_string` 接入 SQLite checkpointer，`/demo/runs` 创建 Run Bundle 后会后台执行同一张 LangGraph；OpenEuler 中验证 `Send` 并行 coder 分支汇聚后下游节点只执行一次。`scripts/test_unit.sh` 已纳入 `testing/unittest/applications/`，避免新增应用测试被 Docker 门禁漏跑。新增 `/dashboard/demo.html`、`/dashboard/compare.html`、`/dashboard/benchmarks.html` 最小数据驱动页面，不写死性能结论。当前依据：OpenEuler 单测会实际执行 LangGraph runner 测试。
+2026-07-20 更新：Runtime 模式的 LangGraph planner 任务会携带 `graph_managed=true`，Runtime 内部 `WorkflowService` 看到该标记后不再物化业务 DAG，避免 LangGraph 和 AgentRuntime 同时维护一套业务图。`testing/perf/comparison/runner.py` 已能实际跑 fake/direct/runtime 矩阵，自动写出 `run-data/benchmarks/<benchmark_id>/raw_runs.csv`、`summary.csv` 和 `comparison.json`；同时处理 OpenEuler `safe.directory` 问题，避免挂载仓库污染 benchmark 结果。当前依据：OpenEuler 下 fake benchmark 已生成非空 raw/summary CSV，error 字段为空。
+
 实现状态总表见 `docs/implementation_status.md`；进度记录见 `docs/progress.md`。比赛要求范围内的核心机制已经完成；通用抢占、生产级多节点部署和 LLM 语义摘要不在当前实现范围内。
 
 | 模块 | README 声明能力 | 源码实现位置 | 当前状态 | 备注 |
 |---|---|---|---|---|
 | Core Model | AgentCapability、Task required_capability、状态机、幂等字段 | `aruntime/core/models.py` | 已实现 | Agent/Task 已建模为 runtime 一等公民 |
+| Backend | legacy_llm/direct_tool/codex_cli/native_planner 后端配置与 Worker 适配 | `aruntime/backends/*`, `aruntime/worker/agent_worker.py` | 部分实现 | legacy/tool 兼容，Codex CLI 支持 fake 测试；完整 Planner 两阶段和真实 Demo 待扩展 |
+| Workspace | Attempt 级 git worktree、PatchArtifact、ArtifactStore | `aruntime/workspace/*` | 部分实现 | patch 和 changed_files 由 git diff 计算 |
+| Dashboard/API | Run summary、Run events、Artifact 下载、静态 Dashboard | `aruntime/daemon/main.py`, `aruntime/dashboard/*` | 部分实现 | 原生 HTML/CSS/JS 轮询 REST |
 | ACB | Agent lifecycle、timeline、/agents/{agent_name}/acb | `aruntime/core/acb.py`, `aruntime/core/lifecycle.py`, `aruntime/daemon/main.py` | 已实现 | FAILED/LOST 需经 RECOVERING 回 READY |
 | Scheduler | fifo/priority/deadline/fair_share/resource_aware/capability_aware/cost_aware/reliability_aware | `aruntime/scheduler/kernel.py` | 已实现 | 支持能力匹配、资源重检和资源阻塞 BLOCKED |
 | Dynamic Task | spawn children、DAG、依赖、trace/context 继承、真实 Demo | `aruntime/daemon/main.py`, `aruntime/scheduler/kernel.py`, `examples/production_incident_demo/scripts/run_demo.py` | 已实现 | `/tasks/{task_id}/spawn`, `/children`, `/dag`, `/dependencies`，Demo 至少 12 个子任务 |

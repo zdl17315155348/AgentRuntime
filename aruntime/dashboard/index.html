@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>AgentRuntime Demo</title>
+    <link rel="stylesheet" href="/dashboard/styles.css">
+  </head>
+  <body>
+    <header>
+      <strong>AgentRuntime Demo</strong>
+      <span>openEuler</span>
+      <input id="runId" placeholder="root_task_id">
+      <button id="load">Load</button>
+    </header>
+    <main>
+      <section id="summary"></section>
+      <section><h2>Dynamic DAG</h2><pre id="tasks"></pre></section>
+      <section><h2>Agents / Workers</h2><pre id="agents"></pre></section>
+      <section><h2>Attempts</h2><pre id="attempts"></pre></section>
+      <section><h2>Artifacts</h2><pre id="artifacts"></pre></section>
+      <section><h2>Events</h2><pre id="events"></pre></section>
+    </main>
+    <script src="/dashboard/app.js"></script>
+  </body>
+</html>

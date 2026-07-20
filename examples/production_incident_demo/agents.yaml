@@ -1,20 +1,85 @@
 agents:
   - name: architect
     role: Architect
-    capability: {can_plan: true}
+    system_prompt: |
+      你负责检查仓库并生成结构化任务计划。
+      不得修改代码。
+    backend:
+      type: native_planner
+      model: deepseek-chat
+      sandbox: read-only
+      timeout_s: 120
+      max_inspection_files: 6
+    capability:
+      can_plan: true
+      tools: [repo_scan, search_code, read_file]
+
   - name: coder_a
     role: Coder A
-    capability: {can_code: true, tools: [read_file, write_file, run_pytest], languages: [python]}
-    failure_policy: {mode: fallback, fallback_agent: coder_b, timeout_ms: 30000}
+    system_prompt: |
+      在当前Git工作区完成指定代码修复。
+      必须运行相关测试。
+    backend:
+      type: codex_cli
+      sandbox: workspace-write
+      approval_policy: never
+      timeout_s: 300
+      output_schema: configs/schemas/codex_coder_result.schema.json
+    capability:
+      can_code: true
+      languages: [python]
+    failure_policy:
+      mode: fallback
+      fallback_agent: coder_b
+      max_retries: 0
+
   - name: coder_b
     role: Coder B
-    capability: {can_code: true, tools: [read_file, write_file, run_pytest], languages: [python]}
+    system_prompt: |
+      作为备用Coder，根据原任务和恢复上下文完成修复。
+    backend:
+      type: codex_cli
+      sandbox: workspace-write
+      approval_policy: never
+      timeout_s: 300
+      output_schema: configs/schemas/codex_coder_result.schema.json
+    capability:
+      can_code: true
+      languages: [python]
+
   - name: tester
     role: Tester
-    capability: {can_test: true, tools: [run_pytest]}
+    backend:
+      type: direct_tool
+      sandbox: read-only
+      timeout_s: 120
+    capability:
+      can_test: true
+      tools: [run_pytest]
+
   - name: repair
     role: Repair
-    capability: {can_code: true, can_test: true, tools: [read_file, write_file, run_pytest], languages: [python]}
+    backend:
+      type: codex_cli
+      sandbox: workspace-write
+      approval_policy: never
+      timeout_s: 300
+      output_schema: configs/schemas/codex_coder_result.schema.json
+    capability:
+      can_code: true
+      can_test: true
+      languages: [python]
+
   - name: reviewer
     role: Reviewer
-    capability: {can_review: true}
+    system_prompt: |
+      只读审查Patch、测试结果和需求覆盖情况。
+      不得修改文件。
+    backend:
+      type: codex_cli
+      sandbox: read-only
+      approval_policy: never
+      timeout_s: 180
+      output_schema: configs/schemas/codex_reviewer_result.schema.json
+    capability:
+      can_review: true

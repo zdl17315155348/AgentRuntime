@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Incident Repair Demo</title>
+    <link rel="stylesheet" href="/dashboard/styles.css">
+  </head>
+  <body>
+    <header>
+      <strong>Incident Repair</strong>
+      <span id="mode">LIVE</span>
+      <button id="runtime">Start Runtime</button>
+      <button id="direct">Start Direct</button>
+      <button id="replay">Open Replay</button>
+      <button id="cancel">Cancel</button>
+    </header>
+    <main>
+      <section id="summary"></section>
+      <section><h2>LangGraph</h2><pre id="graph"></pre></section>
+      <section><h2>Execution</h2><pre id="events"></pre></section>
+      <section><h2>Artifacts</h2><pre id="artifacts"></pre></section>
+    </main>
+    <script src="/dashboard/js/api.js"></script>
+    <script src="/dashboard/js/demo.js"></script>
+  </body>
+</html>

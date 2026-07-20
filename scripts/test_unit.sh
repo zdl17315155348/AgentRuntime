@@ -15,7 +15,7 @@ rm -rf .pytest_cache
 find testing/ -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
 
 # 运行单元测试
-python3 -m pytest testing/unittest/core/ testing/unittest/scheduler/ testing/unittest/context/ testing/unittest/api/ testing/unittest/comm/ testing/unittest/llm/ testing/unittest/resource/ testing/unittest/observability/ -v
+python3 -m pytest testing/unittest/core/ testing/unittest/scheduler/ testing/unittest/context/ testing/unittest/api/ testing/unittest/comm/ testing/unittest/llm/ testing/unittest/resource/ testing/unittest/observability/ testing/unittest/applications/ -v
 
 echo ""
 echo "✅ 单元测试完成"

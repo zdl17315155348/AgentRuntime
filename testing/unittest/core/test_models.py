@@ -1,4 +1,6 @@
-from aruntime.core.models import AgentCapability, AgentSpec, SideEffectLevel, TaskSpec, TaskStatus
+import pytest
+
+from aruntime.core.models import AgentBackendConfig, AgentBackendType, AgentCapability, TaskAttempt, AgentSpec, SideEffectLevel, TaskSpec, TaskStatus, WorkspaceSpec
 
 
 def test_agent_spec_has_runtime_capability_and_quotas():
@@ -16,6 +18,7 @@ def test_agent_spec_has_runtime_capability_and_quotas():
     assert agent.restart_budget == 2
     assert agent.fault_domain == "fd-a"
     assert agent.token_quota == 4096
+    assert agent.backend.type == AgentBackendType.LEGACY_LLM
 
 
 def test_task_spec_declares_capability_dependencies_and_side_effects():
@@ -33,6 +36,27 @@ def test_task_spec_declares_capability_dependencies_and_side_effects():
     assert task.dependencies == ["design"]
     assert task.children == ["test"]
     assert task.side_effect_level == SideEffectLevel.FILE_WRITE
+    assert task.root_task_id == task.task_id
+
+
+def test_backend_config_rejects_danger_full_access_for_codex():
+    with pytest.raises(ValueError):
+        AgentBackendConfig(type=AgentBackendType.CODEX_CLI, sandbox="danger-full-access")
+
+
+def test_task_attempt_serializes_backend_workspace_fields():
+    attempt = TaskAttempt(
+        attempt_id="t:attempt:1",
+        agent_name="coder",
+        backend_type="codex_cli",
+        workspace_path="/tmp/ws",
+        base_commit="abc",
+    )
+
+    restored = TaskAttempt(**attempt.model_dump(mode="json"))
+
+    assert restored.backend_type == "codex_cli"
+    assert restored.workspace_path == "/tmp/ws"
 
 
 def test_task_fsm_rejects_illegal_running_to_created():

@@ -54,7 +54,7 @@ def _valid_task_result(data: dict) -> bool:
     return (
         data.get("type") == "task_result"
         and bool(str(data.get("task_id") or "").strip())
-        and data.get("status") in {"SUCCESS", "FAILED"}
+        and data.get("status") in {"SUCCESS", "FAILED", "CANCELLED", "TIMEOUT"}
     )
 
 
@@ -66,6 +66,7 @@ async def _handle_uds_client(
     auth_tokens: dict[str, str] | None = None,
     heartbeat_handler=None,
     agent_message_ack_handler=None,
+    backend_event_handler=None,
 ) -> None:
     agent_name = ""
     seen_message_ids: set[str] = set()
@@ -145,6 +146,10 @@ async def _handle_uds_client(
                     except Exception:
                         break
                 continue
+            if msg_type in {"backend_started", "backend_event", "artifact_created", "backend_cancelled"}:
+                if backend_event_handler is not None:
+                    await backend_event_handler(agent_name, data)
+                continue
             if msg_type == "agent_message_ack":
                 message_id = str(data.get("message_id") or "")
                 if message_id:
@@ -170,12 +175,13 @@ async def start_uds_server(
     auth_tokens: dict[str, str] | None = None,
     heartbeat_handler=None,
     agent_message_ack_handler=None,
+    backend_event_handler=None,
 ) -> asyncio.AbstractServer:
     if os.path.exists(path):
         os.remove(path)
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     server = await asyncio.start_unix_server(
-        lambda r, w: _handle_uds_client(r, w, router, task_result_handler, auth_tokens, heartbeat_handler, agent_message_ack_handler),
+        lambda r, w: _handle_uds_client(r, w, router, task_result_handler, auth_tokens, heartbeat_handler, agent_message_ack_handler, backend_event_handler),
         path=path,
     )
     os.chmod(path, 0o660)

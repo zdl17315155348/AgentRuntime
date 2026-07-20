@@ -5,7 +5,8 @@ python3 -c "from aruntime.daemon.main import app; print(app.title)"
 python3 -m pytest testing/unittest -q
 python3 -m pytest testing/integration/test_daemon_restart.py -q
 fuser -k 8234/tcp >/dev/null 2>&1 || true
-rm -f /tmp/agent-runtime-agentd.sock /tmp/agent-runtime-os/state.db /tmp/agent-runtime-os/state.db-wal /tmp/agent-runtime-os/state.db-shm
+STATE_DB="${AGENTD_STATE_DB:-/tmp/agent-runtime-os/state.db}"
+rm -f /tmp/agent-runtime-agentd.sock "$STATE_DB" "$STATE_DB-wal" "$STATE_DB-shm" /tmp/agent-runtime-os/state.db /tmp/agent-runtime-os/state.db-wal /tmp/agent-runtime-os/state.db-shm
 LLM_BACKEND=mock LLM_API_KEY="" SCHEDULER_TYPE=dag python3 -m aruntime.daemon.main >/tmp/agentd_final_integration.log 2>&1 &
 AGENTD_PID=$!
 trap 'kill "$AGENTD_PID" >/dev/null 2>&1 || true; wait "$AGENTD_PID" >/dev/null 2>&1 || true' EXIT INT TERM

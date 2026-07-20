@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from typing import Optional, Dict, Any, List, Literal, ClassVar
 from enum import Enum
 from datetime import datetime
@@ -39,6 +39,54 @@ class SideEffectLevel(str, Enum):
     FILE_WRITE = "file_write"
     NETWORK = "network"
     EXTERNAL_API = "external_api"
+
+
+class AgentBackendType(str, Enum):
+    NATIVE_PLANNER = "native_planner"
+    CODEX_CLI = "codex_cli"
+    DIRECT_TOOL = "direct_tool"
+    LEGACY_LLM = "legacy_llm"
+
+
+class AgentBackendConfig(BaseModel):
+    type: AgentBackendType = AgentBackendType.LEGACY_LLM
+    model: Optional[str] = None
+    executable: str = "codex"
+    sandbox: Literal["read-only", "workspace-write", "danger-full-access"] = "read-only"
+    approval_policy: Literal["never", "on-request", "untrusted"] = "never"
+    timeout_s: int = 300
+    ephemeral: bool = True
+    output_schema: Optional[str] = None
+    max_inspection_files: int = 6
+    max_inspection_rounds: int = 1
+
+    @model_validator(mode="after")
+    def validate_backend(self):
+        if self.type == AgentBackendType.CODEX_CLI and self.sandbox == "danger-full-access":
+            raise ValueError("danger-full-access is disabled by default")
+        return self
+
+
+class WorkspaceSpec(BaseModel):
+    source_repo: str
+    base_ref: str = "HEAD"
+    base_commit: Optional[str] = None
+    workspace_id: Optional[str] = None
+    workspace_path: Optional[str] = None
+    read_only: bool = False
+    retain_on_failure: bool = True
+
+
+class ArtifactReference(BaseModel):
+    artifact_id: str
+    artifact_type: Literal["patch", "test_report", "review", "plan", "log"]
+    path: str
+    sha256: str
+    size_bytes: int
+    task_id: str
+    attempt_id: str
+    created_at: datetime = Field(default_factory=datetime.now)
+    metadata: Dict[str, Any] = Field(default_factory=dict)
 
 
 class AgentCapability(BaseModel):
@@ -120,6 +168,17 @@ class TaskAttempt(BaseModel):
     result: Optional[Dict[str, Any]] = None
     started_at: datetime = Field(default_factory=datetime.now)
     completed_at: Optional[datetime] = None
+    backend_type: str = ""
+    backend_session_id: Optional[str] = None
+    backend_run_id: Optional[str] = None
+    backend_pid: Optional[int] = None
+    workspace_id: Optional[str] = None
+    workspace_path: Optional[str] = None
+    base_commit: Optional[str] = None
+    resumed_from_attempt: Optional[str] = None
+    recovery_context_id: Optional[str] = None
+    exit_code: Optional[int] = None
+    artifacts: List[ArtifactReference] = Field(default_factory=list)
 
 
 class TaskControlBlock(BaseModel):
@@ -196,6 +255,10 @@ class TaskSpec(BaseModel):
     timeout: Optional[float] = None
     timeout_ms: Optional[int] = None
     parent_task_id: Optional[str] = None
+    root_task_id: Optional[str] = None
+    task_role: Optional[str] = None
+    required_backend: Optional[AgentBackendType] = None
+    workspace: Optional[WorkspaceSpec] = None
     children: List[str] = Field(default_factory=list)
     trace_id: str = Field(default_factory=lambda: f"trace_{uuid4().hex}")
     dependencies: List[str] = Field(default_factory=list)       # 依赖的任务 ID 列表
@@ -221,6 +284,8 @@ class TaskSpec(BaseModel):
     attempts: List[TaskAttempt] = Field(default_factory=list)
 
     def model_post_init(self, __context) -> None:
+        if self.root_task_id is None:
+            self.root_task_id = self.task_id
         if self.definition is None:
             self.definition = TaskDefinition(
                 agent_name=self.agent_name,
@@ -279,6 +344,10 @@ class TaskSpec(BaseModel):
             attempt_id=f"{self.task_id}:attempt:{self.tcb.current_attempt}",
             worker_pid=worker_pid,
             agent_name=agent_name,
+            backend_type=self.required_backend.value if self.required_backend else "",
+            workspace_id=self.workspace.workspace_id if self.workspace else None,
+            workspace_path=self.workspace.workspace_path if self.workspace else None,
+            base_commit=self.workspace.base_commit if self.workspace else None,
         )
         self.attempts.append(attempt)
         return attempt
@@ -346,6 +415,8 @@ class AgentSpec(BaseModel):
     system_prompt: str = ""
     model: str = "gpt-4o-mini"
     capability: AgentCapability = Field(default_factory=AgentCapability)
+    backend: AgentBackendConfig = Field(default_factory=AgentBackendConfig)
+    failure_policy: FailurePolicy = Field(default_factory=FailurePolicy)
     status: AgentStatus = AgentStatus.CREATED
     current_task_id: Optional[str] = None
     created_at: datetime = Field(default_factory=datetime.now)

@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from aruntime.comm.message import Message
-from aruntime.core.models import AgentSpec, TaskSpec
+from aruntime.core.models import AgentSpec, ArtifactReference, TaskSpec
 from aruntime.resource.types import ResourceLease
 
 
@@ -43,6 +43,11 @@ class SQLiteStateStore:
             "worker_pid INTEGER, data TEXT NOT NULL, updated_at TEXT NOT NULL)"
         )
         cur.execute(
+            "CREATE TABLE IF NOT EXISTS artifacts ("
+            "artifact_id TEXT PRIMARY KEY, root_task_id TEXT, task_id TEXT, attempt_id TEXT, "
+            "artifact_type TEXT, path TEXT, sha256 TEXT, data TEXT NOT NULL, created_at TEXT NOT NULL)"
+        )
+        cur.execute(
             "CREATE TABLE IF NOT EXISTS resource_leases ("
             "lease_id TEXT PRIMARY KEY, task_id TEXT, agent_name TEXT, status TEXT, data TEXT NOT NULL, updated_at TEXT NOT NULL)"
         )
@@ -61,7 +66,17 @@ class SQLiteStateStore:
             "message_id TEXT NOT NULL, receiver TEXT NOT NULL, status TEXT NOT NULL, "
             "processed_at TEXT, generated_task_id TEXT, PRIMARY KEY(message_id, receiver))"
         )
+        self._ensure_column("task_attempts", "backend_type", "TEXT")
+        self._ensure_column("task_attempts", "backend_pid", "INTEGER")
+        self._ensure_column("task_attempts", "workspace_path", "TEXT")
+        self._ensure_column("task_attempts", "base_commit", "TEXT")
         self._conn.commit()
+
+    def _ensure_column(self, table: str, column: str, declaration: str) -> None:
+        rows = self._conn.execute(f"PRAGMA table_info({table})").fetchall()
+        names = {row["name"] for row in rows}
+        if column not in names:
+            self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {declaration}")
 
     def save_agent(
         self,
@@ -109,21 +124,91 @@ class SQLiteStateStore:
             for attempt in task.attempts:
                 self._conn.execute(
                     "INSERT OR REPLACE INTO task_attempts "
-                    "(attempt_id, task_id, agent_name, worker_pid, data, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+                    "(attempt_id, task_id, agent_name, worker_pid, backend_type, backend_pid, workspace_path, base_commit, data, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         attempt.attempt_id,
                         task.task_id,
                         attempt.agent_name,
                         attempt.worker_pid,
+                        attempt.backend_type,
+                        attempt.backend_pid,
+                        attempt.workspace_path,
+                        attempt.base_commit,
                         json.dumps(attempt.model_dump(mode="json"), ensure_ascii=False),
                         datetime.now().isoformat(),
                     ),
                 )
+                for artifact in attempt.artifacts:
+                    self._save_artifact_unlocked(task.root_task_id or task.task_id, artifact)
             self._conn.commit()
 
     def load_tasks(self) -> list[dict[str, Any]]:
         with self._lock:
             rows = self._conn.execute("SELECT * FROM tasks").fetchall()
+            return [dict(row) for row in rows]
+
+    def _save_artifact_unlocked(self, root_task_id: str, artifact: ArtifactReference) -> None:
+        data = artifact.model_dump(mode="json")
+        self._conn.execute(
+            "INSERT OR REPLACE INTO artifacts "
+            "(artifact_id, root_task_id, task_id, attempt_id, artifact_type, path, sha256, data, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                artifact.artifact_id,
+                root_task_id,
+                artifact.task_id,
+                artifact.attempt_id,
+                artifact.artifact_type,
+                artifact.path,
+                artifact.sha256,
+                json.dumps(data, ensure_ascii=False),
+                data["created_at"],
+            ),
+        )
+
+    def save_artifact(self, root_task_id: str, artifact: ArtifactReference) -> None:
+        with self._lock:
+            self._save_artifact_unlocked(root_task_id, artifact)
+            self._conn.commit()
+
+    def load_artifact(self, artifact_id: str) -> ArtifactReference | None:
+        with self._lock:
+            row = self._conn.execute("SELECT data FROM artifacts WHERE artifact_id = ?", (artifact_id,)).fetchone()
+            return ArtifactReference(**json.loads(row["data"])) if row else None
+
+    def list_artifacts_for_run(self, root_task_id: str) -> list[ArtifactReference]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT data FROM artifacts WHERE root_task_id = ? ORDER BY created_at ASC",
+                (root_task_id,),
+            ).fetchall()
+            return [ArtifactReference(**json.loads(row["data"])) for row in rows]
+
+    def list_attempts_for_run(self, root_task_id: str) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT ta.* FROM task_attempts ta JOIN tasks t ON ta.task_id = t.task_id "
+                "WHERE json_extract(t.data, '$.root_task_id') = ? OR t.task_id = ? "
+                "ORDER BY ta.updated_at ASC",
+                (root_task_id, root_task_id),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def list_trace_events_after_id(self, root_task_id: str, after_id: int = 0) -> list[dict[str, Any]]:
+        with self._lock:
+            task_rows = self._conn.execute(
+                "SELECT task_id FROM tasks WHERE json_extract(data, '$.root_task_id') = ? OR task_id = ?",
+                (root_task_id, root_task_id),
+            ).fetchall()
+            task_ids = [row["task_id"] for row in task_rows]
+            if not task_ids:
+                return []
+            placeholders = ",".join("?" for _ in task_ids)
+            rows = self._conn.execute(
+                f"SELECT * FROM trace_events WHERE id > ? AND task_id IN ({placeholders}) ORDER BY id ASC",
+                (after_id, *task_ids),
+            ).fetchall()
             return [dict(row) for row in rows]
 
     def save_lease(self, lease: ResourceLease) -> None:

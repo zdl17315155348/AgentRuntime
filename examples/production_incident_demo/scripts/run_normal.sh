@@ -2,7 +2,8 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 fuser -k 8234/tcp >/dev/null 2>&1 || true
-rm -f /tmp/agent-runtime-agentd.sock /tmp/agent-runtime-os/state.db /tmp/agent-runtime-os/state.db-wal /tmp/agent-runtime-os/state.db-shm
+STATE_DB="${AGENTD_STATE_DB:-/tmp/agent-runtime-os/state.db}"
+rm -f /tmp/agent-runtime-agentd.sock "$STATE_DB" "$STATE_DB-wal" "$STATE_DB-shm" /tmp/agent-runtime-os/state.db /tmp/agent-runtime-os/state.db-wal /tmp/agent-runtime-os/state.db-shm
 AGENT_WORKSPACE="$ROOT/target_repo" LLM_BACKEND=mock LLM_API_KEY="" SCHEDULER_TYPE=dag python3 -m aruntime.daemon.main >/tmp/agentd_demo.log 2>&1 &
 AGENTD_PID=$!
 export AGENTD_BASE_URL=http://127.0.0.1:8234

@@ -145,6 +145,8 @@ cython_debug/
 .vscode/
 .idea/
 .codex-local/
+third_party/codex/
+run-data/
 *.swp
 *.swo
 *~

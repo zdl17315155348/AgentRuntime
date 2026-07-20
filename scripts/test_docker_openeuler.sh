@@ -8,12 +8,22 @@ source "$PROJECT_DIR/scripts/docker_common.sh"
 
 IMAGE_TAG="${IMAGE_TAG:-agent-runtime-os:openeuler}"
 CONFIG_PATH="${CONFIG_PATH:-$PROJECT_DIR/configs/runtime.json}"
+CODEX_HOME_MOUNT=()
+if [ -f "${CODEX_HOME:-$HOME/.codex}/config.toml" ]; then
+  CODEX_HOME_MOUNT=(-v "${CODEX_HOME:-$HOME/.codex}/config.toml:/root/.codex/config.toml:ro")
+fi
 
 ensure_docker_available
 
 $DOCKER build -t "$IMAGE_TAG" .
 
 RUN_ARGS=(--rm)
+if [ -n "${OPENAI_API_KEY:-}" ]; then
+  RUN_ARGS+=(-e "OPENAI_API_KEY=$OPENAI_API_KEY")
+fi
+if [ -n "${CODEX_API_KEY:-}" ] || [ -n "${OPENAI_API_KEY:-}" ]; then
+  RUN_ARGS+=(-e "CODEX_API_KEY=${CODEX_API_KEY:-$OPENAI_API_KEY}")
+fi
 if [ -f "$CONFIG_PATH" ]; then
   RUN_ARGS+=(-v "$CONFIG_PATH:/app/configs/runtime.json:ro" -e RUNTIME_CONFIG=/app/configs/runtime.json)
 fi
@@ -24,7 +34,9 @@ if [ -n "${SMOKE_LLM_API_KEY:-}" ]; then
   RUN_ARGS+=(-e "SMOKE_LLM_API_KEY=$SMOKE_LLM_API_KEY")
 fi
 
-$DOCKER run "${RUN_ARGS[@]}" \
+$DOCKER run \
+  "${CODEX_HOME_MOUNT[@]}" \
+  "${RUN_ARGS[@]}" \
   "$IMAGE_TAG" bash -lc '
 set -euo pipefail
 unset http_proxy https_proxy all_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY
@@ -100,7 +112,8 @@ python3 -m pytest testing/unittest/daemon/test_resource_aware.py -v
 
 echo "== smoke =="
 fuser -k 8234/tcp >/dev/null 2>&1 || true
-rm -f /tmp/agent-runtime-agentd.sock /tmp/agent-runtime-os/state.db /tmp/agent-runtime-os/state.db-wal /tmp/agent-runtime-os/state.db-shm || true
+STATE_DB="${AGENTD_STATE_DB:-/tmp/agent-runtime-os/state.db}"
+rm -f /tmp/agent-runtime-agentd.sock "$STATE_DB" "$STATE_DB-wal" "$STATE_DB-shm" /tmp/agent-runtime-os/state.db /tmp/agent-runtime-os/state.db-wal /tmp/agent-runtime-os/state.db-shm || true
 SMOKE_LLM_BACKEND="${SMOKE_LLM_BACKEND:-}"
 SMOKE_LLM_API_KEY="${SMOKE_LLM_API_KEY:-}"
 if [ -z "$SMOKE_LLM_API_KEY" ] && [ -f configs/runtime.json ]; then

@@ -54,6 +54,18 @@ def test_submit_task_sends_dependencies_and_priority():
     assert http.last_post["json"]["dependencies"] == ["a", "b"]
 
 
+def test_create_agent_sends_backend_and_capability():
+    c = AgentRuntimeClient(base_url="http://example")
+    http = _HTTP()
+    c.client = http
+
+    c.create_agent("coder", "Coder", capability={"can_code": True}, backend={"type": "codex_cli"})
+
+    assert http.last_post["url"] == "http://example/agents"
+    assert http.last_post["json"]["capability"] == {"can_code": True}
+    assert http.last_post["json"]["backend"] == {"type": "codex_cli"}
+
+
 def test_submit_task_sends_context_payload():
     c = AgentRuntimeClient(base_url="http://example")
     http = _HTTP()
@@ -101,6 +113,36 @@ def test_submit_task_sends_failure_policy_and_on_failure():
     assert http.last_post["json"]["failure_policy"]["mode"] == "fallback"
     assert http.last_post["json"]["failure_policy"]["fallback_agent"] == "coder_b"
     assert http.last_post["json"]["on_failure"] == {"build": "fail_open"}
+
+
+def test_submit_task_sends_runtime_execution_fields():
+    c = AgentRuntimeClient(base_url="http://example")
+    http = _HTTP()
+    c.client = http
+
+    c.submit_task(
+        None,
+        {"goal": "x"},
+        resource_request={"llm_slots": 1},
+        required_capability={"can_code": True},
+        required_backend="codex_cli",
+        timeout_ms=1000,
+        task_role="coder",
+        trace_id="thread",
+        root_task_id="run",
+        idempotency_key="idem",
+    )
+
+    payload = http.last_post["json"]
+    assert payload["agent_name"] is None
+    assert payload["required_backend"] == "codex_cli"
+    assert payload["required_capability"] == {"can_code": True}
+    assert payload["resource_request"] == {"llm_slots": 1}
+    assert payload["timeout_ms"] == 1000
+    assert payload["task_role"] == "coder"
+    assert payload["trace_id"] == "thread"
+    assert payload["root_task_id"] == "run"
+    assert payload["idempotency_key"] == "idem"
 
 
 def test_get_task_hits_task_endpoint():

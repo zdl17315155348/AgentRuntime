@@ -5,6 +5,13 @@ import sys
 from pathlib import Path
 from uuid import uuid4
 
+from aruntime.backends.codex_cli import CodexCLIBackend
+from aruntime.backends.direct_tool import DirectToolBackend
+from aruntime.backends.legacy_llm import LegacyLLMBackend
+from aruntime.backends.native_planner import NativePlannerBackend
+from aruntime.backends.registry import BackendRegistry
+from aruntime.backends.base import BackendExecutionRequest
+from aruntime.core.models import AgentBackendConfig, AgentBackendType, AgentSpec, WorkspaceSpec
 from aruntime.executor.task_executor import TaskExecutor
 from aruntime.llm.gateway import LLMGateway
 from aruntime.tools.file_tools import ReadFileTool, SearchCodeTool, WriteFileTool
@@ -13,7 +20,6 @@ from aruntime.tools.pytest_tool import RunPytestTool
 from aruntime.tools.repo_scan_tool import RepoScanTool
 from aruntime.tools.registry import ToolRegistry
 from aruntime.tools.shell_tool import RunCommandTool
-from aruntime.tools.base import ToolExecutionContext
 
 
 def _encode_line(obj: dict) -> bytes:
@@ -33,7 +39,8 @@ async def _run_exec_task(
     send_json,
     llm_gateway: LLMGateway,
     executor: TaskExecutor,
-    tool_context: ToolExecutionContext,
+    agent_spec: AgentSpec,
+    backend_registry: BackendRegistry,
 ) -> None:
     task_id = str(data.get("task_id") or "").strip()
     attempt_id = str(data.get("attempt_id") or "").strip()
@@ -46,6 +53,10 @@ async def _run_exec_task(
     output = ""
     error = ""
     usage = {}
+    artifacts = []
+    exit_code = None
+    backend_type = ""
+    runtime_context = {}
     try:
         logical_context_reuse_hit = False
         if isinstance(task_input, dict):
@@ -70,22 +81,66 @@ async def _run_exec_task(
                 if test_cfg.get("force_error") is True:
                     raise RuntimeError("forced error")
 
-        tool_request = task_input.get("__tool") if isinstance(task_input, dict) else None
-        if isinstance(tool_request, dict) and tool_request.get("name"):
-            tool_result = await executor.execute_tool(str(tool_request["name"]), dict(tool_request.get("arguments") or {}), tool_context)
-            output = json.dumps(tool_result.output, ensure_ascii=False)
-            usage = {"tool": tool_request["name"], "metadata": tool_result.metadata}
-            if not tool_result.ok:
-                status = "FAILED"
-                error = tool_result.error or "tool error"
+        workspace_data = data.get("workspace") if isinstance(data.get("workspace"), dict) else {}
+        if workspace_data:
+            workspace = WorkspaceSpec(**workspace_data)
         else:
-            llm_result = llm_gateway.chat_with_stats(
-                system_prompt,
-                user_message,
-                prefix_cache_hit=logical_context_reuse_hit,
+            workspace_root = Path(os.getenv("AGENT_WORKSPACE", os.getcwd())).resolve()
+            workspace = WorkspaceSpec(source_repo=str(workspace_root), workspace_path=str(workspace_root))
+
+        backend_config = agent_spec.backend
+        tool_request = task_input.get("__tool") if isinstance(task_input, dict) else None
+        if backend_config.type == AgentBackendType.LEGACY_LLM and isinstance(tool_request, dict) and tool_request.get("name"):
+            backend_config = AgentBackendConfig(type=AgentBackendType.DIRECT_TOOL, timeout_s=backend_config.timeout_s)
+
+        request = BackendExecutionRequest(
+            task_id=task_id,
+            attempt_id=attempt_id,
+            agent_name=agent_spec.agent_name,
+            system_prompt=system_prompt,
+            user_message=user_message,
+            task_input=task_input if isinstance(task_input, dict) else {},
+            workspace=workspace,
+            runtime_context=runtime_context if isinstance(runtime_context, dict) else {},
+            timeout_s=int(data.get("timeout_s") or backend_config.timeout_s or 300),
+            token_budget=data.get("token_budget"),
+        )
+        backend = backend_registry.create(
+            backend_config,
+            {"llm_gateway": llm_gateway, "executor": executor, "agent_spec": agent_spec},
+        )
+
+        async def emit_event(event: dict) -> None:
+            await send_json(
+                {
+                    "type": "backend_event",
+                    "task_id": request.task_id,
+                    "attempt_id": request.attempt_id,
+                    "event": event,
+                }
             )
-            output = llm_result.output
-            usage = llm_result.to_dict()
+            if event.get("name") == "backend.started":
+                await send_json(
+                    {
+                        "type": "backend_started",
+                        "task_id": request.task_id,
+                        "attempt_id": request.attempt_id,
+                        "backend_type": event.get("backend_type") or backend_config.type.value,
+                        "backend_pid": event.get("backend_pid"),
+                        "backend_session_id": event.get("backend_session_id"),
+                    }
+                )
+
+        await backend.prepare(request)
+        backend_result = await backend.execute(request, emit_event)
+        await backend.cleanup(request)
+        status = backend_result.status
+        output = backend_result.output
+        error = backend_result.error
+        usage = backend_result.usage
+        artifacts = [artifact.model_dump(mode="json") for artifact in backend_result.artifacts]
+        exit_code = backend_result.exit_code
+        backend_type = backend_result.backend_type
     except asyncio.CancelledError:
         await send_json(
             {
@@ -110,6 +165,9 @@ async def _run_exec_task(
             "output": output,
             "error": error,
             "usage": usage,
+            "backend_type": backend_type,
+            "exit_code": exit_code,
+            "artifacts": artifacts,
         },
     )
 
@@ -121,19 +179,21 @@ async def _run() -> None:
     if not agent_name:
         raise RuntimeError("AGENT_NAME is required")
 
+    spec_json = os.getenv("AGENT_SPEC_JSON", "")
+    if spec_json:
+        agent_spec = AgentSpec(**json.loads(spec_json))
+    else:
+        agent_spec = AgentSpec(agent_name=agent_name, role=agent_name)
     llm_gateway = LLMGateway(backend=os.getenv("LLM_BACKEND", "mock"), api_key=os.getenv("LLM_API_KEY", ""))
     registry = ToolRegistry()
     for tool in (RepoScanTool(), ReadFileTool(), SearchCodeTool(), WriteFileTool(), GitDiffTool(), GitStatusTool(), RunPytestTool(), RunCommandTool()):
         registry.register(tool)
     executor = TaskExecutor(registry)
-    workspace_root = Path(os.getenv("AGENT_WORKSPACE", os.getcwd())).resolve()
-    tool_context = ToolExecutionContext(
-        workspace_root=workspace_root,
-        allowed_roots=[workspace_root],
-        allowed_shell_commands=set(filter(None, os.getenv("AGENTD_SHELL_ALLOWLIST", "").split(","))),
-        timeout_s=float(os.getenv("AGENTD_TOOL_TIMEOUT_S", "30")),
-        max_output_bytes=int(os.getenv("AGENTD_TOOL_MAX_OUTPUT", "65536")),
-    )
+    backend_registry = BackendRegistry()
+    backend_registry.register(AgentBackendType.LEGACY_LLM, lambda config, deps: LegacyLLMBackend(config, deps))
+    backend_registry.register(AgentBackendType.DIRECT_TOOL, lambda config, deps: DirectToolBackend(config, deps))
+    backend_registry.register(AgentBackendType.CODEX_CLI, lambda config, deps: CodexCLIBackend(config, deps))
+    backend_registry.register(AgentBackendType.NATIVE_PLANNER, lambda config, deps: NativePlannerBackend(config, deps))
 
     reader, writer = await asyncio.open_unix_connection(uds_path)
     writer.write(_encode_line({"type": "register", "agent_name": agent_name, "token": auth_token}))
@@ -188,7 +248,7 @@ async def _run() -> None:
                         }
                     )
                     continue
-                task = asyncio.create_task(_run_exec_task(data, send_json, llm_gateway, executor, tool_context))
+                task = asyncio.create_task(_run_exec_task(data, send_json, llm_gateway, executor, agent_spec, backend_registry))
                 running[key] = task
 
                 def cleanup(done_task: asyncio.Task, task_key=key) -> None:

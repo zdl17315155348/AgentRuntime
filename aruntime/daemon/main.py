@@ -5,13 +5,17 @@ from datetime import datetime
 from typing import Dict, Optional
 import subprocess
 import secrets
+import signal
 from uuid import uuid4
+from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
 
 from aruntime.core.acb import AgentControlBlock
-from aruntime.core.models import AgentCapability, AgentSpec, FailurePolicy, FailureMode, SideEffectLevel, TaskAttempt, TaskSpec, TaskStatus, AgentStatus
+from aruntime.core.models import AgentBackendConfig, AgentBackendType, AgentCapability, AgentSpec, FailurePolicy, FailureMode, SideEffectLevel, TaskAttempt, TaskSpec, TaskStatus, AgentStatus, WorkspaceSpec, ArtifactReference
 from aruntime.core.lifecycle import transition_to, InvalidTransitionError
 from aruntime.scheduler.fifo import FIFOScheduler
 from aruntime.scheduler.dag import DAGScheduler
@@ -32,6 +36,11 @@ from aruntime.daemon.fault_service import WorkerFaultState, retry_backoff_second
 from aruntime.daemon.recovery_service import recover_tasks
 from aruntime.daemon.store import SQLiteStateStore
 from aruntime.daemon.worker_service import json_log, start_worker_process
+from aruntime.workspace import ArtifactStore, WorkspaceManager
+from aruntime.workflow import WorkflowService
+from aruntime.workflow.recovery import RecoveryContext
+from applications.incident_repair.config import ExecutionMode
+from applications.incident_repair.services.run_service import IncidentRunService, new_run_config
 
 import json
 
@@ -159,6 +168,9 @@ uds_server = None
 agent_workers: Dict[str, subprocess.Popen] = {}
 pending_task_results: Dict[str, dict] = {}
 trace_recorder = TraceRecorder()
+artifact_store = ArtifactStore()
+workspace_manager = WorkspaceManager(artifact_store=artifact_store)
+workflow_service: WorkflowService | None = None
 scheduler_event: asyncio.Event | None = None
 global_dispatch_semaphore: asyncio.Semaphore | None = None
 agent_dispatch_semaphores: Dict[str, asyncio.Semaphore] = {}
@@ -173,6 +185,9 @@ llm_usage_totals = {
 }
 
 app = FastAPI(title="Agent Runtime Daemon", version="0.1.0")
+dashboard_dir = Path(__file__).resolve().parents[1] / "dashboard"
+if dashboard_dir.exists():
+    app.mount("/dashboard", StaticFiles(directory=str(dashboard_dir), html=True), name="dashboard")
 
 
 def _persist_agent(agent_name: str) -> None:
@@ -264,8 +279,8 @@ def _agent_semaphore(agent_name: str) -> asyncio.Semaphore:
 def _start_worker(agent_name: str) -> subprocess.Popen:
     uds_path = os.getenv("AGENTD_UDS_PATH", "/tmp/agent-runtime-agentd.sock")
     token = agent_auth_tokens.setdefault(agent_name, secrets.token_urlsafe(24))
-    workspace_root = os.getenv("AGENT_WORKSPACE", "")
-    proc = start_worker_process(agent_name, uds_path, llm_gateway.backend, llm_gateway.api_key or "", token, workspace_root or None)
+    agent = agents[agent_name]
+    proc = start_worker_process(agent, uds_path, token, llm_gateway.backend, llm_gateway.api_key or "")
     agent_workers[agent_name] = proc
     fault_states.setdefault(agent_name, WorkerFaultState(agent_name=agent_name, fault_domain=agent_name)).heartbeat()
     acb = agent_controls.get(agent_name)
@@ -298,17 +313,24 @@ def _stop_worker(agent_name: str, cleanup_cgroup: bool = True) -> None:
     proc = agent_workers.get(agent_name)
     if proc is not None:
         try:
-            proc.terminate()
+            os.killpg(proc.pid, signal.SIGTERM)
         except Exception:
-            pass
+            try:
+                proc.terminate()
+            except Exception:
+                pass
         try:
             proc.wait(timeout=2)
         except Exception:
             try:
-                proc.kill()
+                os.killpg(proc.pid, signal.SIGKILL)
                 proc.wait(timeout=2)
             except Exception:
-                pass
+                try:
+                    proc.kill()
+                    proc.wait(timeout=2)
+                except Exception:
+                    pass
         agent_workers.pop(agent_name, None)
     if cleanup_cgroup:
         binding = cgroup_bindings.pop(agent_name, None)
@@ -352,6 +374,10 @@ def _prepare_fallback_attempt(task: TaskSpec, fallback_agent: str) -> TaskAttemp
         fallback_agent,
         worker_pid=(agent_workers.get(fallback_agent).pid if fallback_agent in agent_workers else None),
     )
+    failed_attempt = task.attempts[-2] if len(task.attempts) >= 2 else None
+    if failed_attempt is not None:
+        attempt.resumed_from_attempt = failed_attempt.attempt_id
+        attempt.recovery_context_id = task.context_id
     task.scheduler_decision_reason = f"fallback:{task.agent_name}->{fallback_agent}"
     agent_inflight_tasks[fallback_agent] = agent_inflight_tasks.get(fallback_agent, 0) + 1
     fault_states.setdefault(task.agent_name, WorkerFaultState(agent_name=task.agent_name, fault_domain=task.agent_name)).record_fallback(
@@ -362,6 +388,39 @@ def _prepare_fallback_attempt(task: TaskSpec, fallback_agent: str) -> TaskAttemp
     )
     _persist_task(task)
     return attempt
+
+
+def _record_recovery_context(task: TaskSpec, attempt: TaskAttempt, failure_reason: str) -> None:
+    if not task.context_id:
+        return
+    partial_patch = None
+    changed_files: list[str] = []
+    if attempt.workspace_path and attempt.base_commit:
+        try:
+            workspace = WorkspaceSpec(
+                source_repo=task.workspace.source_repo if task.workspace else attempt.workspace_path,
+                workspace_path=attempt.workspace_path,
+                base_commit=attempt.base_commit,
+            )
+            partial_patch = workspace_manager.create_patch_artifact(workspace, task.task_id, attempt.attempt_id, task.root_task_id)
+            if partial_patch is not None:
+                attempt.artifacts.append(partial_patch)
+                state_store.save_artifact(task.root_task_id or task.task_id, partial_patch)
+                changed_files = list(partial_patch.metadata.get("changed_files") or [])
+        except Exception:
+            partial_patch = None
+    recovery = RecoveryContext(
+        previous_attempt_id=attempt.attempt_id,
+        previous_agent=attempt.agent_name,
+        failure_reason=failure_reason,
+        partial_patch=partial_patch,
+        changed_files=changed_files,
+    )
+    context_manager.record_task_context(
+        context_id=task.context_id,
+        agent_name=attempt.agent_name,
+        readonly_data={f"recovery:{attempt.attempt_id}": recovery.model_dump(mode="json")},
+    )
 
 
 def _prepare_agent_for_task(task: TaskSpec, reason: str) -> None:
@@ -388,6 +447,8 @@ class CreateAgentRequest(BaseModel):
     system_prompt: str = ""
     model: str = "gpt-4o-mini"
     capability: AgentCapability = Field(default_factory=AgentCapability)
+    backend: AgentBackendConfig = Field(default_factory=AgentBackendConfig)
+    failure_policy: FailurePolicy = Field(default_factory=FailurePolicy)
     max_retries: int = 3
     restart_budget: int = 3
     fault_domain: str = ""
@@ -408,6 +469,10 @@ class SubmitTaskRequest(BaseModel):
     timeout: Optional[float] = None
     timeout_ms: Optional[int] = None
     parent_task_id: str = ""
+    root_task_id: str = ""
+    task_role: str = ""
+    required_backend: AgentBackendType | None = None
+    workspace: WorkspaceSpec | None = None
     children: list[str] = Field(default_factory=list)
     trace_id: str = ""
     dependencies: list[str] = Field(default_factory=list)
@@ -447,6 +512,10 @@ class SubmitDynamicTaskRequest(BaseModel):
     timeout: Optional[float] = None
     timeout_ms: Optional[int] = None
     trace_id: str = ""
+    root_task_id: str = ""
+    task_role: str = ""
+    required_backend: AgentBackendType | None = None
+    workspace: WorkspaceSpec | None = None
     dependency_failure_policies: dict[str, FailureMode] = Field(default_factory=dict)
     on_failure: dict[str, FailureMode] = Field(default_factory=dict)
     failure_policy: FailurePolicy = Field(default_factory=FailurePolicy)
@@ -478,6 +547,21 @@ class SendMessageRequest(BaseModel):
     topic: str = ""
 
 
+class CreateDemoRunRequest(BaseModel):
+    execution_mode: ExecutionMode = ExecutionMode.RUNTIME
+    task_case: str = "incident_repair_v1"
+    user_request: str = "修复认证、JWT和订单安全问题"
+    fault_mode: bool = False
+    source_repo: str = "examples/production_incident_demo/target_repo"
+    base_commit: str = "HEAD"
+    max_concurrency: int = 4
+
+
+demo_run_service = IncidentRunService()
+demo_runs: dict[str, dict] = {}
+demo_run_tasks: dict[str, asyncio.Task] = {}
+
+
 class SpawnTaskRequest(BaseModel):
     task_input: dict
     agent_name: str | None = None
@@ -488,6 +572,9 @@ class SpawnTaskRequest(BaseModel):
     inherit_context: bool = True
     context_id: str = ""
     timeout_ms: Optional[int] = None
+    task_role: str = ""
+    required_backend: AgentBackendType | None = None
+    workspace: WorkspaceSpec | None = None
     failure_policy: FailurePolicy = Field(default_factory=FailurePolicy)
     dependency_failure_policies: dict[str, FailureMode] = Field(default_factory=dict)
     on_failure: dict[str, FailureMode] = Field(default_factory=dict)
@@ -588,6 +675,42 @@ def _select_agent_name(agent_name: str | None, required_capability: dict | None)
     return None
 
 
+def _backend_for_task(task: TaskSpec, agent: AgentSpec) -> AgentBackendType:
+    if task.required_backend is not None:
+        return task.required_backend
+    if agent.backend.type != AgentBackendType.LEGACY_LLM:
+        return agent.backend.type
+    if isinstance(task.task_input, dict) and isinstance(task.task_input.get("__tool"), dict):
+        return AgentBackendType.DIRECT_TOOL
+    return AgentBackendType.LEGACY_LLM
+
+
+def _workspace_for_attempt(task: TaskSpec, attempt: TaskAttempt, agent: AgentSpec) -> WorkspaceSpec:
+    backend_type = _backend_for_task(task, agent)
+    base = workflow_service.workspace_for_task(task) if workflow_service is not None else task.workspace
+    legacy_workspace = os.getenv("AGENT_WORKSPACE", "")
+    if base is None and legacy_workspace:
+        base = WorkspaceSpec(source_repo=legacy_workspace, workspace_path=legacy_workspace)
+    if base is None:
+        repo = os.getcwd()
+        base = WorkspaceSpec(source_repo=repo, workspace_path=repo)
+    if backend_type in (AgentBackendType.CODEX_CLI, AgentBackendType.DIRECT_TOOL, AgentBackendType.NATIVE_PLANNER) and base.workspace_path is None:
+        read_only = agent.backend.sandbox == "read-only" or base.read_only
+        base = workspace_manager.create_attempt_workspace(
+            source_repo=base.source_repo,
+            task_id=task.task_id,
+            attempt_id=attempt.attempt_id,
+            base_ref=base.base_commit or base.base_ref,
+            read_only=read_only,
+            root_task_id=task.root_task_id,
+        )
+    attempt.backend_type = backend_type.value
+    attempt.workspace_id = base.workspace_id
+    attempt.workspace_path = base.workspace_path
+    attempt.base_commit = base.base_commit
+    return base
+
+
 def _scheduler_metrics() -> dict:
     all_tasks = list(tasks.values())
     queue_wait = [t.queue_wait_ms for t in all_tasks if t.queue_wait_ms is not None]
@@ -615,6 +738,11 @@ def _scheduler_metrics() -> dict:
         },
         "selection_log": getattr(target, "selection_log", [])[-50:],
     }
+
+
+def _enqueue_runtime_task(task: TaskSpec) -> None:
+    scheduler.enqueue(task)
+    _wake_scheduler()
 
 
 def _record_llm_usage(task: TaskSpec, usage: dict) -> None:
@@ -688,6 +816,8 @@ async def create_agent(req: CreateAgentRequest):
         system_prompt=req.system_prompt,
         model=req.model,
         capability=req.capability,
+        backend=req.backend,
+        failure_policy=req.failure_policy,
         max_retries=req.max_retries,
         restart_budget=req.restart_budget,
         fault_domain=req.fault_domain or None,
@@ -771,6 +901,17 @@ async def restart_agent(agent_name: str):
         _transition_agent(agent_name, AgentStatus.READY, reason="agent.restart")
     return {"agent_name": agent_name, "status": agent.status}
 
+
+@app.post("/debug/faults/workers/{agent_name}/sigkill")
+async def debug_sigkill_worker(agent_name: str):
+    if os.getenv("AGENTD_ENABLE_FAULT_INJECTION", "").lower() not in ("true", "1", "yes"):
+        raise HTTPException(status_code=404, detail="fault injection disabled")
+    proc = agent_workers.get(agent_name)
+    if proc is None or proc.poll() is not None:
+        raise HTTPException(status_code=404, detail="worker not running")
+    os.kill(proc.pid, 9)
+    return {"agent_name": agent_name, "pid": proc.pid, "status": "SIGKILL_SENT"}
+
 @app.post("/tasks")
 async def submit_task(req: SubmitTaskRequest):
     selected_agent_name = _select_agent_name(req.agent_name, req.required_capability)
@@ -811,6 +952,10 @@ async def submit_task(req: SubmitTaskRequest):
         timeout=req.timeout,
         timeout_ms=req.timeout_ms,
         parent_task_id=req.parent_task_id or None,
+        root_task_id=req.root_task_id or None,
+        task_role=req.task_role or None,
+        required_backend=req.required_backend,
+        workspace=req.workspace,
         children=req.children,
         trace_id=req.trace_id,
         dependencies=req.dependencies,
@@ -877,6 +1022,10 @@ async def submit_dynamic_task(req: SubmitDynamicTaskRequest):
         timeout=req.timeout,
         timeout_ms=req.timeout_ms,
         parent_task_id=req.parent_task_id or None,
+        root_task_id=req.root_task_id or None,
+        task_role=req.task_role or None,
+        required_backend=req.required_backend,
+        workspace=req.workspace,
         trace_id=req.trace_id,
         dependencies=[req.parent_task_id] if req.parent_task_id else [],
         dependency_failure_policies=_edge_failure_policies(req),
@@ -929,6 +1078,10 @@ async def spawn_task(task_id: str, req: SpawnTaskRequest):
         resource_request=req.resource_request,
         timeout_ms=req.timeout_ms,
         parent_task_id=task_id,
+        root_task_id=parent.root_task_id or parent.task_id,
+        task_role=req.task_role or None,
+        required_backend=req.required_backend,
+        workspace=req.workspace or parent.workspace,
         trace_id=parent.trace_id,
         dependencies=dependency_ids,
         dependency_failure_policies=_edge_failure_policies(req),
@@ -1066,6 +1219,185 @@ async def get_task_trace(task_id: str):
     return trace
 
 
+@app.get("/runs/{root_task_id}/summary")
+async def get_run_summary(root_task_id: str):
+    run_tasks = [task for task in tasks.values() if (task.root_task_id or task.task_id) == root_task_id or task.task_id == root_task_id]
+    if not run_tasks:
+        raise HTTPException(status_code=404, detail="Run not found")
+    attempts = [attempt for task in run_tasks for attempt in task.attempts]
+    artifacts = state_store.list_artifacts_for_run(root_task_id)
+    return {
+        "root_task_id": root_task_id,
+        "status": "RUNNING" if any(task.status == TaskStatus.RUNNING for task in run_tasks) else ("FAILED" if any(task.status == TaskStatus.FAILED for task in run_tasks) else "SUCCESS"),
+        "agents": {
+            name: {
+                "backend": agent.backend.type.value,
+                "status": agent.status.value,
+                "worker_pid": (agent_workers.get(name).pid if name in agent_workers else None),
+            }
+            for name, agent in agents.items()
+            if any(attempt.agent_name == name for attempt in attempts) or any(task.agent_name == name for task in run_tasks)
+        },
+        "tasks": {
+            "total": len(run_tasks),
+            "ready": sum(1 for task in run_tasks if task.status == TaskStatus.READY),
+            "running": sum(1 for task in run_tasks if task.status == TaskStatus.RUNNING),
+            "success": sum(1 for task in run_tasks if task.status == TaskStatus.SUCCESS),
+            "failed": sum(1 for task in run_tasks if task.status == TaskStatus.FAILED),
+        },
+        "faults": {
+            "worker_lost": sum(1 for task in run_tasks for attempt in task.attempts if attempt.failure_reason),
+            "fallback": sum(len(fault.fallback_attempts) for fault in fault_states.values()),
+            "leases_reclaimed": len(resource_monitor.get_snapshot().get("reclaimed", [])),
+        },
+        "llm": _llm_metrics(),
+        "attempts": [attempt.model_dump(mode="json") for attempt in attempts],
+        "artifacts": [artifact.model_dump(mode="json") for artifact in artifacts],
+        "integration_commit": "",
+    }
+
+
+@app.get("/runs/{root_task_id}/events")
+async def get_run_events(root_task_id: str, after_id: int = 0):
+    return {"events": state_store.list_trace_events_after_id(root_task_id, after_id)}
+
+
+@app.post("/demo/runs")
+async def create_demo_run(req: CreateDemoRunRequest):
+    config = new_run_config(
+        execution_mode=req.execution_mode,
+        source_repo=req.source_repo,
+        base_commit=req.base_commit,
+        max_concurrency=req.max_concurrency,
+        fault_mode=req.fault_mode,
+    )
+    bundle = await demo_run_service.start_run(config, req.user_request)
+    demo_runs[config.run_id] = {
+        "run_id": config.run_id,
+        "thread_id": config.thread_id,
+        "execution_mode": config.execution_mode.value,
+        "task_case": req.task_case,
+        "status": "CREATED",
+        "summary": bundle["summary"],
+    }
+    async def _run_demo_graph() -> None:
+        try:
+            result = await demo_run_service.execute_run(config, req.user_request, bundle=bundle)
+            demo_runs[config.run_id]["status"] = result["summary"]["status"]
+            demo_runs[config.run_id]["summary"] = result["summary"]
+        except Exception as exc:
+            demo_runs[config.run_id]["status"] = "FAILED"
+            demo_runs[config.run_id]["error"] = str(exc)
+
+    demo_run_tasks[config.run_id] = asyncio.create_task(_run_demo_graph())
+    return demo_runs[config.run_id]
+
+
+@app.get("/demo/runs")
+async def list_demo_runs():
+    return {"runs": demo_run_service.store.list_runs()}
+
+
+@app.get("/demo/runs/{run_id}")
+async def get_demo_run(run_id: str):
+    run_dir = demo_run_service.store.run_dir(run_id)
+    summary = run_dir / "summary.json"
+    if not summary.exists():
+        raise HTTPException(status_code=404, detail="Demo run not found")
+    return json.loads(summary.read_text(encoding="utf-8"))
+
+
+@app.post("/demo/runs/{run_id}/cancel")
+async def cancel_demo_run(run_id: str):
+    if run_id not in demo_runs:
+        raise HTTPException(status_code=404, detail="Demo run not found")
+    task = demo_run_tasks.get(run_id)
+    if task is not None and not task.done():
+        task.cancel()
+    demo_runs[run_id]["status"] = "CANCELLED"
+    return {"run_id": run_id, "status": "CANCELLED"}
+
+
+@app.post("/demo/runs/{run_id}/faults")
+async def inject_demo_fault(run_id: str, target: dict):
+    if run_id not in demo_runs:
+        raise HTTPException(status_code=404, detail="Demo run not found")
+    return {"run_id": run_id, "injected": False, "target": target}
+
+
+@app.get("/demo/runs/{run_id}/events")
+async def get_demo_events(run_id: str, after_id: int = 0):
+    path = demo_run_service.store.run_dir(run_id) / "unified_events.jsonl"
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Demo run events not found")
+    events = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        event = json.loads(line)
+        if int(event.get("event_id", 0)) > after_id:
+            events.append(event)
+    return {"events": events}
+
+
+@app.get("/demo/runs/{run_id}/graph")
+async def get_demo_graph(run_id: str):
+    path = demo_run_service.store.run_dir(run_id) / "graph_state.json"
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Demo run graph not found")
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+@app.get("/demo/runs/{run_id}/artifacts")
+async def get_demo_artifacts(run_id: str):
+    artifact_dir = demo_run_service.store.run_dir(run_id) / "artifacts"
+    return {"artifacts": [str(path.relative_to(artifact_dir)) for path in artifact_dir.rglob("*") if path.is_file()]}
+
+
+@app.get("/demo/runs/{run_id}/replay")
+async def get_demo_replay(run_id: str):
+    path = demo_run_service.store.run_dir(run_id) / "replay_manifest.json"
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Replay manifest not found")
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+@app.get("/demo/benchmarks")
+async def list_demo_benchmarks():
+    root = Path("run-data/benchmarks")
+    if not root.exists():
+        return {"benchmarks": []}
+    return {"benchmarks": [path.name for path in sorted(root.iterdir()) if path.is_dir()]}
+
+
+@app.get("/demo/benchmarks/{benchmark_id}")
+async def get_demo_benchmark(benchmark_id: str):
+    root = Path("run-data/benchmarks").resolve()
+    path = (root / benchmark_id).resolve()
+    if root not in path.parents or not path.exists():
+        raise HTTPException(status_code=404, detail="Benchmark not found")
+    result: dict[str, object] = {}
+    for name in ("config.json", "comparison.json", "report.json"):
+        file = path / name
+        if file.exists():
+            result[name.removesuffix(".json")] = json.loads(file.read_text(encoding="utf-8"))
+    summary = path / "summary.csv"
+    if summary.exists():
+        result["summary_csv"] = summary.read_text(encoding="utf-8")
+    return result
+
+
+@app.get("/artifacts/{artifact_id}")
+async def get_artifact(artifact_id: str):
+    artifact = state_store.load_artifact(artifact_id)
+    if artifact is None:
+        raise HTTPException(status_code=404, detail="Artifact not found")
+    path = Path(artifact.path).resolve()
+    if artifact_store.root not in path.parents:
+        raise HTTPException(status_code=403, detail="artifact path outside store")
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Artifact file not found")
+    return FileResponse(str(path))
+
+
 @app.post("/messages")
 async def send_message(req: SendMessageRequest):
     if req.from_agent not in agents:
@@ -1178,8 +1510,12 @@ async def _run_task_once(
             if not within_limits:
                 raise RuntimeError(f"resource limit exceeded: {limit_reason}")
 
+        workspace = _workspace_for_attempt(task, attempt, agent) if attempt is not None else (task.workspace or WorkspaceSpec(source_repo=os.getcwd(), workspace_path=os.getcwd()))
+        if attempt is not None:
+            _persist_task(task)
         _record_trace_event(task, "ipc.send_task", {"agent_name": agent_name})
         message_id = f"exec_{task.task_id}_{uuid4().hex}"
+        timeout_s = (task.timeout_ms / 1000.0) if task.timeout_ms is not None else (task.timeout or (task.failure_policy.timeout_ms / 1000.0))
         sent = await message_router.send_event(agent_name, {
             "type": "exec_task",
             "message_id": message_id,
@@ -1188,11 +1524,14 @@ async def _run_task_once(
             "system_prompt": agent.system_prompt or f"你是一个{agent.role}",
             "user_message": user_message,
             "task_input": task_payload,
+            "workspace": workspace.model_dump(mode="json"),
+            "runtime_context": task_payload.get("runtime_context", {}) if isinstance(task_payload.get("runtime_context"), dict) else {},
+            "timeout_s": int(timeout_s),
+            "token_budget": task.token_budget,
         })
         if not sent:
             raise RuntimeError("failed to send exec_task")
 
-        timeout_s = (task.timeout_ms / 1000.0) if task.timeout_ms is not None else (task.timeout or (task.failure_policy.timeout_ms / 1000.0))
         try:
             result = await asyncio.wait_for(fut, timeout=timeout_s)
         except asyncio.TimeoutError:
@@ -1222,14 +1561,29 @@ async def _run_task_once(
         output = result.get("output") or ""
         error = result.get("error") or ""
         usage = result.get("usage") or {}
+        artifacts_data = result.get("artifacts") or []
+        result_backend_type = str(result.get("backend_type") or "")
+        result_exit_code = result.get("exit_code")
         if isinstance(usage, dict):
             _record_llm_usage(task, usage)
             _record_trace_event(task, "llm.call", usage)
             if attempt is not None:
                 attempt.token_usage = usage
+                if result_backend_type:
+                    attempt.backend_type = result_backend_type
+                if result_exit_code is not None:
+                    attempt.exit_code = int(result_exit_code)
+                attempt.artifacts = [ArtifactReference(**item) for item in artifacts_data if isinstance(item, dict)]
                 _persist_task(task)
         if status == "SUCCESS":
             if attempt is not None:
+                if _backend_for_task(task, agent) == AgentBackendType.CODEX_CLI and (task.task_role or "").lower() in ("coder", "repair"):
+                    patch_artifact = workspace_manager.create_patch_artifact(workspace, task.task_id, attempt.attempt_id, task.root_task_id)
+                    if patch_artifact is None:
+                        raise RuntimeError("codex task produced empty patch")
+                    if patch_artifact is not None:
+                        attempt.artifacts.append(patch_artifact)
+                        state_store.save_artifact(task.root_task_id or task.task_id, patch_artifact)
                 task.finish_attempt(attempt, result={"output": output}, token_usage=usage if isinstance(usage, dict) else {})
                 _persist_task(task)
             trace_recorder.finish_span(task.task_id, span_id, "success")
@@ -1293,6 +1647,7 @@ async def _run_task_with_policy(task: TaskSpec) -> tuple[bool, str]:
             last_error = str(e)
             if task_attempt.completed_at is None:
                 task.finish_attempt(task_attempt, failure_reason=last_error)
+            _record_recovery_context(task, task_attempt, last_error)
             trace_recorder.increment_retry(task.task_id)
             _record_trace_event(task, "task.retry_or_reclaim", {"error": last_error, "attempt": attempt})
             _isolate_failed_worker(task.agent_name, task.task_id, last_error)
@@ -1344,6 +1699,7 @@ async def _run_task_with_policy(task: TaskSpec) -> tuple[bool, str]:
                 last_error = str(e)
                 if fallback_attempt.completed_at is None:
                     task.finish_attempt(fallback_attempt, failure_reason=last_error)
+                _record_recovery_context(task, fallback_attempt, last_error)
                 _isolate_failed_worker(fallback_agent_name, task.task_id, last_error)
                 await resource_monitor.reclaim_async(task.task_id, reason=last_error)
 
@@ -1388,6 +1744,8 @@ async def _execute_task(task: TaskSpec) -> None:
             scheduler.complete_task(task.task_id)
             _record_trace_event(task, "task.success", {"agent_name": task.agent_name})
             _persist_task(task)
+            if workflow_service is not None:
+                workflow_service.handle_task_success(task)
             logger.info(f"任务 {task.task_id} ✓")
         else:
             task.transition_to(TaskStatus.FAILED, "task.failed")
@@ -1399,6 +1757,8 @@ async def _execute_task(task: TaskSpec) -> None:
             logger.error(f"任务 {task.task_id} ✗: {task.error}")
             task.result = {"role": agent.role if agent else "", "output": f"[错误] {task.error}"}
             _persist_task(task)
+            if workflow_service is not None:
+                workflow_service.handle_task_failure(task)
     except Exception as e:
         task.transition_to(TaskStatus.FAILED, "task.exception")
         task.error = str(e)
@@ -1464,10 +1824,19 @@ async def scheduling_loop():
 
 @app.on_event("startup")
 async def startup():
-    global scheduler_event, global_dispatch_semaphore
+    global scheduler_event, global_dispatch_semaphore, workflow_service
     scheduler_event = asyncio.Event()
     scheduler_event.set()
     global_dispatch_semaphore = asyncio.Semaphore(max(resource_monitor.llm_max_concurrent, 1))
+    workflow_service = WorkflowService(
+        workspace_manager=workspace_manager,
+        tasks=tasks,
+        agents_provider=lambda: agents,
+        enqueue_task=_enqueue_runtime_task,
+        record_trace=_record_trace_event,
+        persist_task=_persist_task,
+        context_manager=context_manager,
+    )
     restored_agent_names: list[str] = []
     try:
         for row in state_store.load_agents():
@@ -1543,6 +1912,23 @@ async def startup():
                     break
             await message_router.ack(agent_name, message_id)
 
+        async def _on_backend_event(agent_name: str, data: dict) -> None:
+            task_id = str(data.get("task_id") or "").strip()
+            attempt_id = str(data.get("attempt_id") or "").strip()
+            task = tasks.get(task_id)
+            if task is None:
+                return
+            attempt = next((item for item in task.attempts if item.attempt_id == attempt_id), None)
+            if data.get("type") == "backend_started" and attempt is not None:
+                attempt.backend_type = str(data.get("backend_type") or attempt.backend_type)
+                if data.get("backend_pid") is not None:
+                    attempt.backend_pid = int(data["backend_pid"])
+                if data.get("backend_session_id"):
+                    attempt.backend_session_id = str(data["backend_session_id"])
+                _persist_task(task)
+            detail = {k: v for k, v in data.items() if k not in {"type"}}
+            _record_trace_event(task, str(data.get("type") or "backend_event"), detail)
+
         uds_server = await start_uds_server(
             uds_path,
             message_router,
@@ -1550,6 +1936,7 @@ async def startup():
             auth_tokens=agent_auth_tokens,
             heartbeat_handler=_on_heartbeat,
             agent_message_ack_handler=_on_agent_message_ack,
+            backend_event_handler=_on_backend_event,
         )
         for agent_name in restored_agent_names:
             _start_worker(agent_name)
