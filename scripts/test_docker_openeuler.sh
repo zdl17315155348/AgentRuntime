@@ -15,7 +15,15 @@ fi
 
 ensure_docker_available
 
-$DOCKER build -t "$IMAGE_TAG" .
+if [ ! -x "$PROJECT_DIR/third_party/codex/codex" ]; then
+  echo "未找到 Codex 二进制: $PROJECT_DIR/third_party/codex/codex"
+  exit 1
+fi
+
+$DOCKER build \
+  -f deploy/Dockerfile.openeuler \
+  -t "$IMAGE_TAG" \
+  .
 
 RUN_ARGS=(--rm)
 if [ -n "${OPENAI_API_KEY:-}" ]; then
