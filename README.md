@@ -67,3 +67,4 @@ bash examples/production_incident_demo/scripts/run_fault.sh
 - [x] P1-6/P1-7 openEuler 脚本和 Preflight：`start_agentd_docker.sh` 与 `test_docker_openeuler.sh` 显式使用 `deploy/Dockerfile.openeuler`，key 仅通过环境变量传入，挂载 runtime config、workspace、artifact、state、log 目录，支持 `AGENTD_ENABLE_FAULT_INJECTION`，preflight 检查 Codex/DeepSeek 真实模式、agentd/dashboard 和目录写权限。
 - [x] P0-4 integration 顺序稳定性：`test_worker_fallback` 在需要时自启隔离状态库的 mock agentd，避免完整 `testing/integration` 顺序运行时连接竞争；依据：openEuler 容器内 `python3 -m pytest testing/integration -q` 为 `7 passed`。
 - [x] P1-7 Preflight 错误可观测性：外部命令超时返回明确 `FAIL timeout after Ns`，不再 traceback。
+- [x] P1-7 Preflight 仓库导入路径：脚本启动时加入仓库根目录到 `sys.path`，确保 openEuler 容器任意工作目录下都能导入 `aruntime`。
