@@ -6,6 +6,7 @@ from applications.incident_repair.config import ExecutionMode, IncidentRunConfig
 from applications.incident_repair.execution.base import AgentExecutionRequest, AgentExecutionResult, ExecutionMetrics
 from applications.incident_repair.execution.direct import DirectExecutionProvider
 from applications.incident_repair.execution.factory import create_execution_provider
+from applications.incident_repair.execution.runtime import RuntimeSystemError
 
 
 def _config(mode: ExecutionMode = ExecutionMode.DIRECT) -> IncidentRunConfig:
@@ -142,6 +143,26 @@ async def test_runtime_provider_reuses_client_and_maps_request_fields():
     assert client.submitted["task_input"]["graph_managed"] is True
 
 
+@pytest.mark.anyio
+async def test_runtime_provider_parses_direct_tool_json_output():
+    class _DirectToolJsonClient(_FakeClient):
+        def wait_task(self, task_id, timeout_s):
+            return {
+                "task_id": task_id,
+                "status": "SUCCESS",
+                "result": {"output": '{"returncode": 1, "passed": 0, "failed": 1, "failed_tests": [{"name": "t::fail", "message": "boom"}], "report_artifact_id": null}'},
+                "attempts": [{"attempt_id": "a1"}],
+                "scheduler": {},
+            }
+
+    provider = create_execution_provider(_config(ExecutionMode.RUNTIME), {"client": _DirectToolJsonClient()})
+    result = await provider.execute(_request("direct_tool", "tester"))
+
+    assert result.status == "SUCCESS"
+    assert result.structured_result["returncode"] == 1
+    assert result.structured_result["failed_tests"][0]["name"] == "t::fail"
+
+
 class _PlannerClient(_FakeClient):
     def wait_task(self, task_id, timeout_s):
         return {
@@ -165,13 +186,111 @@ async def test_runtime_provider_returns_planner_plan_without_runtime_dag_materia
 
 
 @pytest.mark.anyio
+async def test_runtime_provider_parses_codex_coder_json_output():
+    class _CodexCoderClient(_FakeClient):
+        def wait_task(self, task_id, timeout_s):
+            return {
+                "task_id": task_id,
+                "status": "SUCCESS",
+                "result": {"output": '{"completed": true, "summary": "fixed", "tests_run": ["pytest"], "remaining_issues": []}'},
+                "attempts": [{"attempt_id": "a1"}],
+                "scheduler": {},
+            }
+
+    provider = create_execution_provider(_config(ExecutionMode.RUNTIME), {"client": _CodexCoderClient()})
+    result = await provider.execute(_request("codex_cli", "coder"))
+
+    assert result.structured_result == {
+        "completed": True,
+        "summary": "fixed",
+        "tests_run": ["pytest"],
+        "remaining_issues": [],
+    }
+
+
+@pytest.mark.anyio
+async def test_runtime_provider_parses_codex_repair_json_output():
+    class _CodexRepairClient(_FakeClient):
+        def wait_task(self, task_id, timeout_s):
+            return {
+                "task_id": task_id,
+                "status": "SUCCESS",
+                "result": {"output": {"completed": True, "summary": "repaired", "tests_run": [], "remaining_issues": ["needs review"]}},
+                "attempts": [{"attempt_id": "a1"}],
+                "scheduler": {},
+            }
+
+    provider = create_execution_provider(_config(ExecutionMode.RUNTIME), {"client": _CodexRepairClient()})
+    result = await provider.execute(_request("codex_cli", "repair"))
+
+    assert result.structured_result["completed"] is True
+    assert result.structured_result["remaining_issues"] == ["needs review"]
+
+
+@pytest.mark.anyio
+async def test_runtime_provider_parses_reviewer_approved_from_structured_output_not_exit_code():
+    class _ReviewerClient(_FakeClient):
+        def wait_task(self, task_id, timeout_s):
+            return {
+                "task_id": task_id,
+                "status": "SUCCESS",
+                "result": {
+                    "output": '{"approved": false, "requirements_covered": ["tests"], "issues": ["missing edge"], "summary": "reject", "artifact_id": "review1"}',
+                    "exit_code": 0,
+                },
+                "attempts": [{"attempt_id": "a1"}],
+                "scheduler": {},
+            }
+
+    provider = create_execution_provider(_config(ExecutionMode.RUNTIME), {"client": _ReviewerClient()})
+    result = await provider.execute(_request("codex_cli", "reviewer"))
+
+    assert result.status == "SUCCESS"
+    assert result.structured_result["approved"] is False
+    assert result.structured_result["issues"] == ["missing edge"]
+
+
+@pytest.mark.anyio
+async def test_runtime_provider_fails_invalid_codex_json():
+    class _InvalidJsonClient(_FakeClient):
+        def wait_task(self, task_id, timeout_s):
+            return {
+                "task_id": task_id,
+                "status": "SUCCESS",
+                "result": {"output": "{not-json"},
+                "attempts": [{"attempt_id": "a1"}],
+                "scheduler": {},
+            }
+
+    provider = create_execution_provider(_config(ExecutionMode.RUNTIME), {"client": _InvalidJsonClient()})
+    with pytest.raises(RuntimeSystemError, match="invalid structured output"):
+        await provider.execute(_request("codex_cli", "coder"))
+
+
+@pytest.mark.anyio
+async def test_runtime_provider_fails_empty_codex_output():
+    class _EmptyOutputClient(_FakeClient):
+        def wait_task(self, task_id, timeout_s):
+            return {
+                "task_id": task_id,
+                "status": "SUCCESS",
+                "result": {"output": ""},
+                "attempts": [{"attempt_id": "a1"}],
+                "scheduler": {},
+            }
+
+    provider = create_execution_provider(_config(ExecutionMode.RUNTIME), {"client": _EmptyOutputClient()})
+    with pytest.raises(RuntimeSystemError, match="empty structured output"):
+        await provider.execute(_request("codex_cli", "coder"))
+
+
+@pytest.mark.anyio
 async def test_runtime_provider_keeps_direct_tool_business_result_without_forcing_success():
     class _FailingClient(_FakeClient):
         def wait_task(self, task_id, timeout_s):
             return {
                 "task_id": task_id,
-                "status": "FAILED",
-                "error": "pytest failed",
+                "status": "SUCCESS",
                 "result": {"output": {"returncode": 1, "passed": 0, "failed": 1, "failed_tests": [{"name": "t::fail", "message": "boom"}], "report_artifact_id": None}},
                 "attempts": [{"attempt_id": "a1"}],
                 "scheduler": {"queue_wait_ms": 3},
@@ -180,5 +299,68 @@ async def test_runtime_provider_keeps_direct_tool_business_result_without_forcin
     provider = create_execution_provider(_config(ExecutionMode.RUNTIME), {"client": _FailingClient()})
     result = await provider.execute(_request("direct_tool", "tester"))
 
-    assert result.status == "FAILED"
+    assert result.status == "SUCCESS"
     assert result.structured_result["returncode"] == 1
+
+
+@pytest.mark.anyio
+async def test_runtime_provider_marks_worker_crash_as_failed_system_state():
+    class _CrashClient(_FakeClient):
+        def wait_task(self, task_id, timeout_s):
+            return {
+                "task_id": task_id,
+                "status": "FAILED",
+                "error": "worker.lost",
+                "result": {"output": ""},
+                "attempts": [{"attempt_id": "a1"}],
+                "scheduler": {},
+            }
+
+    provider = create_execution_provider(_config(ExecutionMode.RUNTIME), {"client": _CrashClient()})
+    result = await provider.execute(_request("direct_tool", "tester"))
+
+    assert result.status == "FAILED"
+    assert result.error_message == "worker.lost"
+    assert result.structured_result == {}
+
+
+@pytest.mark.anyio
+async def test_runtime_provider_marks_pytest_timeout_as_timeout_system_state():
+    class _TimeoutClient(_FakeClient):
+        def wait_task(self, task_id, timeout_s):
+            return {
+                "task_id": task_id,
+                "status": "TIMEOUT",
+                "error": "task timeout",
+                "result": {"output": ""},
+                "attempts": [{"attempt_id": "a1"}],
+                "scheduler": {},
+            }
+
+    provider = create_execution_provider(_config(ExecutionMode.RUNTIME), {"client": _TimeoutClient()})
+    result = await provider.execute(_request("direct_tool", "tester"))
+
+    assert result.status == "TIMEOUT"
+    assert result.error_message == "task timeout"
+    assert result.structured_result == {}
+
+
+@pytest.mark.anyio
+async def test_runtime_provider_reports_missing_tool_as_system_error():
+    class _MissingToolClient(_FakeClient):
+        def wait_task(self, task_id, timeout_s):
+            return {
+                "task_id": task_id,
+                "status": "FAILED",
+                "error": "tool 'pytest' is not allowed for agent 'tester'",
+                "result": {"output": ""},
+                "attempts": [{"attempt_id": "a1"}],
+                "scheduler": {},
+            }
+
+    provider = create_execution_provider(_config(ExecutionMode.RUNTIME), {"client": _MissingToolClient()})
+    result = await provider.execute(_request("direct_tool", "tester"))
+
+    assert result.status == "FAILED"
+    assert "tool 'pytest' is not allowed" in (result.error_message or "")
+    assert result.structured_result == {}

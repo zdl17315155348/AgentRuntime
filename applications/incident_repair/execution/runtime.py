@@ -9,6 +9,7 @@ from aruntime.api.client import AgentRuntimeClient
 from applications.incident_repair.config import IncidentRunConfig
 from applications.incident_repair.execution.base import AgentExecutionRequest, AgentExecutionResult, ExecutionProvider
 from applications.incident_repair.execution.instrumentation import ExecutionTimer
+from applications.incident_repair.schemas import CoderResultModel, ReviewSummaryModel, TestSummaryModel
 
 
 class RuntimeSystemError(Exception):
@@ -90,10 +91,10 @@ class AgentRuntimeExecutionProvider(ExecutionProvider):
         if status not in ("SUCCESS", "FAILED", "TIMEOUT", "CANCELLED"):
             status = "FAILED"
             raise RuntimeSystemError(f"unexpected runtime task status: {task.get('status')}")
-        if request.backend == "direct_tool":
-            structured = result.get("output") if isinstance(result, dict) and isinstance(result.get("output"), dict) else result if isinstance(result, dict) else {}
-        else:
+        if status == "SUCCESS" or self._result_has_output(result):
             structured = self._structured_result_for_backend(request, result)
+        else:
+            structured = {}
         patch_ref = None
         artifact_refs: list[str] = []
         artifacts = result.get("artifacts") if isinstance(result, dict) else None
@@ -127,17 +128,53 @@ class AgentRuntimeExecutionProvider(ExecutionProvider):
         )
 
     def _structured_result_for_backend(self, request: AgentExecutionRequest, result: dict[str, Any]) -> dict[str, Any]:
+        payload = self._json_payload(result)
+        if not payload:
+            raise RuntimeSystemError(f"empty structured output from {request.backend}")
+
         if request.backend == "deepseek":
-            output = result.get("output") if isinstance(result, dict) else ""
-            if isinstance(output, str):
-                try:
-                    payload = json.loads(output)
-                    plan = payload.get("plan")
-                    if isinstance(plan, dict):
-                        return plan
-                except json.JSONDecodeError:
-                    return result
-        return result if isinstance(result, dict) else {}
+            plan = payload.get("plan")
+            return plan if isinstance(plan, dict) else payload
+
+        if request.backend == "codex_cli":
+            if request.role in ("coder", "repair"):
+                return CoderResultModel.model_validate(payload).model_dump()
+            if request.role == "reviewer":
+                return ReviewSummaryModel.model_validate(payload).model_dump()
+            return payload
+
+        if request.backend == "direct_tool":
+            return TestSummaryModel.model_validate(payload).model_dump()
+
+        return payload
+
+    def _json_payload(self, result: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(result, dict):
+            raise RuntimeSystemError("invalid runtime result envelope")
+        output = result.get("output")
+        if isinstance(output, dict):
+            return output
+        if isinstance(output, str):
+            if not output.strip():
+                return {}
+            try:
+                payload = json.loads(output)
+            except json.JSONDecodeError as exc:
+                raise RuntimeSystemError(f"invalid structured output: {exc}") from exc
+            if not isinstance(payload, dict):
+                raise RuntimeSystemError("structured output must be a JSON object")
+            return payload
+        return {}
+
+    def _result_has_output(self, result: dict[str, Any]) -> bool:
+        if not isinstance(result, dict):
+            return False
+        output = result.get("output")
+        if isinstance(output, dict):
+            return bool(output)
+        if isinstance(output, str):
+            return bool(output.strip())
+        return False
 
     def _agent_for_role(self, role: str) -> str | None:
         return {"planner": "architect", "coder": None, "repair": "repair", "tester": "tester", "reviewer": "reviewer", "integrator": None}.get(role)
