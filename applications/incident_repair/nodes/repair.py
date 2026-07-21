@@ -8,6 +8,7 @@ from applications.incident_repair.routing import build_idempotency_key
 async def repair_node(state: dict, runtime):
     context = context_from_runtime(runtime)
     repair_round = int(state.get("repair_round", 0)) + 1
+    timeout_s = int(context.run_config.task_timeout_s)
     request = AgentExecutionRequest(
         run_id=state["run_id"],
         thread_id=state["thread_id"],
@@ -20,7 +21,7 @@ async def repair_node(state: dict, runtime):
         task_input={"test_summary": state.get("test_summary"), "patch_refs": state.get("patch_refs", [])},
         source_repo=state["source_repo"],
         base_commit=state.get("integrated_commit") or state["base_commit"],
-        timeout_s=300,
+        timeout_s=timeout_s,
         idempotency_key=build_idempotency_key(state["thread_id"], "repair", 10 + repair_round, "root"),
         resource_request={"cpu_cores": 1, "memory_mb": 1024, "llm_slots": 1},
     )

@@ -15,6 +15,10 @@ ARTIFACT_DIR="${ARTIFACT_DIR:-$RUN_DATA_DIR/artifacts}"
 WORKSPACE_DIR="${WORKSPACE_DIR:-$RUN_DATA_DIR/workspaces}"
 STATE_DIR="${STATE_DIR:-$RUN_DATA_DIR/state}"
 LOG_DIR="${LOG_DIR:-$RUN_DATA_DIR/logs}"
+CODEX_HOME_MOUNT=()
+if [ -f "${CODEX_HOME:-$HOME/.codex}/config.toml" ]; then
+  CODEX_HOME_MOUNT=(-v "${CODEX_HOME:-$HOME/.codex}/config.toml:/root/.codex/config.toml:ro")
+fi
 
 ensure_docker_available
 
@@ -57,5 +61,6 @@ for key in DEEPSEEK_API_KEY LLM_API_KEY OPENAI_API_KEY CODEX_API_KEY AGENTD_ENAB
 done
 
 $DOCKER run \
+  "${CODEX_HOME_MOUNT[@]}" \
   "${RUN_ARGS[@]}" \
   "$IMAGE_TAG"

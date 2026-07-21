@@ -2062,6 +2062,11 @@ async def metrics():
     llm_metrics = _llm_metrics()
     result["context"] = context_metrics
     result["llm"] = llm_metrics
+    result["runtime_config"] = {
+        "config_path": CONFIG_PATH,
+        "llm_backend": llm_gateway.backend,
+        "llm_api_key_present": bool(llm_gateway.api_key),
+    }
     result["experiments"] = {
         "token_saving_ratio": context_metrics["token_saving_ratio"],
         "context_build_time_ms": context_metrics["context_build_time_ms"],

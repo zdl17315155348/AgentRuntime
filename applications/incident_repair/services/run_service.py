@@ -49,7 +49,10 @@ class IncidentRunService:
             "runtime_task_ids": [],
             "execution_records": [],
             "event_count": 0,
+            "completed_coder_task_ids": [],
             "active_coder_task": None,
+            "coder_step": 0,
+            "coder_integration_history": [],
         }
         self.store.write_json(config.run_id, "run_config.json", config.model_dump(mode="json"))
         self.store.write_environment(config.run_id, config.source_repo)

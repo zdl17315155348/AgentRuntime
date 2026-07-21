@@ -10,7 +10,7 @@ def verify_password(username: str, password: str):
     if user is None:
         return None
     if user.password != password:
-        return None
+        raise ValueError("bad password")
     return user
 
 
@@ -21,6 +21,4 @@ def create_token(user_id: int, ttl_seconds: int = 3600) -> str:
 
 def decode_token(token: str):
     payload = json.loads(base64.urlsafe_b64decode(token.encode()).decode())
-    if int(payload.get("exp", 0)) < int(time.time()):
-        raise ValueError("token expired")
     return int(payload["sub"])

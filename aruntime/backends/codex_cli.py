@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shutil
 import signal
 from pathlib import Path
 from typing import Any
@@ -29,11 +30,11 @@ class CodexCLIBackend(AgentBackend):
         prompt = self._build_prompt(request)
         command = [
             self.config.executable,
-            "--sandbox",
-            self.config.sandbox,
             "--ask-for-approval",
             self.config.approval_policy,
             "exec",
+            "--sandbox",
+            self.config.sandbox,
         ]
         if self.config.ephemeral:
             command.append("--ephemeral")
@@ -46,10 +47,29 @@ class CodexCLIBackend(AgentBackend):
 
     async def execute(self, request: BackendExecutionRequest, emit_event: EmitEvent) -> BackendExecutionResult:
         command = self.build_command(request)
+        attempts = max(1, int(os.getenv("CODEX_EXEC_RETRIES", "2")))
+        last: BackendExecutionResult | None = None
+        for attempt in range(attempts):
+            final_path = self._final_json_path(request)
+            try:
+                final_path.unlink()
+            except FileNotFoundError:
+                pass
+            result = await self._execute_once(request, emit_event, command)
+            last = result
+            if result.status == "SUCCESS" or not self._is_retryable_failure(result):
+                return result
+            if attempt + 1 < attempts:
+                await emit_event({"name": "backend.retry", "backend_type": AgentBackendType.CODEX_CLI.value, "reason": result.error or "retryable codex failure", "attempt": attempt + 1})
+                await asyncio.sleep(2 * (attempt + 1))
+        return last or BackendExecutionResult(status="FAILED", error="codex retry failed", backend_type=AgentBackendType.CODEX_CLI.value)
+
+    async def _execute_once(self, request: BackendExecutionRequest, emit_event: EmitEvent, command: list[str]) -> BackendExecutionResult:
         env = os.environ.copy()
         api_key = os.getenv("CODEX_API_KEY") or os.getenv("OPENAI_API_KEY")
         if api_key:
             env["CODEX_API_KEY"] = api_key
+        env["CODEX_HOME"] = str(self._prepare_codex_home(request))
         process = await asyncio.create_subprocess_exec(
             *command,
             stdin=asyncio.subprocess.DEVNULL,
@@ -101,6 +121,10 @@ class CodexCLIBackend(AgentBackend):
             artifacts=artifacts,
         )
 
+    def _is_retryable_failure(self, result: BackendExecutionResult) -> bool:
+        text = f"{result.output or ''}\n{result.error or ''}"
+        return "stream disconnected before completion" in text or "Upstream request failed" in text
+
     async def cancel(self, attempt_id: str) -> None:
         process = self._processes.get(attempt_id)
         if process is not None:
@@ -123,6 +147,16 @@ class CodexCLIBackend(AgentBackend):
 
     def _final_json_path(self, request: BackendExecutionRequest) -> Path:
         return self.artifact_store.attempt_dir(request.task_id, request.attempt_id) / "final.json"
+
+    def _prepare_codex_home(self, request: BackendExecutionRequest) -> Path:
+        target = self.artifact_store.attempt_dir(request.task_id, request.attempt_id) / "codex-home"
+        target.mkdir(parents=True, exist_ok=True)
+        source_home = Path(os.getenv("CODEX_HOME", str(Path.home() / ".codex")))
+        source_config = source_home / "config.toml"
+        target_config = target / "config.toml"
+        if source_config.exists() and not target_config.exists():
+            shutil.copyfile(source_config, target_config)
+        return target
 
     def _schema_path(self, raw_path: str) -> str:
         path = Path(raw_path)

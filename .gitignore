@@ -147,6 +147,7 @@ cython_debug/
 .codex-local/
 third_party/codex/
 .runtime-docker/
+final-evidence/
 run-data/
 benchmark/results/
 examples/production_incident_demo/output/

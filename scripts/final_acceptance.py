@@ -28,7 +28,7 @@ def main() -> int:
     args = parser.parse_args()
 
     ok = True
-    ok &= run("py_compile acceptance scripts", ["python3", "-m", "py_compile", "scripts/preflight_openeuler.py", "scripts/run_real_direct.py", "scripts/run_real_runtime.py"])
+    ok &= run("py_compile acceptance scripts", ["python3", "-m", "py_compile", "scripts/preflight_openeuler.py", "scripts/prepare_e2e_repo.py", "scripts/run_real_direct.py", "scripts/run_real_runtime.py"])
     ok &= run("application tests", ["python3", "-m", "pytest", "testing/unittest/applications", "-q"])
     ok &= run("benchmark smoke test", ["python3", "-m", "pytest", "testing/perf/test_benchmark.py", "-q"])
     ok &= run("preflight", ["python3", "scripts/preflight_openeuler.py"] + (["--require-real"] if args.require_real else []), required=args.require_real)

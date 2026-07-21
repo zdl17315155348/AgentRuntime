@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agent-runtime-os"
-version = "0.1.59"
-description = "面向多智能体的操作系统级执行时（Agent Runtime），支持 AgentCapability、异构 Backend 选择验证、Codex 结构化结果校验、openEuler Codex/bubblewrap privileged 沙箱、LangGraph 双执行模式、Planner 动态 DAG、Attempt 级 worktree/artifact、Run Dashboard、统一资源管理、可靠通信、受控工具执行、fallback、Demo pytest 门禁与 benchmark"
+version = "0.1.82"
+description = "面向多智能体的操作系统级执行时（Agent Runtime），支持 AgentCapability、异构 Backend 选择验证、Codex 结构化结果校验、openEuler Codex/bubblewrap privileged 沙箱、Codex attempt 级 CODEX_HOME 隔离、Direct Codex Pydantic 结构化校验、Codex CLI 非交互 exec 参数顺序、Codex artifact CODEX_HOME 预创建、Planner/Coder 失败态可观测记录、Runtime 真实后端校验、Codex 上游流断开重试、真实 E2E 并发可配置、真实 E2E 任务超时可配置、真实 E2E 挂载仓库 safe.directory 处理、preflight 非交互 Codex 探针、openEuler agentd Codex config 挂载、Direct 真实入口 Codex config 早失败、最终封板证据深度核验、证据密钥扫描排除 Codex 私有运行目录、Patch artifact 过滤 Codex 私有文件、Direct 输出隔离到 artifact 目录、运行证据忽略规则、镜像上下文排除运行证据、LangGraph 双执行模式、Planner 动态 DAG、Coder 拓扑串行执行、E2E 干净工作区准备、Runtime Fault 真实 E2E 入口、Benchmark 交错配对与公平性校验、正式 Benchmark 干净工作区门禁、统一 manifest 输出、Attempt 级 worktree/artifact、Run Dashboard、统一资源管理、可靠通信、受控工具执行、fallback、Demo pytest 门禁与 benchmark"
 requires-python = ">=3.10"
 dependencies = [
     "httpx>=0.27.0",

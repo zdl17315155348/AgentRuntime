@@ -19,8 +19,12 @@ class BenchmarkConfig(BaseModel):
     base_commit: str
     prompt_hash: str
     graph_version: str
+    release_commit: str = ""
+    codex_version: str = ""
+    task_description_hash: str = ""
     data_kind: str = "real_agent"
     performance_claim_allowed: bool = True
+    performance_claim_reason: str = ""
 
 
 class RunMetric(BaseModel):
@@ -29,12 +33,25 @@ class RunMetric(BaseModel):
     mode: str
     concurrency: int
     measured: bool
+    pair_id: str = ""
+    pair_index: int = -1
     success: bool
     total_ms: float
     queue_wait_ms: float = 0
     backend_ms: float = 0
     peak_rss_mb: float = 0
     error: str = ""
+    base_commit: str = ""
+    prompt_hash: str = ""
+    graph_version: str = ""
+    deepseek_model: str = ""
+    codex_model: str = ""
+    codex_version: str = ""
+    cpu_limit: float | None = None
+    memory_limit_mb: int | None = None
+    task_description_hash: str = ""
+    fault_mode: bool = False
+    release_commit: str = ""
 
 
 class WorkflowMetric(BaseModel):
@@ -45,12 +62,25 @@ class WorkflowMetric(BaseModel):
     mode: str
     concurrency: int
     measured: bool
+    pair_id: str = ""
+    pair_index: int = -1
     latency_ms: float
     success: bool
     queue_wait_ms: float = 0
     backend_ms: float = 0
     peak_rss_mb: float = 0
     error: str = ""
+    base_commit: str = ""
+    prompt_hash: str = ""
+    graph_version: str = ""
+    deepseek_model: str = ""
+    codex_model: str = ""
+    codex_version: str = ""
+    cpu_limit: float | None = None
+    memory_limit_mb: int | None = None
+    task_description_hash: str = ""
+    fault_mode: bool = False
+    release_commit: str = ""
 
 
 class TrialMetric(BaseModel):
@@ -59,6 +89,8 @@ class TrialMetric(BaseModel):
     mode: str
     concurrency: int
     measured: bool
+    pair_id: str = ""
+    pair_index: int = -1
     batch_makespan_ms: float
     throughput_per_min: float
     success_count: int
@@ -68,6 +100,7 @@ class TrialMetric(BaseModel):
 
 class PairedRun(BaseModel):
     pair_id: str
+    pair_index: int = -1
     direct_run_id: str
     runtime_run_id: str
     comparable: bool

@@ -61,14 +61,43 @@ class WorkspaceManager:
         if not workspace.workspace_path or not workspace.base_commit:
             return None
         worktree = Path(workspace.workspace_path).resolve()
+        ignored = tuple(exclude_globs or []) + (
+            "__pycache__/",
+            ".pytest_cache/",
+            ".codex-home/",
+            ".codex-events.jsonl",
+            ".codex-final.json",
+        )
         untracked = self._git(worktree, "ls-files", "--others", "--exclude-standard")
-        ignored = tuple(exclude_globs or ["__pycache__/", ".pytest_cache/"])
         new_files = [line.strip() for line in untracked.splitlines() if line.strip() and not _ignored(line.strip(), ignored)]
         if new_files:
             self._git(worktree, "add", "-N", *new_files)
-        diff_args = ["diff", "--binary", workspace.base_commit, "--", ".", ":(exclude)**/__pycache__/**", ":(exclude).pytest_cache/**"]
+        diff_args = [
+            "diff",
+            "--binary",
+            workspace.base_commit,
+            "--",
+            ".",
+            ":(exclude)**/__pycache__/**",
+            ":(exclude).pytest_cache/**",
+            ":(exclude).codex-home/**",
+            ":(exclude).codex-events.jsonl",
+            ":(exclude).codex-final.json",
+        ]
         patch = self._git(worktree, *diff_args)
-        changed = self._git(worktree, "diff", "--name-only", workspace.base_commit, "--", ".", ":(exclude)**/__pycache__/**", ":(exclude).pytest_cache/**")
+        changed = self._git(
+            worktree,
+            "diff",
+            "--name-only",
+            workspace.base_commit,
+            "--",
+            ".",
+            ":(exclude)**/__pycache__/**",
+            ":(exclude).pytest_cache/**",
+            ":(exclude).codex-home/**",
+            ":(exclude).codex-events.jsonl",
+            ":(exclude).codex-final.json",
+        )
         changed_files = [line.strip() for line in changed.splitlines() if line.strip()]
         if not patch:
             return None

@@ -85,4 +85,7 @@ class IncidentRepairState(TypedDict):
     runtime_task_ids: Annotated[list[str], operator.add]
     execution_records: Annotated[list[ExecutionRecord], operator.add]
     event_count: int
+    completed_coder_task_ids: list[str]
     active_coder_task: PlannedTask | None
+    coder_step: int
+    coder_integration_history: Annotated[list[dict[str, Any]], operator.add]

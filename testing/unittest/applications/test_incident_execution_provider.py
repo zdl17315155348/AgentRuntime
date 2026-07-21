@@ -99,6 +99,29 @@ async def test_direct_provider_returns_common_result_shape_for_planner():
     assert result.metrics.total_ms >= 0
 
 
+@pytest.mark.anyio
+async def test_direct_codex_provider_uses_pydantic_validation_without_cli_schema():
+    captured = {}
+
+    class _WorkspaceManager:
+        def create_attempt_workspace(self, source_repo, task_id, attempt_id, base_ref, read_only, root_task_id=None):
+            return type("W", (), {"workspace_path": "/tmp/workspace"})()
+
+        def create_patch_artifact(self, workspace, task_id, attempt_id, root_task_id=None):
+            return None
+
+    class _Codex:
+        async def execute(self, *args, **kwargs):
+            captured.update(kwargs)
+            return 0, "", "", 123
+
+    provider = DirectExecutionProvider(_config(), {"workspace_manager": _WorkspaceManager(), "codex": _Codex()})
+    result = await provider.execute(_request("codex_cli", "coder"))
+
+    assert "output_schema" not in captured or captured["output_schema"] is None
+    assert result.status == "SUCCESS"
+
+
 def test_provider_factory_switches_modes():
     assert create_execution_provider(_config(ExecutionMode.DIRECT)).mode == "direct"
     assert create_execution_provider(_config(ExecutionMode.REPLAY)).mode == "replay"

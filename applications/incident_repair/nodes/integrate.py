@@ -3,7 +3,7 @@ from __future__ import annotations
 from applications.incident_repair.nodes.common import context_from_runtime
 
 
-async def integrate_node(state: dict, runtime):
+async def _integrate_pending_patches(state: dict, runtime):
     context = context_from_runtime(runtime)
     patch_refs = state.get("pending_patch_refs") or []
     if not patch_refs:
@@ -33,3 +33,7 @@ async def integrate_node(state: dict, runtime):
         "integration_result": integration_result,
         "pending_patch_refs": [],
     }
+
+
+async def integrate_node(state: dict, runtime):
+    return await _integrate_pending_patches(state, runtime)

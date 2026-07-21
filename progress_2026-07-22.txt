@@ -1,0 +1,54 @@
+Date: 2026-07-22
+
+Completed code work:
+- P0/P1 runtime and openEuler fixes are present in the worktree.
+- openEuler image build verifies bundled Codex (`codex-cli 0.142.5`) and bubblewrap.
+- Direct/Runtime Codex use attempt-scoped CODEX_HOME.
+- Direct real E2E reaches planner, coder, integration, tester, and repair nodes.
+- `final_board_check.py` tolerates unreadable Codex-private files and excludes `.codex-home` from secret scanning.
+- Patch generation excludes `.codex-home`, `.codex-events.jsonl`, and `.codex-final.json`.
+- Direct Codex now supports artifact-scoped `CODEX_HOME`, final output, and JSONL events, so future Codex-private files do not enter the code worktree.
+- The latest rerun was interrupted before finishing, so the new artifact-scoped Direct output path still needs a fresh openEuler E2E confirmation.
+
+Latest real E2E evidence:
+- Latest completed run: `direct_real_078e293f1624`
+- Summary: `run-data/live/direct_real_078e293f1624/summary.json`
+- Status: FAILED
+- Failure: patch integration included Codex-private worktree files and then could not apply overlapping coder patches (`app/auth.py`, `app/main.py`, `tests/test_auth.py`).
+- This run used the image before the final artifact-scoped Direct Codex output change.
+- Current rerun state: interrupted before receiving a new run summary.
+
+Latest verified tests:
+- `python3 -m pytest testing/unittest/applications/test_direct_codex.py testing/unittest/applications/test_incident_execution_provider.py -q`
+- Result: `19 passed`
+- `python3 -m pytest testing/unittest/workspace/test_patch_artifact_excludes_codex_home.py testing/unittest/workspace/test_patch_artifact.py -q`
+- Result: `3 passed`
+
+Uncommitted implementation changes relevant to the next run:
+- `applications/incident_repair/direct/codex.py`
+- `applications/incident_repair/execution/direct.py`
+- `aruntime/workspace/manager.py`
+- `testing/unittest/applications/test_direct_codex.py`
+- `testing/unittest/workspace/test_patch_artifact_excludes_codex_home.py`
+- README.md and pyproject.toml were updated for completed items.
+
+Next execution sequence:
+1. Rebuild `agent-runtime-os:openeuler` so the artifact-scoped Direct Codex output code is in the container.
+2. Rerun Direct real E2E with a fresh host-created git demo repository mounted into openEuler.
+3. Inspect patch artifact changed_files. They must not include `.codex-home`, `.codex-events.jsonl`, or `.codex-final.json`.
+4. If Direct integration still fails, address overlapping coder patches by respecting planner dependencies or integrating sequentially from the current integrated commit.
+5. Run Runtime real E2E, then Runtime fault-recovery E2E.
+6. Run Direct and Runtime stability repetitions, then the small-sample and formal benchmarks.
+7. Capture Dashboard, replay, and video evidence; rerun `python3 scripts/final_board_check.py`.
+
+Remaining final-board TODO:
+- Direct real E2E success.
+- Runtime real E2E success.
+- Runtime fault E2E success.
+- Direct and Runtime each succeed in at least 2 consecutive runs.
+- Small-sample real benchmark with complete fields.
+- Reproducible formal benchmark.
+- Dashboard real-data screenshots/logs.
+- Replay manifest and recording evidence.
+- Final evidence directory complete.
+- `python3 scripts/final_board_check.py` reports all PASS.

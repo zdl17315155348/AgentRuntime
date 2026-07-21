@@ -81,7 +81,30 @@ class AgentRuntimeExecutionProvider(ExecutionProvider):
         return self.client.inject_worker_sigkill(agent_name)
 
     async def get_execution_snapshot(self, run_id: str) -> dict[str, Any]:
-        return self.client.get_metrics()
+        raw = self.client.get_metrics()
+        faults = raw.get("faults") if isinstance(raw.get("faults"), dict) else {}
+        resource = raw.get("resource") if isinstance(raw.get("resource"), dict) else {}
+        context = raw.get("context") if isinstance(raw.get("context"), dict) else {}
+        worker_lost = 0
+        fallbacks = 0
+        retries = 0
+        for item in faults.values():
+            if not isinstance(item, dict):
+                continue
+            worker_lost += int(item.get("failure_count") or item.get("worker_lost") or 0)
+            fallbacks += len(item.get("fallback_attempts") or [])
+            retries += int(item.get("restart_count") or 0)
+        return {
+            **raw,
+            "worker_lost": worker_lost,
+            "fallbacks": fallbacks,
+            "retries": retries,
+            "lease_reclaimed": len(resource.get("reclaimed") or []),
+            "recovery_hits": int(context.get("recovery_hits") or context.get("readonly_hits") or 0),
+            "shared_context_hits": int(context.get("shared_hits") or 0),
+            "repeat_file_reads": int(context.get("repeat_file_reads") or 0),
+            "token_saving_ratio": float(context.get("token_saving_ratio") or 0),
+        }
 
     def _convert_result(self, request: AgentExecutionRequest, task: dict[str, Any], timer: ExecutionTimer) -> AgentExecutionResult:
         scheduler = task.get("scheduler") or {}
@@ -91,10 +114,16 @@ class AgentRuntimeExecutionProvider(ExecutionProvider):
         if status not in ("SUCCESS", "FAILED", "TIMEOUT", "CANCELLED"):
             status = "FAILED"
             raise RuntimeSystemError(f"unexpected runtime task status: {task.get('status')}")
+        structured = {}
+        parse_error: str | None = None
         if status == "SUCCESS" or self._result_has_output(result):
-            structured = self._structured_result_for_backend(request, result)
-        else:
-            structured = {}
+            try:
+                structured = self._structured_result_for_backend(request, result)
+            except Exception as exc:
+                if request.backend != "deepseek":
+                    raise
+                parse_error = str(exc)
+                status = "FAILED"
         patch_ref = None
         artifact_refs: list[str] = []
         artifacts = result.get("artifacts") if isinstance(result, dict) else None
@@ -118,7 +147,7 @@ class AgentRuntimeExecutionProvider(ExecutionProvider):
         return AgentExecutionResult(
             status=status,  # type: ignore[arg-type]
             output=str(result.get("output") if isinstance(result, dict) else result or ""),
-            error_message=task.get("error") or None,
+            error_message=parse_error or task.get("error") or None,
             runtime_task_id=str(task.get("task_id") or ""),
             attempt_ids=[str(attempt.get("attempt_id")) for attempt in attempts if isinstance(attempt, dict)],
             artifact_refs=[ref for ref in artifact_refs if ref],
@@ -160,7 +189,8 @@ class AgentRuntimeExecutionProvider(ExecutionProvider):
             try:
                 payload = json.loads(output)
             except json.JSONDecodeError as exc:
-                raise RuntimeSystemError(f"invalid structured output: {exc}") from exc
+                excerpt = output.strip().replace("\n", "\\n")[:200]
+                raise RuntimeSystemError(f"invalid structured output: {exc}; output_prefix={excerpt!r}") from exc
             if not isinstance(payload, dict):
                 raise RuntimeSystemError("structured output must be a JSON object")
             return payload

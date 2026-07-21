@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from applications.incident_repair.config import IncidentRunConfig
-from applications.incident_repair.direct.codex import DirectCodexExecutor, last_agent_message
+from applications.incident_repair.direct.codex import DirectCodexExecutor, _prepare_codex_home, last_agent_message
 from applications.incident_repair.direct.deepseek import DirectDeepSeekExecutor
 from applications.incident_repair.direct.tool import run_pytest_direct
 from applications.incident_repair.direct.workspace import DirectWorkspaceManager
@@ -74,8 +74,16 @@ class DirectExecutionProvider(ExecutionProvider):
                     read_only=request.role == "reviewer",
                     root_task_id=request.run_id,
                 )
-                final_json = str(Path(workspace.workspace_path or request.source_repo) / ".codex-final.json")
-                schema = "configs/schemas/codex_reviewer_result.schema.json" if request.role == "reviewer" else "configs/schemas/codex_coder_result.schema.json"
+                artifact_store = getattr(self.workspace_manager, "artifact_store", None)
+                if artifact_store is None:
+                    artifact_dir = Path(workspace.workspace_path or request.source_repo)
+                else:
+                    artifact_dir = Path(artifact_store.attempt_dir(request.run_id, request.idempotency_key[:16]))
+                artifact_dir.mkdir(parents=True, exist_ok=True)
+                codex_home = artifact_dir / "codex-home"
+                _prepare_codex_home(str(codex_home), as_home=True)
+                final_json = str(artifact_dir / ".codex-final.json")
+                events_jsonl = str(artifact_dir / ".codex-events.jsonl")
                 rc, stdout, stderr, _pid = await self.codex.execute(
                     request.goal,
                     workspace.workspace_path or request.source_repo,
@@ -84,11 +92,11 @@ class DirectExecutionProvider(ExecutionProvider):
                     system_prompt=request.system_prompt,
                     task_input=request.task_input,
                     runtime_context={"context_refs": request.context_refs, "artifact_refs": request.artifact_refs, "base_commit": request.base_commit},
-                    output_schema=schema,
                     output_last_message=final_json,
+                    codex_home=str(codex_home),
                 )
                 if stdout:
-                    Path(workspace.workspace_path or request.source_repo, ".codex-events.jsonl").write_text(stdout, encoding="utf-8")
+                    Path(events_jsonl).write_text(stdout, encoding="utf-8")
                 final_output = Path(final_json).read_text(encoding="utf-8", errors="replace") if Path(final_json).exists() else last_agent_message(stdout)
                 if request.role == "reviewer":
                     try:

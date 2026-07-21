@@ -63,6 +63,7 @@ class RunSummaryAggregator:
             "run_id": config.run_id,
             "execution_mode": config.execution_mode.value,
             "status": final_state.get("workflow_status") or "UNKNOWN",
+            "runtime_task_ids": list(final_state.get("runtime_task_ids") or []),
             "graph": graph,
             "execution": execution,
             "faults": faults,

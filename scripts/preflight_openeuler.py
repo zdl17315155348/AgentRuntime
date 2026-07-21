@@ -23,7 +23,7 @@ def _print(status: str, name: str, detail: str = "") -> None:
 
 def _run(argv: list[str], timeout: int = 15, cwd: str | None = None) -> subprocess.CompletedProcess:
     try:
-        return subprocess.run(argv, cwd=cwd, capture_output=True, text=True, timeout=timeout, check=False)
+        return subprocess.run(argv, cwd=cwd, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=timeout, check=False)
     except subprocess.TimeoutExpired as exc:
         return subprocess.CompletedProcess(argv, 124, stdout=exc.stdout or "", stderr=f"timeout after {timeout}s")
 
@@ -37,6 +37,28 @@ def _check(ok: bool, name: str, detail: str = "", required: bool = True) -> bool
         return False
     _print("SKIP", name, detail)
     return True
+
+
+def inspect_git_state(repo: Path) -> None:
+    safe_git = ["git", "-c", f"safe.directory={repo}"]
+    head = _run([*safe_git, "rev-parse", "HEAD"], cwd=str(repo))
+    status = _run([*safe_git, "status", "--porcelain"], cwd=str(repo))
+
+    if head.returncode == 0:
+        _print("INFO", "Git HEAD", head.stdout.strip()[:12])
+    else:
+        _print("WARN", "Git HEAD", (head.stderr or head.stdout).strip()[-200:])
+
+    if status.returncode != 0:
+        _print("WARN", "Git working tree", (status.stderr or status.stdout).strip()[-200:])
+    elif status.stdout.strip():
+        _print("WARN", "Git working tree", "uncommitted changes present")
+    else:
+        _print("PASS", "Git working tree", "clean")
+
+
+def _codex_config_path() -> Path:
+    return Path(os.getenv("CODEX_HOME", str(Path.home() / ".codex"))) / "config.toml"
 
 
 def main() -> int:
@@ -54,6 +76,8 @@ def main() -> int:
     if git and os.getenv("AGENTD_PREFLIGHT_GIT_VERSION") == "1":
         git_detail = _run(["git", "--version"]).stdout.strip()
     ok &= _check(git is not None, "Git", git_detail if git else "missing")
+    if git:
+        inspect_git_state(ROOT)
     bwrap = shutil.which("bwrap")
     if bwrap:
         bwrap_version = _run(["bwrap", "--version"]).stdout.strip()
@@ -68,6 +92,13 @@ def main() -> int:
     codex_required = args.require_real or os.getenv("ALLOW_MISSING_CODEX") != "1"
     codex_detail = _run(["codex", "--version"]).stdout.strip() if codex else "missing"
     ok &= _check(codex is not None, "Codex", codex_detail, required=codex_required)
+    codex_config = _codex_config_path()
+    ok &= _check(
+        codex_config.exists(),
+        "Codex config",
+        str(codex_config) if codex_config.exists() else f"missing {codex_config}; mount host CODEX_HOME config.toml",
+        required=args.require_real,
+    )
     ok &= _check((ROOT / "examples/production_incident_demo/target_repo").exists(), "target repo", "examples/production_incident_demo/target_repo")
     ok &= _check((ROOT / ".git").exists(), "Git worktree", str(ROOT))
     ok &= _check(_run(["python3", "-m", "pytest", "--version"]).returncode == 0, "pytest")
@@ -111,21 +142,22 @@ def main() -> int:
     cgroup_v2 = Path("/sys/fs/cgroup/cgroup.controllers").exists()
     ok &= _check(cgroup_v2, "cgroup v2", required=False)
 
-    if args.require_real and codex:
+    if args.require_real and codex and codex_config.exists():
+        codex_auth_timeout = int(os.getenv("AGENTD_PREFLIGHT_CODEX_AUTH_TIMEOUT_S", "300"))
         probe = _run(
             [
                 "codex",
-                "--sandbox",
-                "read-only",
                 "--ask-for-approval",
                 "never",
                 "exec",
+                "--sandbox",
+                "read-only",
                 "--ephemeral",
                 "--json",
                 "--skip-git-repo-check",
                 "Return the word OK.",
             ],
-            timeout=120,
+            timeout=codex_auth_timeout,
             cwd="/tmp",
         )
         detail = "exit=0" if probe.returncode == 0 else (probe.stderr or probe.stdout)[-200:].replace("\n", " ")
