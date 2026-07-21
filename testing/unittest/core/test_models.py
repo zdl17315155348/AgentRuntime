@@ -49,6 +49,7 @@ def test_task_attempt_serializes_backend_workspace_fields():
         attempt_id="t:attempt:1",
         agent_name="coder",
         backend_type="codex_cli",
+        backend_pid=12345,
         workspace_path="/tmp/ws",
         base_commit="abc",
     )
@@ -56,6 +57,7 @@ def test_task_attempt_serializes_backend_workspace_fields():
     restored = TaskAttempt(**attempt.model_dump(mode="json"))
 
     assert restored.backend_type == "codex_cli"
+    assert restored.backend_pid == 12345
     assert restored.workspace_path == "/tmp/ws"
 
 
