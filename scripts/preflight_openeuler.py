@@ -20,7 +20,10 @@ def _print(status: str, name: str, detail: str = "") -> None:
 
 
 def _run(argv: list[str], timeout: int = 15, cwd: str | None = None) -> subprocess.CompletedProcess:
-    return subprocess.run(argv, cwd=cwd, capture_output=True, text=True, timeout=timeout, check=False)
+    try:
+        return subprocess.run(argv, cwd=cwd, capture_output=True, text=True, timeout=timeout, check=False)
+    except subprocess.TimeoutExpired as exc:
+        return subprocess.CompletedProcess(argv, 124, stdout=exc.stdout or "", stderr=f"timeout after {timeout}s")
 
 
 def _check(ok: bool, name: str, detail: str = "", required: bool = True) -> bool:

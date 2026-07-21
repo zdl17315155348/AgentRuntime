@@ -66,3 +66,4 @@ bash examples/production_incident_demo/scripts/run_fault.sh
 - [x] P1-5 openEuler 镜像强制 Codex 依赖：`deploy/Dockerfile.openeuler` 使用 `COPY third_party/codex/codex /usr/local/bin/codex`，构建时执行 `chmod`、`test -x`、`codex --version` 并记录 SHA-256 `ac06f492f3ded7a8e2f36dc961e3cc5276a3c4841a2695d4681d0557c5b30e41`；本地二进制依据：`codex-cli 0.142.5`、`ELF 64-bit x86-64`。
 - [x] P1-6/P1-7 openEuler 脚本和 Preflight：`start_agentd_docker.sh` 与 `test_docker_openeuler.sh` 显式使用 `deploy/Dockerfile.openeuler`，key 仅通过环境变量传入，挂载 runtime config、workspace、artifact、state、log 目录，支持 `AGENTD_ENABLE_FAULT_INJECTION`，preflight 检查 Codex/DeepSeek 真实模式、agentd/dashboard 和目录写权限。
 - [x] P0-4 integration 顺序稳定性：`test_worker_fallback` 在需要时自启隔离状态库的 mock agentd，避免完整 `testing/integration` 顺序运行时连接竞争；依据：openEuler 容器内 `python3 -m pytest testing/integration -q` 为 `7 passed`。
+- [x] P1-7 Preflight 错误可观测性：外部命令超时返回明确 `FAIL timeout after Ns`，不再 traceback。
