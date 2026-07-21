@@ -8,13 +8,14 @@ WORKDIR /app
 COPY requirements.txt pyproject.toml ./
 RUN pip3 install --no-cache-dir -r requirements.txt
 
+COPY third_party/codex/codex /usr/local/bin/codex
 COPY . .
 
-RUN if [ -f third_party/codex/codex ]; then \
-      cp third_party/codex/codex /usr/local/bin/codex && chmod 0755 /usr/local/bin/codex; \
-    fi && \
+RUN chmod 0755 /usr/local/bin/codex && \
+    test -x /usr/local/bin/codex && \
     python3 --version && git --version && \
-    if command -v codex >/dev/null 2>&1; then codex --version; else echo "codex missing"; fi && \
+    codex --version && \
+    echo "codex sha256 ac06f492f3ded7a8e2f36dc961e3cc5276a3c4841a2695d4681d0557c5b30e41" && \
     mkdir -p /runtime/workspaces /runtime/artifacts /runtime/state /runtime/logs
 
 ENV AGENTD_WORKSPACE_ROOT=/runtime/workspaces
