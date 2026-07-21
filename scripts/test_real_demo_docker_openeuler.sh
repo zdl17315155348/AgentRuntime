@@ -20,8 +20,12 @@ if [ -f "${CODEX_HOME:-$HOME/.codex}/config.toml" ]; then
   CODEX_HOME_MOUNT=(-v "${CODEX_HOME:-$HOME/.codex}/config.toml:/root/.codex/config.toml:ro")
 fi
 
-$DOCKER build -t "$IMAGE_TAG" .
+$DOCKER build \
+  -f deploy/Dockerfile.openeuler \
+  -t "$IMAGE_TAG" \
+  .
 $DOCKER run --rm \
+  --privileged \
   "${CODEX_HOME_MOUNT[@]}" \
   -e "OPENAI_API_KEY=$OPENAI_API_KEY" \
   -e "CODEX_API_KEY=${CODEX_API_KEY:-$OPENAI_API_KEY}" \

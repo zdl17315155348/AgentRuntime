@@ -50,9 +50,20 @@ def main() -> int:
     ok &= _check(release.exists(), "openEuler", release.read_text(encoding="utf-8", errors="replace").strip() if release.exists() else "not openEuler")
     ok &= _check(sys.version_info >= (3, 10), "Python", sys.version.split()[0])
     git = shutil.which("git")
-    ok &= _check(git is not None, "Git", _run(["git", "--version"]).stdout.strip() if git else "missing")
+    git_detail = "installed"
+    if git and os.getenv("AGENTD_PREFLIGHT_GIT_VERSION") == "1":
+        git_detail = _run(["git", "--version"]).stdout.strip()
+    ok &= _check(git is not None, "Git", git_detail if git else "missing")
     bwrap = shutil.which("bwrap")
-    ok &= _check(bwrap is not None, "bubblewrap", _run(["bwrap", "--version"]).stdout.strip() if bwrap else "missing", required=args.require_real)
+    if bwrap:
+        bwrap_version = _run(["bwrap", "--version"]).stdout.strip()
+        bwrap_probe = _run(["bwrap", "--ro-bind", "/", "/", "true"])
+        bwrap_ok = bwrap_probe.returncode == 0
+        bwrap_detail = bwrap_version if bwrap_ok else (bwrap_probe.stderr or bwrap_probe.stdout).strip()
+    else:
+        bwrap_ok = False
+        bwrap_detail = "missing"
+    ok &= _check(bwrap_ok, "bubblewrap namespace", bwrap_detail, required=args.require_real)
     codex = shutil.which("codex")
     codex_required = args.require_real or os.getenv("ALLOW_MISSING_CODEX") != "1"
     codex_detail = _run(["codex", "--version"]).stdout.strip() if codex else "missing"

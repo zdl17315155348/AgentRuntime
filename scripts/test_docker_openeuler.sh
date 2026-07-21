@@ -25,7 +25,7 @@ $DOCKER build \
   -t "$IMAGE_TAG" \
   .
 
-RUN_ARGS=(--rm)
+RUN_ARGS=(--rm --privileged)
 if [ -n "${OPENAI_API_KEY:-}" ]; then
   RUN_ARGS+=(-e "OPENAI_API_KEY=$OPENAI_API_KEY")
 fi

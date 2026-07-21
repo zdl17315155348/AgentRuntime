@@ -10,9 +10,12 @@ IMAGE_TAG="${IMAGE_TAG:-agent-runtime-os:openeuler}"
 
 ensure_docker_available
 
-$DOCKER build -t "$IMAGE_TAG" .
+$DOCKER build \
+  -f deploy/Dockerfile.openeuler \
+  -t "$IMAGE_TAG" \
+  .
 
-CID="$($DOCKER create "$IMAGE_TAG" bash -lc '
+CID="$($DOCKER create --privileged "$IMAGE_TAG" bash -lc '
 set -euo pipefail
 unset http_proxy https_proxy all_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY
 python3 -m pip install --no-cache-dir -q pytest

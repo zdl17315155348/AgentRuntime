@@ -39,6 +39,7 @@ $DOCKER rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
 
 RUN_ARGS=(
   --rm
+  --privileged
   --name "$CONTAINER_NAME"
   -p "${HOST_PORT}:8234"
   -v "$CONFIG_PATH:/app/configs/runtime.json:ro"

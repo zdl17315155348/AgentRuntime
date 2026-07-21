@@ -70,4 +70,4 @@ bash examples/production_incident_demo/scripts/run_fault.sh
 - [x] P1-7 Preflight 仓库导入路径：脚本启动时加入仓库根目录到 `sys.path`，确保 openEuler 容器任意工作目录下都能导入 `aruntime`。
 - [x] P2-9 Codex 非交互调用：Direct 和 Runtime Codex 子进程显式关闭 stdin，避免真实 CLI 在非 TTY 容器执行时读取额外输入；依据：`python3 -m pytest testing/unittest/backends/test_codex_command.py testing/unittest/backends/test_codex_timeout.py testing/unittest/backends/test_codex_file_change.py -q`。
 - [x] P2-9 Codex 真实对话确认：openEuler 容器内 `read-only` 最小对话返回 `thread.started`、`turn.completed`、`agent_message` 和 `final.json`，说明认证与对话正常。
-- [x] P1-7 Codex 写入沙箱依赖：openEuler 容器内 `workspace-write` 写文件探测失败原因为 `sandbox requires bubblewrap but bwrap is unavailable`，镜像安装 `bubblewrap`，preflight 增加 `bwrap --version` 检查。
+- [x] P1-7 Codex 写入沙箱依赖：openEuler 容器内 `workspace-write` 写文件探测定位到 Docker 默认安全策略阻止 `bubblewrap` 创建 namespace；openEuler 运行脚本使用 `--privileged`，preflight 执行真实 `bwrap --ro-bind / / true` 探针；依据：`--privileged` 下 Codex 创建 `hello.txt` 成功。
