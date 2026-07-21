@@ -51,6 +51,8 @@ def main() -> int:
     ok &= _check(sys.version_info >= (3, 10), "Python", sys.version.split()[0])
     git = shutil.which("git")
     ok &= _check(git is not None, "Git", _run(["git", "--version"]).stdout.strip() if git else "missing")
+    bwrap = shutil.which("bwrap")
+    ok &= _check(bwrap is not None, "bubblewrap", _run(["bwrap", "--version"]).stdout.strip() if bwrap else "missing", required=args.require_real)
     codex = shutil.which("codex")
     codex_required = args.require_real or os.getenv("ALLOW_MISSING_CODEX") != "1"
     codex_detail = _run(["codex", "--version"]).stdout.strip() if codex else "missing"

@@ -109,6 +109,14 @@ class DirectExecutionProvider(ExecutionProvider):
                         metrics=timer.finish(queue_wait_ms=queue_wait_ms),
                     )
                 patch = self.workspace_manager.create_patch_artifact(workspace, request.graph_node, request.idempotency_key[:16], root_task_id=request.run_id)
+                error = None
+                if rc != 0:
+                    details = [f"codex exited {rc}" if rc is not None else "codex timeout"]
+                    if stderr.strip():
+                        details.append(f"stderr: {stderr.strip()[:1000]}")
+                    if final_output.strip():
+                        details.append(f"last_message: {final_output.strip()[:1000]}")
+                    error = " | ".join(details)
                 patch_ref = None
                 if patch:
                     patch_ref = {
@@ -121,7 +129,7 @@ class DirectExecutionProvider(ExecutionProvider):
                 return AgentExecutionResult(
                     status="SUCCESS" if rc == 0 else ("TIMEOUT" if rc is None else "FAILED"),
                     output=final_output,
-                    error_message=stderr or None,
+                    error_message=error,
                     workspace_path=workspace.workspace_path,
                     patch_ref=patch_ref,
                     metrics=timer.finish(queue_wait_ms=queue_wait_ms),

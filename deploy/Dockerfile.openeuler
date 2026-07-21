@@ -1,6 +1,6 @@
 FROM openeuler/openeuler:24.03-lts
 
-RUN dnf install -y python3 python3-pip procps-ng psmisc git curl && \
+RUN dnf install -y python3 python3-pip procps-ng psmisc git curl bubblewrap && \
     dnf clean all
 
 WORKDIR /app
@@ -13,7 +13,7 @@ COPY . .
 
 RUN chmod 0755 /usr/local/bin/codex && \
     test -x /usr/local/bin/codex && \
-    python3 --version && git --version && \
+    python3 --version && git --version && bwrap --version && \
     codex --version && \
     echo "codex sha256 ac06f492f3ded7a8e2f36dc961e3cc5276a3c4841a2695d4681d0557c5b30e41" && \
     mkdir -p /runtime/workspaces /runtime/artifacts /runtime/state /runtime/logs
