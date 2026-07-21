@@ -68,3 +68,4 @@ bash examples/production_incident_demo/scripts/run_fault.sh
 - [x] P0-4 integration 顺序稳定性：`test_worker_fallback` 在需要时自启隔离状态库的 mock agentd，避免完整 `testing/integration` 顺序运行时连接竞争；依据：openEuler 容器内 `python3 -m pytest testing/integration -q` 为 `7 passed`。
 - [x] P1-7 Preflight 错误可观测性：外部命令超时返回明确 `FAIL timeout after Ns`，不再 traceback。
 - [x] P1-7 Preflight 仓库导入路径：脚本启动时加入仓库根目录到 `sys.path`，确保 openEuler 容器任意工作目录下都能导入 `aruntime`。
+- [x] P2-9 Codex 非交互调用：Direct 和 Runtime Codex 子进程显式关闭 stdin，避免真实 CLI 在非 TTY 容器执行时读取额外输入；依据：`python3 -m pytest testing/unittest/backends/test_codex_command.py testing/unittest/backends/test_codex_timeout.py testing/unittest/backends/test_codex_file_change.py -q`。

@@ -52,6 +52,7 @@ class CodexCLIBackend(AgentBackend):
             env["CODEX_API_KEY"] = api_key
         process = await asyncio.create_subprocess_exec(
             *command,
+            stdin=asyncio.subprocess.DEVNULL,
             cwd=str(request.workspace.workspace_path),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,

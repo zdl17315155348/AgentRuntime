@@ -47,6 +47,7 @@ class DirectCodexExecutor:
             env["CODEX_API_KEY"] = api_key
         process = await asyncio.create_subprocess_exec(
             *command,
+            stdin=asyncio.subprocess.DEVNULL,
             cwd=cwd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
