@@ -5,6 +5,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import httpx
@@ -53,12 +54,28 @@ def main() -> int:
     ok &= _check((ROOT / ".git").exists(), "Git worktree", str(ROOT))
     ok &= _check(_run(["python3", "-m", "pytest", "--version"]).returncode == 0, "pytest")
 
+    for env_name, default, label in (
+        ("AGENTD_WORKSPACE_ROOT", str(ROOT / "run-data/workspaces"), "Workspace write"),
+        ("AGENTD_ARTIFACT_ROOT", str(ROOT / "run-data/artifacts"), "Artifact write"),
+    ):
+        path = Path(os.getenv(env_name, default))
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+            with tempfile.NamedTemporaryFile(dir=path, delete=True) as probe:
+                probe.write(b"ok")
+            write_ok = True
+            detail = str(path)
+        except Exception as exc:
+            write_ok = False
+            detail = str(exc)
+        ok &= _check(write_ok, label, detail)
+
     try:
         resp = httpx.get(f"{args.agentd_url}/metrics", timeout=2, trust_env=False)
         agentd_ok = resp.status_code == 200
     except Exception:
         agentd_ok = False
-    ok &= _check(agentd_ok, "AgentRuntime", args.agentd_url, required=False)
+    ok &= _check(agentd_ok, "AgentRuntime", args.agentd_url, required=args.require_real)
 
     dashboard_ok = False
     try:
@@ -66,7 +83,7 @@ def main() -> int:
         dashboard_ok = resp.status_code == 200
     except Exception:
         dashboard_ok = False
-    ok &= _check(dashboard_ok, "Dashboard routes", "/dashboard/demo.html", required=False)
+    ok &= _check(dashboard_ok, "Dashboard routes", "/dashboard/demo.html", required=args.require_real)
 
     llm_key = os.getenv("DEEPSEEK_API_KEY") or os.getenv("LLM_API_KEY")
     codex_key = os.getenv("CODEX_API_KEY") or os.getenv("OPENAI_API_KEY")
