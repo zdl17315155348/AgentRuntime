@@ -90,6 +90,8 @@ def route_after_test(state: dict[str, Any], max_repair_rounds: int = 2) -> str:
 
 
 def route_after_review(state: dict[str, Any], max_repair_rounds: int = 2) -> str:
+    if state.get("workflow_status") == "FAILED":
+        return "failed"
     review = state.get("review_summary") or {}
     if review.get("approved"):
         return "success"

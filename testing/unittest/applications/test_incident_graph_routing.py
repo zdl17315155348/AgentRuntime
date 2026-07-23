@@ -25,3 +25,4 @@ def test_review_route_respects_repair_limit():
     assert route_after_review({"review_summary": {"approved": True}, "repair_round": 0}) == "success"
     assert route_after_review({"review_summary": {"approved": False}, "repair_round": 0}) == "repair"
     assert route_after_review({"review_summary": {"approved": False}, "repair_round": 2}) == "failed"
+    assert route_after_review({"workflow_status": "FAILED", "review_summary": None, "repair_round": 0}) == "failed"
