@@ -100,8 +100,13 @@ async def test_direct_provider_returns_common_result_shape_for_planner():
 
 
 @pytest.mark.anyio
-async def test_direct_codex_provider_uses_pydantic_validation_without_cli_schema():
+async def test_direct_codex_provider_uses_pydantic_validation_without_cli_schema(tmp_path, monkeypatch):
     captured = {}
+
+    source = tmp_path / "source-codex"
+    source.mkdir()
+    (source / "config.toml").write_text("model = \"test\"\n", encoding="utf-8")
+    monkeypatch.setenv("CODEX_HOME", str(source))
 
     class _WorkspaceManager:
         def create_attempt_workspace(self, source_repo, task_id, attempt_id, base_ref, read_only, root_task_id=None):
@@ -164,6 +169,49 @@ async def test_runtime_provider_reuses_client_and_maps_request_fields():
     assert result.runtime_task_id == "t1"
     assert result.structured_result["returncode"] == 0
     assert client.submitted["task_input"]["graph_managed"] is True
+
+
+@pytest.mark.anyio
+async def test_runtime_cancel_tracks_submitted_tasks():
+    tracked = {}
+
+    class _TrackingClient(_FakeClient):
+        def wait_task(self, task_id, timeout_s):
+            tracked["snapshot"] = set(provider._run_task_ids.get("run1", set()))
+            return super().wait_task(task_id, timeout_s)
+
+    provider = create_execution_provider(_config(ExecutionMode.RUNTIME), {"client": _TrackingClient()})
+    result = await provider.execute(_request("direct_tool", "tester"))
+
+    assert result.runtime_task_id == "t1"
+    assert tracked["snapshot"] == {"t1"}
+    assert provider._run_task_ids == {}
+
+
+@pytest.mark.anyio
+async def test_runtime_cancel_all_active_tasks():
+    client = _FakeClient()
+    provider = create_execution_provider(_config(ExecutionMode.RUNTIME), {"client": client})
+    provider._run_task_ids["run1"].update({"t1", "t2"})
+
+    await provider.cancel_run("run1")
+
+    assert set(client.cancelled) == {"t1", "t2"}
+    assert len(client.cancelled) == 2
+    assert "run1" not in provider._run_task_ids
+
+
+@pytest.mark.anyio
+async def test_runtime_cancel_ignores_completed_tasks():
+    client = _FakeClient()
+    provider = create_execution_provider(_config(ExecutionMode.RUNTIME), {"client": client})
+
+    await provider.execute(_request("direct_tool", "tester"))
+    assert provider._run_task_ids == {}
+
+    await provider.cancel_run("run1")
+
+    assert client.cancelled == []
 
 
 @pytest.mark.anyio

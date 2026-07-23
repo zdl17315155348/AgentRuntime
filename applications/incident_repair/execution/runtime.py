@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import time
+from collections import defaultdict
 from typing import Any
 
 from aruntime.api.client import AgentRuntimeClient
@@ -25,6 +26,7 @@ class AgentRuntimeExecutionProvider(ExecutionProvider):
         self.config = config
         self.dependencies = dependencies or {}
         self.client: AgentRuntimeClient = self.dependencies.get("client") or AgentRuntimeClient()
+        self._run_task_ids: dict[str, set[str]] = defaultdict(set)
 
     @property
     def mode(self) -> str:
@@ -62,17 +64,27 @@ class AgentRuntimeExecutionProvider(ExecutionProvider):
             failure_policy=self._failure_policy_for_role(request.role),
         )
         task_id = str(task["task_id"])
+        self._run_task_ids[request.run_id].add(task_id)
         timer.mark_execution_started()
-        result = self.client.wait_task(task_id, request.timeout_s + 30)
-        return self._convert_result(request, result, timer)
+        try:
+            result = self.client.wait_task(task_id, request.timeout_s + 30)
+            return self._convert_result(request, result, timer)
+        finally:
+            self._run_task_ids[request.run_id].discard(task_id)
+            if not self._run_task_ids[request.run_id]:
+                self._run_task_ids.pop(request.run_id, None)
 
     async def cancel_run(self, run_id: str) -> None:
-        task_ids = self.dependencies.get("run_task_ids", {}).get(run_id, set())
-        for task_id in list(task_ids):
+        task_ids = list(self._run_task_ids.get(run_id, set()))
+        for task_id in task_ids:
             try:
                 self.client.cancel_task(task_id)
             except Exception:
                 continue
+            finally:
+                self._run_task_ids[run_id].discard(task_id)
+        if not self._run_task_ids.get(run_id):
+            self._run_task_ids.pop(run_id, None)
 
     async def inject_fault(self, run_id: str, target: dict[str, Any]) -> dict[str, Any]:
         agent_name = str(target.get("agent_name") or target.get("role") or "")
