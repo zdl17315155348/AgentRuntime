@@ -1,28 +1,27 @@
 Date: 2026-07-23
 
 Current release commit:
-- `a2fac6685845f5a567c008d997687362cb4f3eed` before the workflow timeout fix.
+- `d1f46bf` before the PID1 guard fix.
 
 Code work completed in this change set:
-- `applications/incident_repair/services/run_service.py`
-- `scripts/start_agentd_docker.sh`
-- `scripts/test_docker_openeuler.sh`
-- `testing/unittest/applications/test_incident_graph_runner.py`
-- `testing/unittest/applications/test_start_agentd_docker.py`
+- `scripts/e2e_runtime_guard.py`
+- `scripts/run_real_direct.py`
+- `scripts/run_real_runtime.py`
+- `scripts/run_real_runtime_fault.py`
+- `testing/unittest/applications/test_e2e_runtime_guard.py`
 - `README.md`
 - `pyproject.toml`
 
 Current result:
-- Direct real E2E hang was reproduced as an initial `CREATED` run with no final summary and many `bwrap <defunct>` children in a Python PID 1 container.
-- `IncidentRunService.execute_run()` now enforces `workflow_timeout_s`, calls provider `cancel_run()`, and writes FAILED summary on timeout.
-- openEuler Docker scripts now use `--init` so Codex/bubblewrap orphaned children are reaped by init instead of Python PID 1.
+- Real E2E scripts now reject Python-as-PID1 execution unless `ALLOW_PYTHON_PID1_E2E=1` is set.
+- Next real E2E attempt must rebuild the openEuler image and run containers with Docker `--init`.
 
 Latest test totals:
 - openEuler Docker no-key unit: `270 passed, 4 warnings`.
 - openEuler Docker integration: `8 passed`.
 - openEuler Docker fake final acceptance: application `72 passed`, benchmark smoke `1 passed`, preflight PASS with real E2E skipped for missing keys in that no-key container.
 - openEuler real preflight: all PASS, including openEuler 24.03, Python 3.11.6, bubblewrap 0.8.0, Codex 0.142.5, Codex config, AgentRuntime, Dashboard, Codex auth, and DeepSeek connectivity.
-- Targeted fix tests: `python3 -m pytest testing/unittest/applications/test_incident_graph_runner.py testing/unittest/applications/test_start_agentd_docker.py -q` -> `4 passed`.
+- Targeted PID1 guard tests: `python3 -m pytest testing/unittest/applications/test_e2e_runtime_guard.py testing/unittest/applications/test_start_agentd_docker.py -q` -> `6 passed`.
 
 Progress status:
 - TODO 1 fixed and committed.
@@ -30,7 +29,7 @@ Progress status:
 - TODO 3 complete with logs under `final-evidence/tests/`.
 - TODO 4 complete with `final-evidence/environment/docker_build.log` and `docker_image_id.txt`.
 - TODO 5 complete with `final-evidence/environment/openeuler_preflight.log`.
-- Direct real E2E should be rerun after rebuilding the image with the timeout/PID1 fixes.
+- Direct real E2E should be rerun only after rebuilding the image with timeout/PID1 guard fixes and using `docker run --init`.
 
 Remaining benchmark/dashboard items:
 - Direct real E2E

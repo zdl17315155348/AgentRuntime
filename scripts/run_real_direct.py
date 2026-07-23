@@ -16,6 +16,7 @@ if str(ROOT) not in sys.path:
 
 from applications.incident_repair.config import ExecutionMode, IncidentRunConfig
 from applications.incident_repair.services.run_service import IncidentRunService
+from e2e_runtime_guard import reject_python_pid1_without_init
 from prepare_e2e_repo import prepare_e2e_repo
 
 
@@ -126,6 +127,8 @@ async def _run(
 
 
 def main() -> int:
+    if reject_python_pid1_without_init():
+        return 1
     parser = argparse.ArgumentParser()
     parser.add_argument("--source-repo", default=str(DEFAULT_REPO))
     parser.add_argument("--require-real", action="store_true")
