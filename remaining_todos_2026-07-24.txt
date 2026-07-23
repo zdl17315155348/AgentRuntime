@@ -1,0 +1,74 @@
+Remaining TODOs after TODO6 Direct real E2E success
+Current date: 2026-07-24
+Current HEAD when recorded: 571a192 docs: record direct e2e success
+
+Completed before this file:
+- [x] TODO 1 Runtime cancel_run task tracking
+- [x] TODO 2 stale progress file archived
+- [x] TODO 3 no-key full regression evidence
+- [x] TODO 4 openEuler image rebuild evidence
+- [x] TODO 5 real openEuler preflight
+- [x] TODO 6 Direct real E2E
+
+Remaining release TODOs:
+- [ ] TODO 7 Direct continuous success verification
+  - Run Direct real E2E at least three times.
+  - Acceptance: the last two runs are consecutive SUCCESS.
+  - Classify any failure before rerunning.
+
+- [ ] TODO 8 Start real agentd for Runtime E2E
+  - Confirm LLM_BACKEND is not mock.
+  - Confirm LLM API key is passed to agentd.
+  - Confirm agent registration succeeds.
+  - Confirm Codex config is mounted.
+  - Confirm http://127.0.0.1:8234/metrics is available.
+
+- [ ] TODO 9 Runtime real E2E
+  - Run scripts/run_real_runtime.py with --require-real.
+  - Acceptance includes native_planner, codex_cli coder, direct_tool tester, read-only reviewer, task/attempt/worker/Codex PID evidence, ResourceLease evidence, Runtime trace backend events, lease cleanup, and no legacy_llm fallback.
+
+- [ ] TODO 10 Runtime continuous success verification
+  - Run Runtime real E2E at least three times.
+  - Acceptance: the last two runs are consecutive SUCCESS.
+
+- [ ] TODO 11 Runtime Fault real E2E
+  - Run scripts/run_real_runtime_fault.py with --require-real.
+  - Acceptance includes coder_a backend.started, SIGKILL injection, worker.lost, lease reclaim, failed first attempt, fallback to coder_b, successful second attempt, workflow SUCCESS, no orphan Codex process, no lease leak, different old/new PID and worktree, final patch/pytest/reviewer pass.
+
+- [ ] TODO 12 Release Candidate commit
+  - Only after Direct, Runtime, and Fault are all stable.
+  - Commit and push release candidate.
+  - Record final-evidence/environment/git_commit.txt.
+  - Freeze Prompt, Schema, Graph, Benchmark, and resource-limit definitions.
+
+- [ ] TODO 13 Regenerate official E2E evidence on RC
+  - Direct: 2 consecutive SUCCESS.
+  - Runtime: 2 consecutive SUCCESS.
+  - Fault: 1 SUCCESS.
+  - Manifest git_commit, docker_image_id, codex_version, and demo_base_commit must match the RC.
+
+- [ ] TODO 14 Real benchmark small sample
+  - Run testing.perf.comparison.runner with incident_repair_v1, modes direct/runtime, concurrency 1, warmup 1, runs 3.
+  - Acceptance: non-synthetic data, performance_claim_allowed=true, correct release_commit, non-empty prompt hash and Codex version, comparable pairs, non-zero backend time/tokens/RSS, Direct and Runtime success samples.
+
+- [ ] TODO 15 Formal benchmark
+  - Minimum matrix: concurrency 1, 2, 4; warmup 2; measured runs 10.
+  - Include Direct/Runtime overhead, throughput/P95 at concurrency 1/2/4, Direct Retry vs Runtime Fallback, Recovery Context off/on.
+  - Output mean, P50, P95, 95% CI, success rate, throughput, queue wait, backend time, token, RSS, recovery time.
+
+- [ ] TODO 16 Dashboard defense-level display
+  - Demo page: LangGraph node status, Coder dependency order, Runtime Task/Attempt, Worker PID, Codex PID, ResourceLease, worktree, Patch, pytest, Reviewer, fallback timeline.
+  - Compare page: Direct/Runtime total time, stage breakdown, token, RSS, success, pair fairness checks.
+  - Benchmarks page: concurrency-throughput curve, concurrency-P95 curve, Runtime overhead, fault recovery success rate, Recovery Context benefit.
+  - Raw JSON-only display is not acceptable.
+
+- [ ] TODO 17 Replay, screenshots, and recordings
+  - Save one normal Runtime real run.
+  - Save one Runtime Fault real run.
+  - Save Replay Manifest.
+  - Save Demo, Compare, and Benchmark screenshots.
+  - Save normal-flow and fault-recovery recordings.
+
+- [ ] Final board check
+  - Run python3 scripts/final_board_check.py.
+  - Acceptance: every item prints [PASS].
