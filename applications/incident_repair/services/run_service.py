@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import time
 from pathlib import Path
 from uuid import uuid4
@@ -81,9 +82,17 @@ class IncidentRunService:
         state = bundle["state"]
         started = bundle["summary"]["started_at"]
         try:
-            final_state = await self.runner.run(state, context)
+            final_state = await asyncio.wait_for(self.runner.run(state, context), timeout=config.workflow_timeout_s)
             status = final_state.get("workflow_status") or "SUCCESS"
             error = final_state.get("error")
+        except (asyncio.TimeoutError, TimeoutError):
+            provider = context.provider
+            if hasattr(provider, "cancel_run"):
+                await provider.cancel_run(config.run_id)
+            final_state = {**state, "workflow_status": "FAILED", "error": f"workflow timeout after {config.workflow_timeout_s}s"}
+            status = "FAILED"
+            error = final_state["error"]
+            context.event_bus.emit("langgraph", "graph.run.failed", attributes={"error": error})
         except Exception as exc:
             final_state = state
             status = "FAILED"

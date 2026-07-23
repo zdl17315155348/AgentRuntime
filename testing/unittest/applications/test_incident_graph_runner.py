@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 from pathlib import Path
 
@@ -12,6 +14,7 @@ from applications.incident_repair.services.run_store import RunStore
 class FakeGraphProvider(ExecutionProvider):
     def __init__(self):
         self.calls: list[AgentExecutionRequest] = []
+        self.cancelled: list[str] = []
 
     @property
     def mode(self) -> str:
@@ -52,7 +55,7 @@ class FakeGraphProvider(ExecutionProvider):
         return AgentExecutionResult(status="SUCCESS", structured_result={"commit": "HEAD"}, metrics=metrics)
 
     async def cancel_run(self, run_id: str) -> None:
-        return None
+        self.cancelled.append(run_id)
 
     async def inject_fault(self, run_id: str, target: dict) -> dict:
         return {}
@@ -97,3 +100,27 @@ async def test_langgraph_runner_joins_parallel_coders_once(tmp_path):
     assert result["summary"]["status"] == "SUCCESS"
     assert result["summary"]["result"]["patch_non_empty"] is True
     assert service.runner.checkpoint_path.exists()
+
+
+@pytest.mark.anyio
+async def test_run_service_times_out_and_cancels_provider(tmp_path):
+    class _HangingRunner:
+        async def run(self, state, context):
+            await asyncio.sleep(30)
+
+    provider = FakeGraphProvider()
+    service = IncidentRunService(store=RunStore(tmp_path / "live"), runner=_HangingRunner())
+    config = IncidentRunConfig(
+        execution_mode=ExecutionMode.DIRECT,
+        run_id="run_timeout",
+        thread_id="thread_timeout",
+        source_repo=str(Path.cwd()),
+        base_commit="HEAD",
+        workflow_timeout_s=1,
+    )
+
+    result = await service.execute_run(config, "fix", {"provider": provider, "integration_service": _Integration()})
+
+    assert provider.cancelled == ["run_timeout"]
+    assert result["summary"]["status"] == "FAILED"
+    assert result["summary"]["error"] == "workflow timeout after 1s"
