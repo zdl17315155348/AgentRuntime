@@ -21,6 +21,20 @@ from prepare_e2e_repo import prepare_e2e_repo
 
 
 DEFAULT_REPO = ROOT / "examples/production_incident_demo/target_repo"
+CONTAINER_WORKSPACE_ROOT = Path("/runtime/workspaces")
+CONTAINER_ARTIFACT_ROOT = Path("/runtime/artifacts")
+
+
+def _configure_persistent_direct_roots() -> None:
+    roots = {
+        "AGENTD_WORKSPACE_ROOT": (CONTAINER_WORKSPACE_ROOT, ROOT / "run-data/workspaces"),
+        "AGENTD_ARTIFACT_ROOT": (CONTAINER_ARTIFACT_ROOT, ROOT / "run-data/artifacts"),
+    }
+    for key, (container_default, repo_default) in roots.items():
+        current = os.getenv(key)
+        if not current or Path(current) == container_default:
+            os.environ[key] = str(repo_default)
+            repo_default.mkdir(parents=True, exist_ok=True)
 
 
 def _ensure_git_safe_directory(repo: Path) -> None:
@@ -98,6 +112,7 @@ async def _run(
         os.environ["LLM_API_KEY"] = os.environ["DEEPSEEK_API_KEY"]
     if not os.getenv("CODEX_API_KEY") and os.getenv("OPENAI_API_KEY"):
         os.environ["CODEX_API_KEY"] = os.environ["OPENAI_API_KEY"]
+    _configure_persistent_direct_roots()
 
     run_id = f"{mode.value}_real_{uuid4().hex[:12]}"
     repo_info = prepare_e2e_repo(repo, run_id=run_id)
