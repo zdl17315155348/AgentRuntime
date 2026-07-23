@@ -81,8 +81,12 @@ class IncidentRunService:
         context = bundle["context"]
         state = bundle["state"]
         started = bundle["summary"]["started_at"]
+        def _record_graph_update(node_name: str, updated_state: dict) -> None:
+            self.store.write_json(config.run_id, "graph_state.json", updated_state)
+            context.event_bus.emit("langgraph", "graph.node.updated", graph_node=node_name, attributes={"workflow_status": updated_state.get("workflow_status")})
+
         try:
-            final_state = await asyncio.wait_for(self.runner.run(state, context), timeout=config.workflow_timeout_s)
+            final_state = await asyncio.wait_for(self.runner.run(state, context, on_update=_record_graph_update), timeout=config.workflow_timeout_s)
             status = final_state.get("workflow_status") or "SUCCESS"
             error = final_state.get("error")
         except (asyncio.TimeoutError, TimeoutError):

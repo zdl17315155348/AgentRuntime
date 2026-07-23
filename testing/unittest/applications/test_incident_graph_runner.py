@@ -105,7 +105,7 @@ async def test_langgraph_runner_joins_parallel_coders_once(tmp_path):
 @pytest.mark.anyio
 async def test_run_service_times_out_and_cancels_provider(tmp_path):
     class _HangingRunner:
-        async def run(self, state, context):
+        async def run(self, state, context, on_update=None):
             await asyncio.sleep(30)
 
     provider = FakeGraphProvider()
@@ -124,3 +124,20 @@ async def test_run_service_times_out_and_cancels_provider(tmp_path):
     assert provider.cancelled == ["run_timeout"]
     assert result["summary"]["status"] == "FAILED"
     assert result["summary"]["error"] == "workflow timeout after 1s"
+
+
+@pytest.mark.anyio
+async def test_run_service_records_graph_node_updates(tmp_path):
+    pytest.importorskip("langgraph")
+    pytest.importorskip("langgraph.checkpoint.sqlite")
+    provider = FakeGraphProvider()
+    service = IncidentRunService(store=RunStore(tmp_path / "live"))
+    service.runner.checkpoint_path = tmp_path / "checkpoints.sqlite"
+    config = IncidentRunConfig(execution_mode=ExecutionMode.DIRECT, run_id="run_events", thread_id="thread_events", source_repo=str(Path.cwd()), base_commit="HEAD")
+
+    result = await service.execute_run(config, "fix", {"provider": provider, "integration_service": _Integration()})
+    events = service.store.load_events("run_events")
+
+    assert result["summary"]["status"] == "SUCCESS"
+    assert any(event["name"] == "graph.node.updated" and event["graph_node"] == "planner" for event in events)
+    assert any(event["name"] == "graph.node.updated" and event["graph_node"] == "reviewer" for event in events)

@@ -1,27 +1,25 @@
 Date: 2026-07-23
 
 Current release commit:
-- `d1f46bf` before the PID1 guard fix.
+- `9647cfa` before the graph progress persistence fix.
 
 Code work completed in this change set:
-- `scripts/e2e_runtime_guard.py`
-- `scripts/run_real_direct.py`
-- `scripts/run_real_runtime.py`
-- `scripts/run_real_runtime_fault.py`
-- `testing/unittest/applications/test_e2e_runtime_guard.py`
+- `applications/incident_repair/runner.py`
+- `applications/incident_repair/services/run_service.py`
+- `testing/unittest/applications/test_incident_graph_runner.py`
 - `README.md`
 - `pyproject.toml`
 
 Current result:
-- Real E2E scripts now reject Python-as-PID1 execution unless `ALLOW_PYTHON_PID1_E2E=1` is set.
-- Next real E2E attempt must rebuild the openEuler image and run containers with Docker `--init`.
+- Long real E2E runs now persist node-level progress instead of leaving `summary.json` at the initial `CREATED` state until the graph completes.
+- `IncidentGraphRunner` uses LangGraph `astream(stream_mode="updates")`; `RunService` writes `graph_state.json` and emits `graph.node.updated` after every node update.
 
 Latest test totals:
 - openEuler Docker no-key unit: `270 passed, 4 warnings`.
 - openEuler Docker integration: `8 passed`.
 - openEuler Docker fake final acceptance: application `72 passed`, benchmark smoke `1 passed`, preflight PASS with real E2E skipped for missing keys in that no-key container.
 - openEuler real preflight: all PASS, including openEuler 24.03, Python 3.11.6, bubblewrap 0.8.0, Codex 0.142.5, Codex config, AgentRuntime, Dashboard, Codex auth, and DeepSeek connectivity.
-- Targeted PID1 guard tests: `python3 -m pytest testing/unittest/applications/test_e2e_runtime_guard.py testing/unittest/applications/test_start_agentd_docker.py -q` -> `6 passed`.
+- Targeted graph progress tests: `python3 -m pytest testing/unittest/applications/test_incident_graph_runner.py -q` -> `3 passed`.
 
 Progress status:
 - TODO 1 fixed and committed.
