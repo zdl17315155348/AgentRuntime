@@ -58,7 +58,7 @@ def load_config():
             "llm": {
                 "backend": "mock",
                 "api_key": "",
-                "model": "deepseek-chat",
+                "model": "deepseek-v4-flash",
                 "temperature": 0.1,
                 "max_tokens": 2048
             }
@@ -86,7 +86,8 @@ def _context_compress_threshold() -> int:
 # 初始化 LLM 网关
 LLM_BACKEND = os.getenv("LLM_BACKEND", llm_config.get("backend", "deepseek"))
 LLM_API_KEY = os.getenv("LLM_API_KEY", llm_config.get("api_key", ""))
-llm_gateway = LLMGateway(backend=LLM_BACKEND, api_key=LLM_API_KEY)
+LLM_MODEL = os.getenv("LLM_MODEL", llm_config.get("model", "deepseek-v4-flash"))
+llm_gateway = LLMGateway(backend=LLM_BACKEND, api_key=LLM_API_KEY, model=LLM_MODEL)
 context_manager = ContextManager(
     compress_threshold_chars=_context_compress_threshold()
 )
@@ -245,6 +246,21 @@ def _recover_agent(agent_name: str, task_id: str | None = None, reason: str = "a
         _transition_agent(agent_name, AgentStatus.READY, task_id=task_id, reason=f"{reason}.ready")
 
 
+def _mark_agent_ready_for_reuse(agent_name: str, task_id: str | None = None, reason: str = "agent.reuse") -> None:
+    agent = agents.get(agent_name)
+    if agent is None:
+        return
+    agent.status = AgentStatus.READY
+    agent.current_task_id = None
+    acb = agent_controls.get(agent_name)
+    if acb is not None:
+        acb.status = AgentStatus.READY
+        acb.current_task_id = None
+        acb.record_event("agent.reused", task_id=task_id, reason=reason)
+        _sync_agent_from_acb(agent_name)
+    _persist_agent(agent_name)
+
+
 def _set_current_task(agent_name: str, task_id: str | None) -> None:
     acb = agent_controls.get(agent_name)
     if acb is not None:
@@ -280,7 +296,7 @@ def _start_worker(agent_name: str) -> subprocess.Popen:
     uds_path = os.getenv("AGENTD_UDS_PATH", "/tmp/agent-runtime-agentd.sock")
     token = agent_auth_tokens.setdefault(agent_name, secrets.token_urlsafe(24))
     agent = agents[agent_name]
-    proc = start_worker_process(agent, uds_path, token, llm_gateway.backend, llm_gateway.api_key or "")
+    proc = start_worker_process(agent, uds_path, token, llm_gateway.backend, llm_gateway.api_key or "", llm_gateway.model)
     agent_workers[agent_name] = proc
     fault_states.setdefault(agent_name, WorkerFaultState(agent_name=agent_name, fault_domain=agent_name)).heartbeat()
     acb = agent_controls.get(agent_name)
@@ -430,12 +446,7 @@ def _prepare_agent_for_task(task: TaskSpec, reason: str) -> None:
     if agent.status == AgentStatus.FAILED:
         _recover_agent(task.agent_name, task.task_id, reason=f"{reason}.recover")
     elif agent.status == AgentStatus.COMPLETED:
-        agent.status = AgentStatus.READY
-        acb = agent_controls.get(task.agent_name)
-        if acb is not None:
-            acb.status = AgentStatus.READY
-            acb.record_event("agent.reused", task_id=task.task_id, reason=reason)
-        _persist_agent(task.agent_name)
+        _mark_agent_ready_for_reuse(task.agent_name, task.task_id, reason=reason)
     _set_context_handle(task.agent_name, task.context_id or None)
     _transition_agent(task.agent_name, AgentStatus.RUNNING, task_id=task.task_id, reason=reason)
     _set_current_task(task.agent_name, task.task_id)
@@ -856,6 +867,8 @@ async def list_agents():
                 "status": agent.status,
                 "current_task": agent.current_task_id,
                 "worker_pid": (agent_workers.get(name).pid if name in agent_workers else None),
+                "backend": agent.backend.model_dump(mode="json"),
+                "failure_policy": agent.failure_policy.model_dump(mode="json"),
             }
             for name, agent in agents.items()
         ]
@@ -933,8 +946,7 @@ async def submit_task(req: SubmitTaskRequest):
         if agent.status == AgentStatus.FAILED:
             _recover_agent(selected_agent_name, reason="task.submit")
         else:
-            agent.status = AgentStatus.READY
-            _persist_agent(selected_agent_name)
+            _mark_agent_ready_for_reuse(selected_agent_name, reason="task.submit")
 
     # 验证依赖任务是否存在
     for dep_id in req.dependencies:
@@ -1004,8 +1016,7 @@ async def submit_dynamic_task(req: SubmitDynamicTaskRequest):
         if agent.status == AgentStatus.FAILED:
             _recover_agent(selected_agent_name, reason="task.dynamic_submit")
         else:
-            agent.status = AgentStatus.READY
-            _persist_agent(selected_agent_name)
+            _mark_agent_ready_for_reuse(selected_agent_name, reason="task.dynamic_submit")
     
     # 验证父任务是否存在
     if req.parent_task_id and req.parent_task_id not in tasks:

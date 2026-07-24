@@ -9,23 +9,107 @@ Completed before this file:
 - [x] TODO 4 openEuler image rebuild evidence
 - [x] TODO 5 real openEuler preflight
 - [x] TODO 6 Direct real E2E
+- [x] TODO A Benchmark Runtime Agent auto registration
+  - Formal Runtime Benchmark registers demo agents before timing.
+  - Checks agentd availability, non-mock LLM backend, LLM key presence, required agents, and backend match with agents.yaml.
+  - Evidence: bash scripts/test_docker_openeuler.sh passed.
+- [x] TODO B Benchmark fault and Recovery Context scenario parameters
+  - Supports baseline, fault_recovery, and recovery_context scenarios.
+  - Records direct retry, runtime fault, recovery context, fault target, and fault trigger metadata outside prompt hash.
+  - Runtime fault injection waits for backend.started before SIGKILL.
+  - Evidence: bash scripts/test_docker_openeuler.sh passed.
 
 Remaining release TODOs:
-- [ ] TODO 7 Direct continuous success verification
+- [x] TODO 7 Direct continuous success verification
   - Run Direct real E2E at least three times.
   - Acceptance: the last two runs are consecutive SUCCESS.
   - Classify any failure before rerunning.
+  - Evidence: openEuler real runs direct_real_2af5e953d8cc, direct_real_e9de41091178, and direct_real_4ce75edff248 all returned SUCCESS; the last two are consecutive SUCCESS.
 
-- [ ] TODO 8 Start real agentd for Runtime E2E
+- [x] TODO 8 Start real agentd for Runtime E2E
   - Confirm LLM_BACKEND is not mock.
   - Confirm LLM API key is passed to agentd.
   - Confirm agent registration succeeds.
   - Confirm Codex config is mounted.
   - Confirm http://127.0.0.1:8234/metrics is available.
+  - Evidence: final-evidence/environment/agentd.log, agentd_metrics.json, and agentd_agents.json show llm_backend=deepseek, llm_api_key_present=true, six workers alive, and registered architect/coder_a/coder_b/tester/repair/reviewer.
 
-- [ ] TODO 9 Runtime real E2E
+- [x] Runtime E2E empty patch root-cause fix
+  - Failed run runtime_real_58af10abafd8 wrote to /app/examples/production_incident_demo/target_repo while the prepared repo was /app/run-data/e2e-repos/runtime_real_58af10abafd8/repo.
+  - Fixed Runtime Codex prompt to include Goal and the attempt workspace path, and to forbid editing source/template repo paths.
+  - Fixed Coder/Repair prompts to require the JSON object parsed by CoderResultModel.
+  - Evidence: python3 -m pytest testing/unittest/backends/test_codex_command.py -q passed with 6 tests; bash scripts/test_docker_openeuler.sh passed.
+
+- [x] Runtime Provider workspace payload fix
+  - Interrupted verification run runtime_real_679998eae8e1 showed task_input.source_repo=/app/run-data/e2e-repos/.../repo but attempt workspace_path=/app.
+  - Root cause: Runtime Provider did not pass the daemon-supported workspace field, so daemon fell back to os.getcwd().
+  - Fixed AgentRuntimeClient.submit_task(workspace=...) and Runtime Provider WorkspaceSpec(source_repo/base_ref/base_commit/read_only) submission.
+  - Evidence: python3 -m pytest testing/unittest/api/test_client.py testing/unittest/applications/test_incident_execution_provider.py testing/unittest/backends/test_codex_command.py -q passed with 36 tests; bash scripts/test_docker_openeuler.sh passed with 230 unit, 22 daemon integration, 5 resource-aware integration, and 1 benchmark test.
+
+- [x] Runtime E2E shared run-data mount fix
+  - Failed run runtime_real_1ee0ae6e5ef9 showed source_repo not found at /app/run-data/e2e-repos/.../repo inside agentd.
+  - Root cause: E2E container prepared the repo under /app/run-data, but agentd did not mount host run-data to the same container path.
+  - Fixed scripts/start_agentd_docker.sh to mount SHARED_RUN_DATA_DIR to /app/run-data.
+  - Evidence: python3 -m pytest testing/unittest/applications/test_start_agentd_docker.py testing/unittest/api/test_client.py testing/unittest/applications/test_incident_execution_provider.py -q passed with 32 tests; bash scripts/test_docker_openeuler.sh passed with 230 unit, 22 daemon integration, 5 resource-aware integration, and 1 benchmark test.
+
+- [x] DeepSeek v4 model configuration fix
+  - Failed run runtime_real_d8d301297d52 showed DeepSeek 400: supported model names are deepseek-v4-pro or deepseek-v4-flash, but deepseek-chat was passed.
+  - Root cause: LLMGateway hard-coded deepseek-chat and daemon did not pass runtime config model to workers.
+  - Fixed LLMGateway model selection through LLM_MODEL/runtime config, defaulted config to deepseek-v4-flash, and passed LLM_MODEL into worker processes.
+  - Evidence: python3 -m pytest testing/unittest/llm/test_gateway.py testing/unittest/daemon/test_worker_service.py testing/unittest/api/test_client.py testing/unittest/applications/test_agent_registration.py -q passed with 17 tests.
+
+- [x] Runtime Planner timeout propagation fix
+  - Failed run runtime_real_7c440d734782 had run_config task_timeout_s=900, but task trace showed task.timeout timeout_s=300.0.
+  - Root cause: planner_node capped task_timeout_s to 300 before submitting the Runtime task.
+  - Fixed planner_node to pass the configured task_timeout_s through to the Runtime provider.
+  - Evidence: openEuler Docker python3 -m pytest testing/unittest/applications/test_planner_timeout.py testing/unittest/applications/test_incident_execution_provider.py -q passed with 20 tests.
+
+- [x] Runtime Planner heartbeat blocking fix
+  - Failed run runtime_real_86186a5efd94 showed worker.lost heartbeat_stale about 10s after planner.repo_scan while the Planner LLM call was still running.
+  - Root cause: DirectDeepSeekLLMAdapter called the synchronous DeepSeek gateway inside the worker event loop, blocking heartbeat.
+  - Fixed DirectDeepSeekLLMAdapter.complete() to run synchronous chat_with_stats in a thread.
+  - Evidence: openEuler Docker python3 -m pytest testing/unittest/applications/test_shared_planner_pipeline.py testing/unittest/planner/test_native_planner_backend.py testing/unittest/applications/test_planner_timeout.py -q passed with 5 tests.
+
+- [x] Runtime Planner inspection schema compatibility fix
+  - Failed run runtime_real_deab67b6fb43 showed InspectionRequest.searches entries as strings such as JWT and authorization.
+  - Root cause: normalize_inspection_payload passed string searches through, while SearchRequest expects objects.
+  - Fixed normalize_inspection_payload to convert string searches to {"query": value, "path": "."}.
+  - Evidence: openEuler Docker python3 -m pytest testing/unittest/planner/test_inspection_parser.py testing/unittest/applications/test_shared_planner_pipeline.py testing/unittest/planner/test_native_planner_backend.py -q passed with 6 tests.
+
+- [x] Runtime Planner empty JSON retry fix
+  - Failed run runtime_real_4ed672a5b867 showed native planner output_prefix='[错误] Expecting value: line 1 column 1 (char 0)'.
+  - Root cause: DeepSeek returned an empty/non-JSON planner response once, and PlannerPipeline failed immediately.
+  - Fixed PlannerPipeline to retry inspection and plan JSON parsing once before preserving the parse error.
+  - Evidence: openEuler Docker python3 -m pytest testing/unittest/applications/test_shared_planner_pipeline.py testing/unittest/planner/test_native_planner_backend.py testing/unittest/applications/test_incident_execution_provider.py -q passed with 25 tests.
+
+- [x] Runtime attempt artifacts patch extraction fix
+  - Failed run runtime_real_6fd094a4c3c4 produced a 10473-byte changes.patch under .runtime-docker/artifacts/runtime_real_6fd094a4c3c4, but the application saw no patch_ref.
+  - Root cause: daemon stores generated Codex patch artifacts on attempts[*].artifacts after worker success, while Runtime Provider only parsed result.artifacts.
+  - Fixed Runtime Provider to collect artifacts from both result.artifacts and attempts[*].artifacts before building patch_ref.
+  - Evidence: openEuler Docker python3 -m pytest testing/unittest/applications/test_incident_execution_provider.py -q passed with 20 tests.
+
+- [x] Runtime artifact container path mapping fix
+  - Failed run runtime_real_e07929d7c45b had a valid patch_ref and a 12067-byte patch in .runtime-docker/artifacts, but integration could not read /runtime/artifacts/... inside the E2E driver container.
+  - Root cause: agentd returns container artifact paths while the E2E driver sees host-mounted artifact paths.
+  - Fixed PatchIntegrationService to map /runtime/artifacts to AGENTD_HOST_ARTIFACT_ROOT, AGENTD_ARTIFACT_ROOT, .runtime-docker/artifacts, or run-data/artifacts before sha256 verification.
+  - Evidence: openEuler Docker python3 -m pytest testing/unittest/applications/test_patch_integration.py testing/unittest/applications/test_incident_execution_provider.py -q passed with 22 tests.
+
+- [x] Runtime tester direct_tool payload fix
+  - Failed run runtime_real_cf8cc103fed1 reached tester after a successful coder patch, but direct_tool returned: direct_tool backend requires task_input.__tool.name.
+  - Root cause: tester_node submitted only integrated_commit, while DirectToolBackend requires task_input.__tool.name.
+  - Fixed tester_node to submit __tool.name=run_pytest with pytest arguments.
+  - Evidence: openEuler Docker python3 -m pytest testing/unittest/applications/test_tester_business_failure.py testing/unittest/applications/test_incident_execution_provider.py -q passed with 22 tests.
+
+- [x] Runtime completed Agent reuse status sync fix
+  - Failed run runtime_real_7992e409fc22 reused coder_a after a successful coder task and failed with: Agent 'coder_a' cannot transition from AgentStatus.COMPLETED to AgentStatus.RUNNING.
+  - Root cause: daemon reset AgentSpec.status to READY but left AgentControlBlock.status at COMPLETED on task submission/reuse paths.
+  - Fixed completed Agent reuse to synchronize AgentSpec and ACB to READY before dispatch.
+  - Evidence: openEuler Docker python3 -m pytest testing/unittest/daemon/test_lifecycle.py testing/unittest/applications/test_tester_business_failure.py testing/unittest/applications/test_incident_execution_provider.py -q passed with 45 tests.
+
+- [x] TODO 9 Runtime real E2E
   - Run scripts/run_real_runtime.py with --require-real.
   - Acceptance includes native_planner, codex_cli coder, direct_tool tester, read-only reviewer, task/attempt/worker/Codex PID evidence, ResourceLease evidence, Runtime trace backend events, lease cleanup, and no legacy_llm fallback.
+  - Evidence: openEuler Docker run runtime_real_4c442fe4667a returned SUCCESS; summary shows patch_non_empty=true, pytest_returncode=0, tests_passed=9, review_approved=true; agentd metrics show 8 tasks success, 0 failed, llm_backend=deepseek, llm_api_key_present=true, and active leases=[].
 
 - [ ] TODO 10 Runtime continuous success verification
   - Run Runtime real E2E at least three times.

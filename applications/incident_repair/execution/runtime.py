@@ -6,6 +6,7 @@ from collections import defaultdict
 from typing import Any
 
 from aruntime.api.client import AgentRuntimeClient
+from aruntime.core.models import WorkspaceSpec
 
 from applications.incident_repair.config import IncidentRunConfig
 from applications.incident_repair.execution.base import AgentExecutionRequest, AgentExecutionResult, ExecutionProvider
@@ -53,6 +54,7 @@ class AgentRuntimeExecutionProvider(ExecutionProvider):
         task = self.client.submit_task(
             self._agent_for_role(request.role),
             payload,
+            context_id=request.idempotency_key if self.config.recovery_context_enabled else "",
             resource_request=request.resource_request,
             required_capability=self._capability_for_role(request.role),
             required_backend=self._backend_for_request(request),
@@ -62,6 +64,13 @@ class AgentRuntimeExecutionProvider(ExecutionProvider):
             root_task_id=request.run_id,
             idempotency_key=request.idempotency_key,
             failure_policy=self._failure_policy_for_role(request.role),
+            workspace=WorkspaceSpec(
+                source_repo=request.source_repo,
+                base_ref=request.base_commit,
+                base_commit=request.base_commit,
+                workspace_path=request.workspace_path,
+                read_only=request.role in ("tester", "reviewer"),
+            ).model_dump(mode="json", exclude_none=True),
         )
         task_id = str(task["task_id"])
         self._run_task_ids[request.run_id].add(task_id)
@@ -136,22 +145,9 @@ class AgentRuntimeExecutionProvider(ExecutionProvider):
                     raise
                 parse_error = str(exc)
                 status = "FAILED"
-        patch_ref = None
-        artifact_refs: list[str] = []
-        artifacts = result.get("artifacts") if isinstance(result, dict) else None
-        if isinstance(artifacts, list):
-            for artifact in artifacts:
-                if not isinstance(artifact, dict):
-                    continue
-                artifact_refs.append(str(artifact.get("artifact_id") or ""))
-                if artifact.get("artifact_type") == "patch":
-                    patch_ref = {
-                        "task_local_id": str(request.task_input.get("local_id") or request.graph_node),
-                        "artifact_id": artifact.get("artifact_id"),
-                        "patch_path": str(artifact.get("path") or ""),
-                        "sha256": str(artifact.get("sha256") or ""),
-                        "changed_files": list((artifact.get("metadata") or {}).get("changed_files", [])),
-                    }
+        artifacts = self._artifacts_from_task(result, attempts)
+        artifact_refs = [str(artifact.get("artifact_id") or "") for artifact in artifacts]
+        patch_ref = self._patch_ref_from_artifacts(request, artifacts)
         metrics = timer.finish(
             queue_wait_ms=float(scheduler.get("queue_wait_ms") or 0),
             total_tokens=float((task.get("llm_usage") or {}).get("total_tokens") or 0),
@@ -217,6 +213,29 @@ class AgentRuntimeExecutionProvider(ExecutionProvider):
         if isinstance(output, str):
             return bool(output.strip())
         return False
+
+    def _artifacts_from_task(self, result: dict[str, Any], attempts: list[Any]) -> list[dict[str, Any]]:
+        artifacts: list[dict[str, Any]] = []
+        if isinstance(result, dict) and isinstance(result.get("artifacts"), list):
+            artifacts.extend([item for item in result["artifacts"] if isinstance(item, dict)])
+        for attempt in attempts:
+            if not isinstance(attempt, dict) or not isinstance(attempt.get("artifacts"), list):
+                continue
+            artifacts.extend([item for item in attempt["artifacts"] if isinstance(item, dict)])
+        return artifacts
+
+    def _patch_ref_from_artifacts(self, request: AgentExecutionRequest, artifacts: list[dict[str, Any]]) -> dict[str, Any] | None:
+        for artifact in artifacts:
+            if artifact.get("artifact_type") != "patch":
+                continue
+            return {
+                "task_local_id": str(request.task_input.get("local_id") or request.graph_node),
+                "artifact_id": artifact.get("artifact_id"),
+                "patch_path": str(artifact.get("path") or ""),
+                "sha256": str(artifact.get("sha256") or ""),
+                "changed_files": list((artifact.get("metadata") or {}).get("changed_files", [])),
+            }
+        return None
 
     def _agent_for_role(self, role: str) -> str | None:
         return {"planner": "architect", "coder": None, "repair": "repair", "tester": "tester", "reviewer": "reviewer", "integrator": None}.get(role)

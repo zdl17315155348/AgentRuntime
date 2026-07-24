@@ -21,13 +21,14 @@ class IncidentRunConfig(BaseModel):
     base_commit: str
     max_concurrency: int = 4
     max_repair_rounds: int = 2
-    deepseek_model: str = "deepseek-chat"
+    deepseek_model: str = "deepseek-v4-flash"
     codex_model: str | None = None
     task_timeout_s: int = 300
     workflow_timeout_s: int = 900
     fault_mode: bool = False
     fault_target_role: str = "coder"
     fault_trigger: str = "after_first_file_read"
+    recovery_context_enabled: bool = True
     cpu_limit: float | None = None
     memory_limit_mb: int | None = None
     benchmark_id: str | None = None

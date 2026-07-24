@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import shutil
 import subprocess
 from dataclasses import dataclass
@@ -38,7 +39,7 @@ class PatchIntegrationService:
         conflict_files: list[str] = []
         try:
             for ref in sorted(patch_refs, key=lambda item: str(item.get("task_local_id") or "")):
-                patch_path = Path(str(ref.get("patch_path") or ""))
+                patch_path = _resolve_patch_path(Path(str(ref.get("patch_path") or "")))
                 sha256 = str(ref.get("sha256") or "")
                 if not patch_path.exists():
                     return PatchIntegrationResult("FAILED", str(worktree), base_commit, None, applied, changed, conflict_files, f"missing patch: {patch_path}")
@@ -76,3 +77,26 @@ class PatchIntegrationService:
             return PatchIntegrationResult("SUCCESS", str(worktree), base_commit, head.stdout.strip(), applied, changed, conflict_files, None)
         except Exception as exc:
             return PatchIntegrationResult("FAILED", str(worktree), base_commit, None, applied, changed, conflict_files, str(exc))
+
+
+def _resolve_patch_path(path: Path) -> Path:
+    if path.exists():
+        return path
+    runtime_root = Path("/runtime/artifacts")
+    try:
+        relative = path.relative_to(runtime_root)
+    except ValueError:
+        return path
+    candidates = []
+    env_root = os.getenv("AGENTD_HOST_ARTIFACT_ROOT") or os.getenv("AGENTD_ARTIFACT_ROOT")
+    if env_root:
+        candidates.append(Path(env_root) / relative)
+    repo_root = Path(__file__).resolve().parents[3]
+    candidates.extend([
+        repo_root / ".runtime-docker/artifacts" / relative,
+        repo_root / "run-data/artifacts" / relative,
+    ])
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return path

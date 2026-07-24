@@ -18,6 +18,7 @@ class AgentRuntimeClient:
         max_retries: int = 3,
         capability: Optional[dict] = None,
         backend: Optional[dict] = None,
+        failure_policy: Optional[dict] = None,
     ) -> dict:
         payload = {
             "agent_name": agent_name,
@@ -30,7 +31,14 @@ class AgentRuntimeClient:
             payload["capability"] = capability
         if backend is not None:
             payload["backend"] = backend
+        if failure_policy is not None:
+            payload["failure_policy"] = failure_policy
         resp = self.client.post(f"{self.base_url}/agents", json=payload)
+        resp.raise_for_status()
+        return resp.json()
+
+    def list_agents(self) -> dict:
+        resp = self.client.get(f"{self.base_url}/agents")
         resp.raise_for_status()
         return resp.json()
 
@@ -51,6 +59,7 @@ class AgentRuntimeClient:
         trace_id: str = "",
         root_task_id: str = "",
         idempotency_key: Optional[str] = None,
+        workspace: Optional[dict] = None,
     ) -> dict:
         payload: dict = {
             "agent_name": agent_name,
@@ -80,6 +89,8 @@ class AgentRuntimeClient:
             payload["root_task_id"] = root_task_id
         if idempotency_key is not None:
             payload["idempotency_key"] = idempotency_key
+        if workspace is not None:
+            payload["workspace"] = workspace
         resp = self.client.post(
             f"{self.base_url}/tasks",
             json=payload,

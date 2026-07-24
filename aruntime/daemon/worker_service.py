@@ -29,6 +29,7 @@ def start_worker_process(
     auth_token: str,
     llm_backend: str = "mock",
     llm_api_key: str = "",
+    llm_model: str = "",
 ) -> subprocess.Popen:
     if isinstance(agent, AgentSpec):
         agent_name = agent.agent_name
@@ -44,6 +45,8 @@ def start_worker_process(
     env["AGENT_AUTH_TOKEN"] = auth_token
     env["LLM_BACKEND"] = llm_backend
     env["LLM_API_KEY"] = llm_api_key or ""
+    if llm_model:
+        env["LLM_MODEL"] = llm_model
     logs = log_dir()
     stdout_path = os.path.join(logs, f"{agent_name}.stdout.log")
     stderr_path = os.path.join(logs, f"{agent_name}.stderr.log")

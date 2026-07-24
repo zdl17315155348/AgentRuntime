@@ -66,7 +66,18 @@ def normalize_inspection_payload(payload: dict[str, Any]) -> dict[str, Any]:
     files = payload.get("files")
     searches = payload.get("searches")
     if isinstance(files, list) or isinstance(searches, list):
-        return payload
+        normalized = dict(payload)
+        if isinstance(files, list):
+            normalized["files"] = [str(item) for item in files if isinstance(item, str) and item]
+        if isinstance(searches, list):
+            normalized_searches = []
+            for item in searches:
+                if isinstance(item, dict):
+                    normalized_searches.append(item)
+                elif isinstance(item, str) and item:
+                    normalized_searches.append({"query": item, "path": "."})
+            normalized["searches"] = normalized_searches
+        return normalized
     extracted_files: list[str] = []
     for key in ("tasks", "items", "plan"):
         values = payload.get(key)

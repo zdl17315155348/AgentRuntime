@@ -6,7 +6,7 @@ agents:
       不得修改代码。
     backend:
       type: native_planner
-      model: deepseek-chat
+      model: deepseek-v4-flash
       sandbox: read-only
       timeout_s: 120
       max_inspection_files: 6

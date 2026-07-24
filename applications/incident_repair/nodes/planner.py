@@ -8,7 +8,7 @@ from applications.incident_repair.schemas import PlanSpec
 
 async def planner_node(state: dict, runtime):
     context = context_from_runtime(runtime)
-    timeout_s = min(int(context.run_config.task_timeout_s), 300)
+    timeout_s = int(context.run_config.task_timeout_s)
     request = AgentExecutionRequest(
         run_id=state["run_id"],
         thread_id=state["thread_id"],

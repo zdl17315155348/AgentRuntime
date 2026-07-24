@@ -213,7 +213,7 @@ def _write_manifest(
         "demo_base_commit": repo_info["base_commit"],
         "docker_image_id": _optional_stdout(["docker", "image", "inspect", "agent-runtime-os:openeuler", "--format", "{{.Id}}"]),
         "codex_version": _optional_stdout(["codex", "--version"]),
-        "deepseek_model": "deepseek-chat",
+        "deepseek_model": "deepseek-v4-flash",
         "started_at": started_at,
         "finished_at": finished_at,
         "source_repo": repo_info["prepared_repo"],

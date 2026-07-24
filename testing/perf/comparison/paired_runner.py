@@ -14,7 +14,12 @@ FAIRNESS_FIELDS = (
     "memory_limit_mb",
     "concurrency",
     "task_description_hash",
-    "fault_mode",
+    "experiment",
+    "direct_retry_enabled",
+    "runtime_fault_enabled",
+    "recovery_context_enabled",
+    "fault_target_agent",
+    "fault_trigger",
     "release_commit",
 )
 

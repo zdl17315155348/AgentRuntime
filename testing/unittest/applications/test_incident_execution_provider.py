@@ -169,6 +169,10 @@ async def test_runtime_provider_reuses_client_and_maps_request_fields():
     assert result.runtime_task_id == "t1"
     assert result.structured_result["returncode"] == 0
     assert client.submitted["task_input"]["graph_managed"] is True
+    assert client.submitted["workspace"]["source_repo"] == "."
+    assert client.submitted["workspace"]["base_commit"] == "HEAD"
+    assert client.submitted["workspace"]["base_ref"] == "HEAD"
+    assert client.submitted["workspace"]["read_only"] is True
 
 
 @pytest.mark.anyio
@@ -277,6 +281,41 @@ async def test_runtime_provider_parses_codex_coder_json_output():
         "tests_run": ["pytest"],
         "remaining_issues": [],
     }
+
+
+@pytest.mark.anyio
+async def test_runtime_provider_reads_patch_from_attempt_artifacts():
+    patch = {
+        "artifact_id": "artifact_patch",
+        "artifact_type": "patch",
+        "path": "/runtime/artifacts/run1/a1/changes.patch",
+        "sha256": "abc",
+        "metadata": {"changed_files": ["app/auth.py"]},
+    }
+
+    class _CodexCoderClient(_FakeClient):
+        def wait_task(self, task_id, timeout_s):
+            return {
+                "task_id": task_id,
+                "status": "SUCCESS",
+                "result": {"output": '{"completed": true, "summary": "fixed", "tests_run": ["pytest"], "remaining_issues": []}'},
+                "attempts": [{"attempt_id": "a1", "artifacts": [patch]}],
+                "scheduler": {},
+            }
+
+    request = _request("codex_cli", "coder")
+    request.task_input["local_id"] = "fix_auth"
+    provider = create_execution_provider(_config(ExecutionMode.RUNTIME), {"client": _CodexCoderClient()})
+    result = await provider.execute(request)
+
+    assert result.patch_ref == {
+        "task_local_id": "fix_auth",
+        "artifact_id": "artifact_patch",
+        "patch_path": "/runtime/artifacts/run1/a1/changes.patch",
+        "sha256": "abc",
+        "changed_files": ["app/auth.py"],
+    }
+    assert result.artifact_refs == ["artifact_patch"]
 
 
 @pytest.mark.anyio

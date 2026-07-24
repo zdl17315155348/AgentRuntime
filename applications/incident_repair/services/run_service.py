@@ -152,11 +152,23 @@ def register_demo_agents(client: AgentRuntimeClient, agents_file: str | Path = "
                 system_prompt=item.get("system_prompt", ""),
                 capability=item.get("capability", {}),
                 backend=item.get("backend", {"type": "legacy_llm"}),
+                failure_policy=item.get("failure_policy"),
             )
         except TypeError:
             client.create_agent(item["name"], item.get("role", item["name"]), item.get("system_prompt", ""))
         except Exception as exc:
-            if "已存在" not in str(exc):
+            if not _agent_already_exists_error(exc):
                 raise
         registered.append(item["name"])
     return registered
+
+
+def _agent_already_exists_error(exc: Exception) -> bool:
+    text = str(exc)
+    response = getattr(exc, "response", None)
+    if response is not None:
+        try:
+            text = f"{text} {response.text}"
+        except Exception:
+            pass
+    return "已存在" in text or "already exists" in text

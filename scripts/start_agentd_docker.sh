@@ -15,6 +15,7 @@ ARTIFACT_DIR="${ARTIFACT_DIR:-$RUN_DATA_DIR/artifacts}"
 WORKSPACE_DIR="${WORKSPACE_DIR:-$RUN_DATA_DIR/workspaces}"
 STATE_DIR="${STATE_DIR:-$RUN_DATA_DIR/state}"
 LOG_DIR="${LOG_DIR:-$RUN_DATA_DIR/logs}"
+SHARED_RUN_DATA_DIR="${SHARED_RUN_DATA_DIR:-$PROJECT_DIR/run-data}"
 CODEX_HOME_MOUNT=()
 if [ -f "${CODEX_HOME:-$HOME/.codex}/config.toml" ]; then
   CODEX_HOME_MOUNT=(-v "${CODEX_HOME:-$HOME/.codex}/config.toml:/root/.codex/config.toml:ro")
@@ -32,7 +33,7 @@ if [ ! -x "$PROJECT_DIR/third_party/codex/codex" ]; then
   exit 1
 fi
 
-mkdir -p "$ARTIFACT_DIR" "$WORKSPACE_DIR" "$STATE_DIR" "$LOG_DIR"
+mkdir -p "$ARTIFACT_DIR" "$WORKSPACE_DIR" "$STATE_DIR" "$LOG_DIR" "$SHARED_RUN_DATA_DIR"
 
 $DOCKER build \
   -f deploy/Dockerfile.openeuler \
@@ -52,6 +53,7 @@ RUN_ARGS=(
   -v "$ARTIFACT_DIR:/runtime/artifacts"
   -v "$STATE_DIR:/runtime/state"
   -v "$LOG_DIR:/runtime/logs"
+  -v "$SHARED_RUN_DATA_DIR:/app/run-data"
   -e RUNTIME_CONFIG=/app/configs/runtime.json
 )
 

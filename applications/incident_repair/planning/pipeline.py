@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from pydantic import ValidationError
+
 from aruntime.planner.models import InspectionRequest, PlanSpec
 from aruntime.planner.parser import load_json_object, normalize_inspection_payload, normalize_plan_payload
 from aruntime.planner.prompt_builder import build_inspection_prompt, build_plan_prompt
@@ -31,8 +33,12 @@ class PlannerPipeline:
     ) -> PlannerPipelineResult:
         repo_tree = await inspector.repo_scan()
         inspection_prompt = build_inspection_prompt(goal, repo_tree[:200], "", available_roles, {"max_files": max_inspection_files, "max_searches": 4})
-        first = await llm.complete(system_prompt, inspection_prompt)
-        inspection = InspectionRequest(**normalize_inspection_payload(load_json_object(first.output)))
+        inspection = await _complete_json_model(
+            llm,
+            system_prompt,
+            inspection_prompt,
+            lambda output: InspectionRequest(**normalize_inspection_payload(load_json_object(output))),
+        )
         if not inspection.files and not inspection.searches:
             inspection = InspectionRequest(files=_fallback_inspection_files(repo_tree, max_inspection_files), searches=[], summary="fallback from repo_scan")
         inspected: dict[str, Any] = {"files": {}, "searches": []}
@@ -41,8 +47,12 @@ class PlannerPipeline:
         for search in inspection.searches[:4]:
             inspected["searches"].append({"query": search.query, "path": search.path, "matches": await inspector.search_code(search.query, search.path)})
         plan_prompt = build_plan_prompt(goal, inspected, available_roles)
-        second = await llm.complete(system_prompt, plan_prompt)
-        plan = PlanSpec(**normalize_plan_payload(load_json_object(second.output)))
+        plan = await _complete_json_model(
+            llm,
+            system_prompt,
+            plan_prompt,
+            lambda output: PlanSpec(**normalize_plan_payload(load_json_object(output))),
+        )
         validate_plan(plan)
         return PlannerPipelineResult(inspection=inspection, plan=plan, repo_tree=repo_tree)
 
@@ -58,3 +68,16 @@ def _fallback_inspection_files(repo_tree: list[str], max_files: int) -> list[str
         if path.startswith("app/") or path.startswith("tests/"):
             files.append(path)
     return files[:max_files]
+
+
+async def _complete_json_model(llm: PlannerLLM, system_prompt: str, prompt: str, parse):
+    last_error: Exception | None = None
+    for _ in range(2):
+        result = await llm.complete(system_prompt, prompt)
+        try:
+            return parse(result.output)
+        except (ValueError, ValidationError) as exc:
+            last_error = exc
+    if last_error is not None:
+        raise last_error
+    raise ValueError("empty planner response")

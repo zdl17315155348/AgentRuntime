@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import BaseModel, Field
 
 
@@ -12,8 +14,13 @@ class BenchmarkConfig(BaseModel):
     measured_runs: int = 30
     cpu_limit: float
     memory_limit_mb: int
+    experiment: Literal["baseline", "fault_recovery", "recovery_context"] = "baseline"
+    direct_retry_enabled: bool = False
+    runtime_fault_enabled: bool = False
     fault_mode: bool = False
     recovery_context_enabled: bool = True
+    fault_target_agent: str = "coder_a"
+    fault_trigger: str = "backend.started"
     codex_model: str | None = None
     deepseek_model: str
     base_commit: str
@@ -25,6 +32,7 @@ class BenchmarkConfig(BaseModel):
     data_kind: str = "real_agent"
     performance_claim_allowed: bool = True
     performance_claim_reason: str = ""
+    registration: dict = Field(default_factory=dict)
 
 
 class RunMetric(BaseModel):
@@ -50,6 +58,14 @@ class RunMetric(BaseModel):
     cpu_limit: float | None = None
     memory_limit_mb: int | None = None
     task_description_hash: str = ""
+    experiment: str = "baseline"
+    direct_retry_enabled: bool = False
+    runtime_fault_enabled: bool = False
+    recovery_context_enabled: bool = True
+    fault_target_agent: str = "coder_a"
+    fault_trigger: str = "backend.started"
+    fault_injected: bool = False
+    fault_injected_at_ms: float = 0
     fault_mode: bool = False
     release_commit: str = ""
 
@@ -79,6 +95,14 @@ class WorkflowMetric(BaseModel):
     cpu_limit: float | None = None
     memory_limit_mb: int | None = None
     task_description_hash: str = ""
+    experiment: str = "baseline"
+    direct_retry_enabled: bool = False
+    runtime_fault_enabled: bool = False
+    recovery_context_enabled: bool = True
+    fault_target_agent: str = "coder_a"
+    fault_trigger: str = "backend.started"
+    fault_injected: bool = False
+    fault_injected_at_ms: float = 0
     fault_mode: bool = False
     release_commit: str = ""
 
@@ -96,6 +120,12 @@ class TrialMetric(BaseModel):
     success_count: int
     failure_count: int
     peak_rss_mb: float = 0
+    experiment: str = "baseline"
+    direct_retry_enabled: bool = False
+    runtime_fault_enabled: bool = False
+    recovery_context_enabled: bool = True
+    fault_target_agent: str = "coder_a"
+    fault_trigger: str = "backend.started"
 
 
 class PairedRun(BaseModel):

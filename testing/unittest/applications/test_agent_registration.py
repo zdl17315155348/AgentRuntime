@@ -16,6 +16,10 @@ class _Client:
         return {"ok": True}
 
 
+class _AlreadyExistsError(Exception):
+    pass
+
+
 def test_demo_agents_register_explicit_heterogeneous_backends():
     client = _Client()
     registered = register_demo_agents(client, Path("examples/production_incident_demo/agents.yaml"))
@@ -24,8 +28,20 @@ def test_demo_agents_register_explicit_heterogeneous_backends():
     by_name = {call["agent_name"]: call for call in client.calls}
     assert by_name["architect"]["backend"]["type"] == "native_planner"
     assert by_name["coder_a"]["backend"]["type"] == "codex_cli"
+    assert by_name["coder_a"]["failure_policy"]["mode"] == "fallback"
+    assert by_name["coder_a"]["failure_policy"]["fallback_agent"] == "coder_b"
     assert by_name["tester"]["backend"]["type"] == "direct_tool"
     assert by_name["reviewer"]["backend"]["sandbox"] == "read-only"
+
+
+def test_demo_agent_registration_is_idempotent_for_existing_agents():
+    class _ClientExists:
+        def create_agent(self, **kwargs):
+            raise _AlreadyExistsError("Agent 已存在")
+
+    registered = register_demo_agents(_ClientExists(), Path("examples/production_incident_demo/agents.yaml"))
+
+    assert registered == ["architect", "coder_a", "coder_b", "tester", "repair", "reviewer"]
 
 
 def test_agents_yaml_has_no_legacy_backend_fallback_for_demo_roles():

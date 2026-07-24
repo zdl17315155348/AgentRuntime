@@ -96,6 +96,8 @@ class TestAgentLifecycleAPI:
         lifecycle_test = [a for a in agents if a["name"] == agent_name]
         assert len(lifecycle_test) == 1
         assert lifecycle_test[0]["status"] == "READY"
+        assert "backend" in lifecycle_test[0]
+        assert "failure_policy" in lifecycle_test[0]
 
     def test_submit_task_changes_agent_status(self, client):
         """提交任务后 Agent 状态变为 RUNNING，完成后变为 COMPLETED"""
@@ -125,6 +127,32 @@ class TestAgentLifecycleAPI:
         assert task_data["runtime"]["agent_name"] == agent_name
         assert task_data["runtime"]["agent_status"] == "COMPLETED"
         assert task_data["runtime"]["trace_id"].startswith("trace_")
+
+    def test_completed_agent_can_be_reused_for_next_task(self, client):
+        suffix = str(int(time.time() * 1000))
+        agent_name = f"lifecycle_test_reuse_{suffix}"
+        client.post("/agents", json={
+            "agent_name": agent_name,
+            "role": "测试员",
+        })
+        first = client.post("/tasks", json={
+            "agent_name": agent_name,
+            "task_input": {"request": "第一次任务"},
+        })
+        assert first.status_code == 200
+        first_data = wait_task_done(client, first.json()["task_id"], timeout_s=10.0)
+        assert first_data["status"] == "SUCCESS"
+        assert first_data["runtime"]["agent_status"] == "COMPLETED"
+
+        second = client.post("/tasks", json={
+            "agent_name": agent_name,
+            "task_input": {"request": "第二次任务"},
+        })
+        assert second.status_code == 200
+        second_data = wait_task_done(client, second.json()["task_id"], timeout_s=10.0)
+
+        assert second_data["status"] == "SUCCESS"
+        assert second_data["runtime"]["agent_name"] == agent_name
 
     def test_submit_task_to_busy_agent(self, client):
         """Agent 正在执行时提交新任务应进入队列"""

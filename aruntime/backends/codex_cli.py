@@ -39,7 +39,7 @@ class CodexCLIBackend(AgentBackend):
         if self.config.ephemeral:
             command.append("--ephemeral")
         command.append("--json")
-        if self.config.output_schema:
+        if self.config.output_schema and os.getenv("CODEX_ENABLE_OUTPUT_SCHEMA") == "1":
             command.extend(["--output-schema", self._schema_path(self.config.output_schema)])
         final_path = self._final_json_path(request)
         command.extend(["--output-last-message", str(final_path), prompt])
@@ -139,6 +139,17 @@ class CodexCLIBackend(AgentBackend):
             parts.append(request.system_prompt)
         if request.user_message:
             parts.append(request.user_message)
+        goal = request.task_input.get("goal") if isinstance(request.task_input, dict) else None
+        if goal:
+            parts.append(f"Goal:\n{goal}")
+        if request.workspace.workspace_path:
+            workspace_path = str(Path(request.workspace.workspace_path).resolve())
+            parts.append(
+                "Workspace:\n"
+                f"{workspace_path}\n"
+                "Only inspect and modify files under this workspace. "
+                "Do not edit the source repository path or example/template repository paths."
+            )
         if request.task_input:
             parts.append("Task input JSON:\n" + json.dumps(request.task_input, ensure_ascii=False))
         if request.runtime_context:

@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import pytest
 
-from applications.incident_repair.config import ExecutionMode, IncidentRunConfig
-from applications.incident_repair.execution.base import AgentExecutionRequest
+from applications.incident_repair.config import ExecutionMode, GraphRuntimeContext, IncidentRunConfig
+from applications.incident_repair.execution.base import AgentExecutionRequest, AgentExecutionResult, ExecutionMetrics
 from applications.incident_repair.execution.direct import DirectExecutionProvider
+from applications.incident_repair.nodes.tester import tester_node as run_tester_node
 
 
 class _WorkspaceManager:
@@ -53,3 +54,42 @@ async def test_tester_runs_in_integrated_commit_worktree_and_keeps_pytest_failur
     assert result.status == "SUCCESS"
     assert result.structured_result["returncode"] == 1
     assert workspace_manager.cleaned["force"] is True
+
+
+@pytest.mark.anyio
+async def test_tester_node_submits_run_pytest_tool_payload():
+    class _Provider:
+        mode = "runtime"
+
+        def __init__(self):
+            self.request = None
+
+        async def execute(self, request):
+            self.request = request
+            metrics = ExecutionMetrics(submit_started_at=0, execution_started_at=0, execution_finished_at=0)
+            return AgentExecutionResult(
+                status="SUCCESS",
+                structured_result={"returncode": 0, "passed": 1, "failed": 0, "failed_tests": [], "report_artifact_id": None},
+                runtime_task_id="task_tester",
+                metrics=metrics,
+            )
+
+    provider = _Provider()
+    state = {
+        "run_id": "run",
+        "thread_id": "thread",
+        "source_repo": "/repo",
+        "base_commit": "base",
+        "integrated_commit": "deadbeef",
+    }
+
+    config = IncidentRunConfig(execution_mode=ExecutionMode.RUNTIME, run_id="run", thread_id="thread", source_repo="/repo", base_commit="base")
+    context = GraphRuntimeContext(provider=provider, run_config=config, event_bus=None)
+
+    update = await run_tester_node(state, context)
+
+    assert provider.request.task_input["integrated_commit"] == "deadbeef"
+    assert provider.request.task_input["__tool"]["name"] == "run_pytest"
+    assert provider.request.task_input["__tool"]["arguments"]["paths"] == ["tests"]
+    assert provider.request.base_commit == "deadbeef"
+    assert update["test_summary"]["returncode"] == 0

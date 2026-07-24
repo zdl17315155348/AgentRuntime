@@ -5,20 +5,35 @@ import asyncio
 import csv
 import hashlib
 import json
+import os
 import subprocess
 import time
 from pathlib import Path
 from uuid import uuid4
 
+import httpx
+import yaml
+
+from aruntime.api.client import AgentRuntimeClient
 from applications.incident_repair.config import ExecutionMode, IncidentRunConfig
 from applications.incident_repair.execution.base import AgentExecutionRequest, AgentExecutionResult, ExecutionMetrics, ExecutionProvider
 from applications.incident_repair.services.run_service import IncidentRunService
+from applications.incident_repair.services.run_service import register_demo_agents
 from testing.perf.comparison.metrics import summarize_metrics
 from testing.perf.comparison.paired_runner import check_pair_fairness
 from testing.perf.comparison.schemas import BenchmarkConfig, PairedRun, RunMetric, TrialMetric, WorkflowMetric
 
 
 TASK_DESCRIPTION = "修复认证、JWT和订单安全问题"
+AGENTS_FILE = Path("examples/production_incident_demo/agents.yaml")
+REQUIRED_AGENT_BACKENDS = {
+    "architect": "native_planner",
+    "coder_a": "codex_cli",
+    "coder_b": "codex_cli",
+    "tester": "direct_tool",
+    "repair": "codex_cli",
+    "reviewer": "codex_cli",
+}
 
 
 def write_benchmark_outputs(config: BenchmarkConfig, metrics: list[RunMetric], root: str | Path = "run-data/benchmarks", workflow_metrics: list[WorkflowMetric] | None = None, trial_metrics: list[TrialMetric] | None = None) -> Path:
@@ -56,6 +71,14 @@ def write_benchmark_outputs(config: BenchmarkConfig, metrics: list[RunMetric], r
             cpu_limit=metric.cpu_limit,
             memory_limit_mb=metric.memory_limit_mb,
             task_description_hash=metric.task_description_hash,
+            experiment=metric.experiment,
+            direct_retry_enabled=metric.direct_retry_enabled,
+            runtime_fault_enabled=metric.runtime_fault_enabled,
+            recovery_context_enabled=metric.recovery_context_enabled,
+            fault_target_agent=metric.fault_target_agent,
+            fault_trigger=metric.fault_trigger,
+            fault_injected=metric.fault_injected,
+            fault_injected_at_ms=metric.fault_injected_at_ms,
             fault_mode=metric.fault_mode,
             release_commit=metric.release_commit,
         )
@@ -97,6 +120,14 @@ def write_benchmark_outputs(config: BenchmarkConfig, metrics: list[RunMetric], r
         "performance_claim_allowed": config.performance_claim_allowed,
         "performance_claim_reason": config.performance_claim_reason,
         "prompt_hash": config.prompt_hash,
+        "experiment": config.experiment,
+        "direct_retry_enabled": config.direct_retry_enabled,
+        "runtime_fault_enabled": config.runtime_fault_enabled,
+        "recovery_context_enabled": config.recovery_context_enabled,
+        "fault_target_agent": config.fault_target_agent,
+        "fault_trigger": config.fault_trigger,
+        "scenario_metadata": scenario_metadata(config),
+        "registration": config.registration,
         "release_commit": config.release_commit,
         "all_pairs_comparable": all(pair.comparable for pair in pairs),
     }
@@ -130,6 +161,70 @@ def build_measured_pairs(metrics: list[RunMetric]) -> list[PairedRun]:
             continue
         pairs.append(check_pair_fairness(direct.model_dump(), runtime.model_dump()))
     return pairs
+
+
+def scenario_metadata(config: BenchmarkConfig) -> dict:
+    return {
+        "experiment": config.experiment,
+        "direct_retry_enabled": config.direct_retry_enabled,
+        "runtime_fault_enabled": config.runtime_fault_enabled,
+        "recovery_context_enabled": config.recovery_context_enabled,
+        "fault_target_agent": config.fault_target_agent,
+        "fault_trigger": config.fault_trigger,
+    }
+
+
+def prepare_runtime_benchmark_agents(config: BenchmarkConfig, base_url: str | None = None, agents_file: str | Path = AGENTS_FILE) -> dict:
+    if "runtime" not in set(config.modes):
+        return {"required": False, "registered": [], "agents": {}}
+    base_url = base_url or os.environ.get("AGENTD_BASE_URL", "http://127.0.0.1:8234")
+    client = AgentRuntimeClient(base_url)
+    started = time.perf_counter()
+    try:
+        metrics = client.get_metrics()
+    except Exception as exc:
+        raise RuntimeError(f"runtime benchmark requires reachable agentd at {base_url}: {exc}") from exc
+    runtime_config = metrics.get("runtime_config") if isinstance(metrics.get("runtime_config"), dict) else {}
+    llm_backend = str(runtime_config.get("llm_backend") or "").strip()
+    if llm_backend == "mock":
+        raise RuntimeError("runtime benchmark requires agentd llm_backend != mock")
+    if runtime_config and not runtime_config.get("llm_api_key_present"):
+        raise RuntimeError("runtime benchmark requires LLM key inside agentd")
+    registered = register_demo_agents(client, agents_file)
+    agents_payload = client.list_agents()
+    agents = agents_payload.get("agents") if isinstance(agents_payload, dict) else []
+    agent_by_name = {str(item.get("name") or ""): item for item in agents if isinstance(item, dict)}
+    yaml_agents = _load_agents_yaml(agents_file)
+    missing = [name for name in REQUIRED_AGENT_BACKENDS if name not in agent_by_name]
+    if missing:
+        raise RuntimeError(f"runtime benchmark missing registered agents: {', '.join(missing)}")
+    mismatches: list[str] = []
+    for name, expected in REQUIRED_AGENT_BACKENDS.items():
+        actual = str(((agent_by_name[name].get("backend") or {}).get("type") or ""))
+        yaml_backend = str((((yaml_agents.get(name) or {}).get("backend") or {}).get("type") or ""))
+        if actual != expected or yaml_backend != expected:
+            mismatches.append(f"{name}:agentd={actual or 'missing'},yaml={yaml_backend or 'missing'},expected={expected}")
+    reviewer_sandbox = str(((agent_by_name["reviewer"].get("backend") or {}).get("sandbox") or ""))
+    if reviewer_sandbox and reviewer_sandbox != "read-only":
+        mismatches.append(f"reviewer:sandbox={reviewer_sandbox},expected=read-only")
+    if mismatches:
+        raise RuntimeError("runtime benchmark agent backend mismatch: " + "; ".join(mismatches))
+    return {
+        "required": True,
+        "base_url": base_url,
+        "registered": registered,
+        "registration_ms": round((time.perf_counter() - started) * 1000, 3),
+        "llm_backend": llm_backend,
+        "llm_api_key_present": bool(runtime_config.get("llm_api_key_present")),
+        "agents": {name: {"backend": agent_by_name[name].get("backend"), "status": agent_by_name[name].get("status")} for name in REQUIRED_AGENT_BACKENDS},
+    }
+
+
+def _load_agents_yaml(agents_file: str | Path) -> dict[str, dict]:
+    path = Path(agents_file)
+    data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    items = data.get("agents") if isinstance(data, dict) else []
+    return {str(item.get("name")): item for item in items if isinstance(item, dict)}
 
 
 class SmokeBenchmarkProvider(ExecutionProvider):
@@ -190,10 +285,18 @@ async def run_one_workflow(
         cpu_limit=config.cpu_limit,
         memory_limit_mb=config.memory_limit_mb,
         benchmark_id=config.benchmark_id,
+        fault_mode=config.runtime_fault_enabled if mode == "runtime" else config.direct_retry_enabled,
+        fault_target_role=config.fault_target_agent,
+        fault_trigger=config.fault_trigger,
+        recovery_context_enabled=config.recovery_context_enabled,
     )
     dependencies = {"provider": SmokeBenchmarkProvider(), "integration_service": _SmokeIntegration()} if smoke else {}
+    fault_task: asyncio.Task | None = None
     try:
+        if not smoke and mode == "runtime" and config.runtime_fault_enabled:
+            fault_task = asyncio.create_task(_inject_runtime_fault_on_event(run_id, config))
         result = await service.execute_run(run_config, TASK_DESCRIPTION, dependencies)
+        fault_result = await fault_task if fault_task is not None else {}
         success = result["summary"]["status"] == "SUCCESS"
         error = str(result["summary"].get("error") or "")
         execution = result["summary"].get("execution") or {}
@@ -203,6 +306,9 @@ async def run_one_workflow(
         error = str(exc)
         execution = {}
         resources = {}
+        fault_result = {}
+        if fault_task is not None:
+            fault_task.cancel()
     return WorkflowMetric(
         trial_id=trial_id,
         workflow_index=workflow_index,
@@ -228,7 +334,15 @@ async def run_one_workflow(
         cpu_limit=config.cpu_limit,
         memory_limit_mb=config.memory_limit_mb,
         task_description_hash=config.task_description_hash,
-        fault_mode=config.fault_mode,
+        experiment=config.experiment,
+        direct_retry_enabled=config.direct_retry_enabled,
+        runtime_fault_enabled=config.runtime_fault_enabled,
+        recovery_context_enabled=config.recovery_context_enabled,
+        fault_target_agent=config.fault_target_agent,
+        fault_trigger=config.fault_trigger,
+        fault_injected=bool(fault_result.get("injected")),
+        fault_injected_at_ms=float(fault_result.get("injected_at_ms") or 0),
+        fault_mode=run_config.fault_mode,
         release_commit=config.release_commit,
     )
 
@@ -283,8 +397,120 @@ async def run_trial(
         success_count=success_count,
         failure_count=len(runs) - success_count,
         peak_rss_mb=max([run.peak_rss_mb for run in runs] or [0]),
+        experiment=config.experiment,
+        direct_retry_enabled=config.direct_retry_enabled,
+        runtime_fault_enabled=config.runtime_fault_enabled,
+        recovery_context_enabled=config.recovery_context_enabled,
+        fault_target_agent=config.fault_target_agent,
+        fault_trigger=config.fault_trigger,
     )
     return runs, trial
+
+
+async def _inject_runtime_fault_on_event(run_id: str, config: BenchmarkConfig) -> dict:
+    base_url = os.environ.get("AGENTD_BASE_URL", "http://127.0.0.1:8234")
+    client = AgentRuntimeClient(base_url)
+    deadline = time.time() + 900
+    last_id = 0
+    workflow_started = time.perf_counter()
+    while time.time() < deadline:
+        events = _run_events(base_url, run_id, last_id)
+        for event in events:
+            try:
+                last_id = max(last_id, int(event.get("id") or event.get("event_id") or last_id))
+            except (TypeError, ValueError):
+                pass
+            if _matches_fault_trigger(base_url, event, config):
+                injected_at_ms = round((time.perf_counter() - workflow_started) * 1000, 3)
+                result = client.inject_worker_sigkill(config.fault_target_agent)
+                return {
+                    "injected": True,
+                    "injected_at_ms": injected_at_ms,
+                    "event_id": event.get("id") or event.get("event_id"),
+                    "event_name": _event_name(event),
+                    "target_agent": config.fault_target_agent,
+                    "result": result,
+                }
+        summary = _run_summary(base_url, run_id)
+        if summary.get("status") in {"SUCCESS", "FAILED", "TIMEOUT", "CANCELLED"}:
+            return {"injected": False, "reason": "workflow finished before fault trigger"}
+        await asyncio.sleep(0.25)
+    return {"injected": False, "reason": f"fault trigger timeout: {config.fault_trigger}"}
+
+
+def _matches_fault_trigger(base_url: str, event: dict, config: BenchmarkConfig) -> bool:
+    configured = config.fault_trigger.replace("_", ".")
+    names = {configured}
+    if configured == "backend.started":
+        names.add("backend_started")
+    if _event_name(event) not in names:
+        return False
+    return _event_agent_name(base_url, event) == config.fault_target_agent
+
+
+def _run_events(base_url: str, run_id: str, after_id: int = 0) -> list[dict]:
+    try:
+        data = httpx.get(f"{base_url}/runs/{run_id}/events", params={"after_id": after_id}, timeout=3, trust_env=False).json()
+    except Exception:
+        return []
+    events = data.get("events")
+    return events if isinstance(events, list) else []
+
+
+def _run_summary(base_url: str, run_id: str) -> dict:
+    try:
+        data = httpx.get(f"{base_url}/runs/{run_id}/summary", timeout=3, trust_env=False).json()
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _task(base_url: str, task_id: str) -> dict:
+    try:
+        data = httpx.get(f"{base_url}/tasks/{task_id}", timeout=3, trust_env=False).json()
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _event_name(event: dict) -> str:
+    return str(event.get("name") or "")
+
+
+def _event_detail(event: dict) -> dict:
+    raw = event.get("data")
+    if isinstance(raw, str):
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            payload = {}
+    elif isinstance(raw, dict):
+        payload = raw
+    else:
+        payload = {}
+    detail = event.get("detail")
+    if isinstance(detail, dict):
+        payload.update(detail)
+    return payload
+
+
+def _event_agent_name(base_url: str, event: dict) -> str:
+    detail = _event_detail(event)
+    if detail.get("agent_name"):
+        return str(detail["agent_name"])
+    task_id = str(event.get("task_id") or detail.get("task_id") or "")
+    attempt_id = str(detail.get("attempt_id") or "")
+    if not task_id:
+        return ""
+    task = _task(base_url, task_id)
+    for attempt in task.get("attempts") or []:
+        if not isinstance(attempt, dict):
+            continue
+        if attempt_id and attempt.get("attempt_id") != attempt_id:
+            continue
+        if attempt.get("agent_name"):
+            return str(attempt["agent_name"])
+    return ""
 
 
 async def run_matrix(config: BenchmarkConfig, source_repo: str, smoke: bool = False, fake: bool | None = None) -> list[RunMetric]:
@@ -316,6 +542,14 @@ async def run_matrix(config: BenchmarkConfig, source_repo: str, smoke: bool = Fa
             cpu_limit=item.cpu_limit,
             memory_limit_mb=item.memory_limit_mb,
             task_description_hash=item.task_description_hash,
+            experiment=item.experiment,
+            direct_retry_enabled=item.direct_retry_enabled,
+            runtime_fault_enabled=item.runtime_fault_enabled,
+            recovery_context_enabled=item.recovery_context_enabled,
+            fault_target_agent=item.fault_target_agent,
+            fault_trigger=item.fault_trigger,
+            fault_injected=item.fault_injected,
+            fault_injected_at_ms=item.fault_injected_at_ms,
             fault_mode=item.fault_mode,
             release_commit=item.release_commit,
         )
@@ -325,6 +559,8 @@ async def run_matrix(config: BenchmarkConfig, source_repo: str, smoke: bool = Fa
 
 async def run_matrix_detailed(config: BenchmarkConfig, source_repo: str, smoke: bool = False) -> tuple[list[WorkflowMetric], list[TrialMetric]]:
     _ensure_git_safe_directory(source_repo)
+    if not smoke and "runtime" in set(config.modes) and not config.registration:
+        config.registration = prepare_runtime_benchmark_agents(config)
     workflow_metrics: list[WorkflowMetric] = []
     trial_metrics: list[TrialMetric] = []
     modes = list(config.modes)
@@ -377,6 +613,23 @@ def require_clean_source_tree(repo: str | Path = ".") -> str:
     return head
 
 
+def normalize_experiment(value: str) -> str:
+    normalized = value.strip().replace("-", "_")
+    allowed = {"baseline", "fault_recovery", "recovery_context"}
+    if normalized not in allowed:
+        raise ValueError(f"unsupported experiment: {value}")
+    return normalized
+
+
+def parse_recovery_context(value: str) -> bool:
+    normalized = value.strip().lower()
+    if normalized == "on":
+        return True
+    if normalized == "off":
+        return False
+    raise ValueError("--recovery-context must be on or off")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--task-case", required=True)
@@ -391,9 +644,17 @@ def main() -> None:
     parser.add_argument("--smoke", action="store_true")
     parser.add_argument("--fake", action="store_true", help="deprecated alias for --smoke")
     parser.add_argument("--allow-dirty", action="store_true")
+    parser.add_argument("--experiment", default="baseline", choices=["baseline", "fault-recovery", "fault_recovery", "recovery-context", "recovery_context"])
+    parser.add_argument("--direct-retry", action="store_true")
+    parser.add_argument("--runtime-fault", action="store_true")
+    parser.add_argument("--recovery-context", default="on", choices=["on", "off"])
+    parser.add_argument("--fault-target-agent", default="coder_a")
+    parser.add_argument("--fault-trigger", default="backend.started")
     parser.add_argument("--output-root", default="run-data/benchmarks")
     args = parser.parse_args()
     smoke = bool(args.smoke or args.fake)
+    experiment = normalize_experiment(args.experiment)
+    recovery_context_enabled = parse_recovery_context(args.recovery_context)
     performance_claim_allowed = not smoke
     performance_claim_reason = ""
     release_commit = ""
@@ -414,7 +675,13 @@ def main() -> None:
         measured_runs=args.runs,
         cpu_limit=args.cpu_limit,
         memory_limit_mb=args.memory_limit_mb,
-        deepseek_model="deepseek-chat",
+        experiment=experiment,  # type: ignore[arg-type]
+        direct_retry_enabled=bool(args.direct_retry),
+        runtime_fault_enabled=bool(args.runtime_fault),
+        recovery_context_enabled=recovery_context_enabled,
+        fault_target_agent=args.fault_target_agent,
+        fault_trigger=args.fault_trigger,
+        deepseek_model="deepseek-v4-flash",
         base_commit=args.base_commit,
         prompt_hash=compute_prompt_hash(),
         graph_version="incident_repair_v1",
@@ -450,6 +717,14 @@ def main() -> None:
             cpu_limit=item.cpu_limit,
             memory_limit_mb=item.memory_limit_mb,
             task_description_hash=item.task_description_hash,
+            experiment=item.experiment,
+            direct_retry_enabled=item.direct_retry_enabled,
+            runtime_fault_enabled=item.runtime_fault_enabled,
+            recovery_context_enabled=item.recovery_context_enabled,
+            fault_target_agent=item.fault_target_agent,
+            fault_trigger=item.fault_trigger,
+            fault_injected=item.fault_injected,
+            fault_injected_at_ms=item.fault_injected_at_ms,
             fault_mode=item.fault_mode,
             release_commit=item.release_commit,
         )

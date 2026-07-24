@@ -15,3 +15,13 @@ def test_normalize_inspection_extracts_task_files():
 
     assert inspection.files == ["app/auth.py", "app/orders.py"]
     assert inspection.searches == []
+
+
+def test_normalize_inspection_accepts_string_searches():
+    payload = {"files": ["app/auth.py"], "searches": ["JWT", "authorization"], "summary": "inspect"}
+
+    inspection = InspectionRequest(**normalize_inspection_payload(payload))
+
+    assert inspection.files == ["app/auth.py"]
+    assert [search.query for search in inspection.searches] == ["JWT", "authorization"]
+    assert [search.path for search in inspection.searches] == [".", "."]

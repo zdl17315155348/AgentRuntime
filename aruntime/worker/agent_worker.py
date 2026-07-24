@@ -184,7 +184,7 @@ async def _run() -> None:
         agent_spec = AgentSpec(**json.loads(spec_json))
     else:
         agent_spec = AgentSpec(agent_name=agent_name, role=agent_name)
-    llm_gateway = LLMGateway(backend=os.getenv("LLM_BACKEND", "mock"), api_key=os.getenv("LLM_API_KEY", ""))
+    llm_gateway = LLMGateway(backend=os.getenv("LLM_BACKEND", "mock"), api_key=os.getenv("LLM_API_KEY", ""), model=os.getenv("LLM_MODEL", ""))
     registry = ToolRegistry()
     for tool in (RepoScanTool(), ReadFileTool(), SearchCodeTool(), WriteFileTool(), GitDiffTool(), GitStatusTool(), RunPytestTool(), RunCommandTool()):
         registry.register(tool)

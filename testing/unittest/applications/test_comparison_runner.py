@@ -2,7 +2,15 @@ from __future__ import annotations
 
 import pytest
 
-from testing.perf.comparison.runner import compute_prompt_hash, require_clean_source_tree, run_matrix, run_matrix_detailed, write_benchmark_outputs
+from testing.perf.comparison.runner import (
+    _matches_fault_trigger,
+    compute_prompt_hash,
+    prepare_runtime_benchmark_agents,
+    require_clean_source_tree,
+    run_matrix,
+    run_matrix_detailed,
+    write_benchmark_outputs,
+)
 from testing.perf.comparison.schemas import BenchmarkConfig
 
 
@@ -118,3 +126,138 @@ def test_require_clean_source_tree_rejects_tracked_changes(tmp_path):
 
 def test_prompt_hash_is_non_empty():
     assert compute_prompt_hash()
+
+
+def test_runtime_benchmark_registers_and_validates_demo_agents(monkeypatch):
+    config = BenchmarkConfig(
+        benchmark_id="bench_register",
+        task_case="incident_repair_v1",
+        modes=["runtime"],
+        concurrency_levels=[1],
+        warmup_runs=0,
+        measured_runs=1,
+        cpu_limit=1,
+        memory_limit_mb=512,
+        deepseek_model="deepseek-chat",
+        base_commit="HEAD",
+        prompt_hash="p",
+        graph_version="incident_repair_v1",
+    )
+    created = []
+
+    class _Client:
+        def __init__(self, base_url):
+            self.base_url = base_url
+
+        def get_metrics(self):
+            return {"runtime_config": {"llm_backend": "deepseek", "llm_api_key_present": True}}
+
+        def create_agent(self, **kwargs):
+            created.append(kwargs)
+            return {"ok": True}
+
+        def list_agents(self):
+            return {
+                "agents": [
+                    {"name": call["agent_name"], "status": "READY", "backend": call["backend"], "failure_policy": call.get("failure_policy") or {}}
+                    for call in created
+                ]
+            }
+
+    monkeypatch.setattr("testing.perf.comparison.runner.AgentRuntimeClient", _Client)
+
+    registration = prepare_runtime_benchmark_agents(config, base_url="http://agentd")
+
+    assert registration["required"] is True
+    assert registration["llm_backend"] == "deepseek"
+    assert registration["agents"]["reviewer"]["backend"]["sandbox"] == "read-only"
+    assert {call["agent_name"] for call in created} == {"architect", "coder_a", "coder_b", "tester", "repair", "reviewer"}
+
+
+def test_runtime_benchmark_rejects_mock_agentd(monkeypatch):
+    config = BenchmarkConfig(
+        benchmark_id="bench_register_mock",
+        task_case="incident_repair_v1",
+        modes=["runtime"],
+        concurrency_levels=[1],
+        warmup_runs=0,
+        measured_runs=1,
+        cpu_limit=1,
+        memory_limit_mb=512,
+        deepseek_model="deepseek-chat",
+        base_commit="HEAD",
+        prompt_hash="p",
+        graph_version="incident_repair_v1",
+    )
+
+    class _Client:
+        def __init__(self, base_url):
+            pass
+
+        def get_metrics(self):
+            return {"runtime_config": {"llm_backend": "mock", "llm_api_key_present": False}}
+
+    monkeypatch.setattr("testing.perf.comparison.runner.AgentRuntimeClient", _Client)
+
+    with pytest.raises(RuntimeError, match="llm_backend != mock"):
+        prepare_runtime_benchmark_agents(config)
+
+
+@pytest.mark.anyio
+async def test_comparison_runner_smoke_records_experiment_scenarios(tmp_path):
+    pytest.importorskip("langgraph")
+    for experiment, kwargs in [
+        ("baseline", {}),
+        ("fault_recovery", {"direct_retry_enabled": True, "runtime_fault_enabled": True}),
+        ("recovery_context", {"recovery_context_enabled": False}),
+    ]:
+        config = BenchmarkConfig(
+            benchmark_id=f"bench_{experiment}",
+            task_case="incident_repair_v1",
+            modes=["direct", "runtime"],
+            concurrency_levels=[1],
+            warmup_runs=0,
+            measured_runs=1,
+            cpu_limit=1,
+            memory_limit_mb=512,
+            deepseek_model="deepseek-chat",
+            base_commit="HEAD",
+            prompt_hash="p",
+            graph_version="incident_repair_v1",
+            experiment=experiment,
+            **kwargs,
+        )
+
+        workflows, trials = await run_matrix_detailed(config, "/data1/projects/agent-runtime-os", smoke=True)
+        metrics = await run_matrix(config, "/data1/projects/agent-runtime-os", smoke=True)
+        out = write_benchmark_outputs(config, metrics, tmp_path, workflow_metrics=workflows, trial_metrics=trials)
+        report = (out / "report.json").read_text(encoding="utf-8")
+
+        assert f'"experiment": "{experiment}"' in report
+        assert all(item.experiment == experiment for item in workflows)
+        if experiment == "recovery_context":
+            assert '"recovery_context_enabled": false' in report
+
+
+def test_runtime_fault_trigger_matches_backend_started_agent():
+    config = BenchmarkConfig(
+        benchmark_id="bench_fault_event",
+        task_case="incident_repair_v1",
+        modes=["runtime"],
+        concurrency_levels=[1],
+        warmup_runs=0,
+        measured_runs=1,
+        cpu_limit=1,
+        memory_limit_mb=512,
+        deepseek_model="deepseek-chat",
+        base_commit="HEAD",
+        prompt_hash="p",
+        graph_version="incident_repair_v1",
+        experiment="fault_recovery",
+        runtime_fault_enabled=True,
+        fault_target_agent="coder_a",
+        fault_trigger="backend.started",
+    )
+
+    assert _matches_fault_trigger("http://agentd", {"name": "backend.started", "data": {"agent_name": "coder_a"}}, config)
+    assert not _matches_fault_trigger("http://agentd", {"name": "backend.started", "data": {"agent_name": "coder_b"}}, config)

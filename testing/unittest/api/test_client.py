@@ -66,6 +66,17 @@ def test_create_agent_sends_backend_and_capability():
     assert http.last_post["json"]["backend"] == {"type": "codex_cli"}
 
 
+def test_create_agent_sends_failure_policy():
+    c = AgentRuntimeClient(base_url="http://example")
+    http = _HTTP()
+    c.client = http
+
+    c.create_agent("coder_a", "Coder", failure_policy={"mode": "fallback", "fallback_agent": "coder_b"})
+
+    assert http.last_post["url"] == "http://example/agents"
+    assert http.last_post["json"]["failure_policy"] == {"mode": "fallback", "fallback_agent": "coder_b"}
+
+
 def test_submit_task_sends_context_payload():
     c = AgentRuntimeClient(base_url="http://example")
     http = _HTTP()
@@ -91,6 +102,20 @@ def test_submit_task_sends_context_payload():
         "shared": {"repo": "agent-runtime-os"},
         "private": {"note": "planner"},
     }
+
+
+def test_submit_task_sends_workspace_payload():
+    c = AgentRuntimeClient(base_url="http://example")
+    http = _HTTP()
+    c.client = http
+
+    c.submit_task(
+        "coder",
+        {"request": "fix"},
+        workspace={"source_repo": "/repo", "base_commit": "abc", "base_ref": "abc"},
+    )
+
+    assert http.last_post["json"]["workspace"] == {"source_repo": "/repo", "base_commit": "abc", "base_ref": "abc"}
 
 
 def test_submit_task_sends_failure_policy_and_on_failure():

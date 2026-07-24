@@ -16,7 +16,13 @@ async def tester_node(state: dict, runtime):
         role="tester",
         backend="direct_tool",
         goal="run pytest",
-        task_input={"integrated_commit": state.get("integrated_commit")},
+        task_input={
+            "integrated_commit": state.get("integrated_commit"),
+            "__tool": {
+                "name": "run_pytest",
+                "arguments": {"paths": ["tests"], "junit_xml": "pytest.xml"},
+            },
+        },
         source_repo=state["source_repo"],
         base_commit=state.get("integrated_commit") or state["base_commit"],
         timeout_s=180,
