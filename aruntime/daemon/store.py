@@ -195,6 +195,14 @@ class SQLiteStateStore:
             ).fetchall()
             return [dict(row) for row in rows]
 
+    def list_tasks_for_run(self, root_task_id: str) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM tasks WHERE json_extract(data, '$.root_task_id') = ? OR task_id = ? ORDER BY updated_at ASC",
+                (root_task_id, root_task_id),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
     def list_trace_events_after_id(self, root_task_id: str, after_id: int = 0) -> list[dict[str, Any]]:
         with self._lock:
             task_rows = self._conn.execute(

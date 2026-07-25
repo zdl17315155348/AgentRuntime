@@ -176,6 +176,35 @@ async def test_runtime_provider_reuses_client_and_maps_request_fields():
 
 
 @pytest.mark.anyio
+async def test_runtime_fault_mode_waits_for_fallback_attempt():
+    captured = {}
+
+    class _TimeoutClient(_FakeClient):
+        def wait_task(self, task_id, timeout_s):
+            captured["timeout_s"] = timeout_s
+            return super().wait_task(task_id, timeout_s)
+
+    fault_config = _config(ExecutionMode.RUNTIME)
+    fault_config.fault_mode = True
+    provider = create_execution_provider(fault_config, {"client": _TimeoutClient()})
+
+    await provider.execute(_request("direct_tool", "coder"))
+
+    assert captured["timeout_s"] == 690
+
+
+def test_runtime_fault_mode_falls_back_without_retrying_coder_a():
+    provider = create_execution_provider(_config(ExecutionMode.RUNTIME), {"client": _FakeClient()})
+    assert provider._failure_policy_for_role("coder")["max_retries"] == 1
+
+    fault_config = _config(ExecutionMode.RUNTIME)
+    fault_config.fault_mode = True
+    fault_provider = create_execution_provider(fault_config, {"client": _FakeClient()})
+
+    assert fault_provider._failure_policy_for_role("coder") == {"mode": "fallback", "max_retries": 0, "fallback_agent": "coder_b"}
+
+
+@pytest.mark.anyio
 async def test_runtime_cancel_tracks_submitted_tasks():
     tracked = {}
 
@@ -236,6 +265,26 @@ async def test_runtime_provider_parses_direct_tool_json_output():
     assert result.status == "SUCCESS"
     assert result.structured_result["returncode"] == 1
     assert result.structured_result["failed_tests"][0]["name"] == "t::fail"
+
+
+@pytest.mark.anyio
+async def test_runtime_provider_parses_direct_tool_json_output_with_runtime_error_prefix():
+    class _DirectToolJsonClient(_FakeClient):
+        def wait_task(self, task_id, timeout_s):
+            return {
+                "task_id": task_id,
+                "status": "SUCCESS",
+                "result": {"output": '[错误] {"returncode": 1, "passed": 4, "failed": 1, "failed_tests": [], "report_artifact_id": null}'},
+                "attempts": [{"attempt_id": "a1"}],
+                "scheduler": {},
+            }
+
+    provider = create_execution_provider(_config(ExecutionMode.RUNTIME), {"client": _DirectToolJsonClient()})
+    result = await provider.execute(_request("direct_tool", "tester"))
+
+    assert result.status == "SUCCESS"
+    assert result.structured_result["returncode"] == 1
+    assert result.structured_result["passed"] == 4
 
 
 class _PlannerClient(_FakeClient):

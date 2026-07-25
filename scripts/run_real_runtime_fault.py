@@ -89,6 +89,15 @@ def _run_summary(base_url: str, run_id: str) -> dict:
     return data if isinstance(data, dict) else {}
 
 
+def _run_tasks(base_url: str, run_id: str) -> list[dict]:
+    try:
+        data = httpx.get(f"{base_url}/runs/{run_id}/tasks", timeout=3, trust_env=False).json()
+    except Exception:
+        return []
+    tasks = data.get("tasks")
+    return tasks if isinstance(tasks, list) else []
+
+
 def _task(base_url: str, task_id: str) -> dict:
     try:
         data = httpx.get(f"{base_url}/tasks/{task_id}", timeout=3, trust_env=False).json()
@@ -137,13 +146,43 @@ def _event_agent_name(base_url: str, event: dict) -> str:
     return ""
 
 
-async def _wait_and_inject(base_url: str, run_id: str, timeout_s: int) -> dict:
+def _task_agent_name(task: dict) -> str:
+    return str(task.get("agent_name") or "")
+
+
+def _task_backend_pid(task: dict) -> int | None:
+    if str(task.get("agent_name") or "") != "coder_a":
+        return None
+    if str(task.get("status") or "") != "RUNNING":
+        return None
+    attempts = task.get("attempts") if isinstance(task.get("attempts"), list) else []
+    for attempt in attempts:
+        if not isinstance(attempt, dict):
+            continue
+        backend_pid = attempt.get("backend_pid")
+        if backend_pid is not None:
+            try:
+                return int(backend_pid)
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
+async def _wait_and_inject(base_url: str, run_id: str, timeout_s: int, workflow_done: asyncio.Event | None = None) -> dict:
     client = AgentRuntimeClient(base_url)
     deadline = time.time() + timeout_s
     last_id = 0
     seen: list[dict] = []
     injected: dict | None = None
+    observed_tasks: dict[str, str] = {}
     while time.time() < deadline:
+        tasks = _run_tasks(base_url, run_id)
+        for task in tasks:
+            task_id = str(task.get("task_id") or "")
+            if task_id:
+                observed_tasks[task_id] = _task_agent_name(task)
+            if injected is None and _task_backend_pid(task) is not None:
+                injected = client.inject_worker_sigkill("coder_a")
         events = _run_events(base_url, run_id, last_id)
         for event in events:
             try:
@@ -152,27 +191,43 @@ async def _wait_and_inject(base_url: str, run_id: str, timeout_s: int) -> dict:
                 pass
             seen.append(event)
             name = _event_name(event)
-            if injected is None and name in {"backend_started", "backend.started"} and _event_agent_name(base_url, event) == "coder_a":
+            event_agent = _event_agent_name(base_url, event)
+            if not event_agent:
+                event_agent = observed_tasks.get(str(event.get("task_id") or ""), "")
+            if injected is None and name in {"backend_started", "backend.started"} and event_agent == "coder_a":
                 injected = client.inject_worker_sigkill("coder_a")
-        summary = _run_summary(base_url, run_id)
-        if summary.get("status") in {"SUCCESS", "FAILED", "TIMEOUT", "CANCELLED"}:
+        if workflow_done is not None and workflow_done.is_set():
             break
         await asyncio.sleep(0.25)
     return {"injection": injected or {"injected": False, "reason": "coder_a backend_started not observed"}, "events": seen}
+
+
+def _run_workflow_sync(service: IncidentRunService, config: IncidentRunConfig, client: AgentRuntimeClient) -> dict:
+    return asyncio.run(service.execute_run(config, "修复认证、JWT和订单安全问题", {"client": client}))
 
 
 def _fault_evidence(events: list[dict], runtime_summary: dict) -> dict:
     names = [_event_name(event) for event in events]
     attempts = runtime_summary.get("attempts") if isinstance(runtime_summary.get("attempts"), list) else []
     coder_attempts = [attempt for attempt in attempts if attempt.get("agent_name") in {"coder_a", "coder_b"}]
-    worker_pids = [attempt.get("worker_pid") for attempt in coder_attempts if attempt.get("worker_pid")]
-    backend_pids = [attempt.get("backend_pid") for attempt in coder_attempts if attempt.get("backend_pid")]
-    worktrees = [attempt.get("workspace_path") for attempt in coder_attempts if attempt.get("workspace_path")]
-    task_ids = {attempt.get("task_id") for attempt in coder_attempts if attempt.get("task_id")}
-    fallback_agents = {attempt.get("agent_name") for attempt in coder_attempts}
+    failed_coder_a = next((attempt for attempt in coder_attempts if attempt.get("agent_name") == "coder_a" and attempt.get("status") in {"FAILED", "TIMEOUT"}), None)
+    fallback_pair = []
+    if failed_coder_a is not None:
+        failed_task_id = str(failed_coder_a.get("attempt_id")).split(":attempt:", 1)[0]
+        fallback_pair = [
+            attempt
+            for attempt in coder_attempts
+            if str(attempt.get("attempt_id")).split(":attempt:", 1)[0] == failed_task_id
+        ]
+    pair_for_identity = fallback_pair or coder_attempts
+    worker_pids = [attempt.get("worker_pid") for attempt in pair_for_identity if attempt.get("worker_pid")]
+    backend_pids = [attempt.get("backend_pid") for attempt in pair_for_identity if attempt.get("backend_pid")]
+    worktrees = [attempt.get("workspace_path") for attempt in pair_for_identity if attempt.get("workspace_path")]
+    task_ids = {str(attempt.get("attempt_id")).split(":attempt:", 1)[0] for attempt in pair_for_identity if attempt.get("attempt_id")}
+    fallback_agents = {attempt.get("agent_name") for attempt in pair_for_identity}
     return {
         "backend_started": names.count("backend_started") + names.count("backend.started"),
-        "worker_lost": names.count("worker.lost"),
+        "worker_lost": names.count("worker.lost") + int((runtime_summary.get("faults") or {}).get("worker_lost") or 0),
         "resource_lease_reclaimed": names.count("lease.reclaim") + int((runtime_summary.get("faults") or {}).get("leases_reclaimed") or 0),
         "attempt_failed": len([attempt for attempt in coder_attempts if attempt.get("status") in {"FAILED", "TIMEOUT"}]),
         "fallback_created": names.count("task.fallback"),
@@ -280,9 +335,13 @@ async def _run(
     )
     service = IncidentRunService()
     started_at = time.time()
-    workflow = asyncio.create_task(service.execute_run(config, "修复认证、JWT和订单安全问题", {"client": client}))
-    fault = asyncio.create_task(_wait_and_inject(base_url, run_id, task_timeout_s))
-    result = await asyncio.wait_for(workflow, timeout=workflow_timeout_s + 60)
+    workflow_done = asyncio.Event()
+    workflow = asyncio.create_task(asyncio.to_thread(_run_workflow_sync, service, config, client))
+    fault = asyncio.create_task(_wait_and_inject(base_url, run_id, task_timeout_s, workflow_done))
+    try:
+        result = await asyncio.wait_for(workflow, timeout=workflow_timeout_s + 60)
+    finally:
+        workflow_done.set()
     fault_result = await fault
     finished_at = time.time()
     summary = result["summary"]

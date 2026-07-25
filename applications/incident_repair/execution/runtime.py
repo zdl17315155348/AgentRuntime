@@ -76,7 +76,10 @@ class AgentRuntimeExecutionProvider(ExecutionProvider):
         self._run_task_ids[request.run_id].add(task_id)
         timer.mark_execution_started()
         try:
-            result = self.client.wait_task(task_id, request.timeout_s + 30)
+            wait_timeout_s = request.timeout_s + 30
+            if self.config.fault_mode and request.role in ("coder", "repair"):
+                wait_timeout_s = request.timeout_s * 2 + 90
+            result = self.client.wait_task(task_id, wait_timeout_s)
             return self._convert_result(request, result, timer)
         finally:
             self._run_task_ids[request.run_id].discard(task_id)
@@ -195,7 +198,7 @@ class AgentRuntimeExecutionProvider(ExecutionProvider):
             if not output.strip():
                 return {}
             try:
-                payload = json.loads(output)
+                payload = json.loads(_strip_runtime_error_prefix(output))
             except json.JSONDecodeError as exc:
                 excerpt = output.strip().replace("\n", "\\n")[:200]
                 raise RuntimeSystemError(f"invalid structured output: {exc}; output_prefix={excerpt!r}") from exc
@@ -254,5 +257,14 @@ class AgentRuntimeExecutionProvider(ExecutionProvider):
 
     def _failure_policy_for_role(self, role: str) -> dict[str, Any]:
         if role in ("coder", "repair"):
-            return {"mode": "fallback", "max_retries": 1, "fallback_agent": "coder_b"}
+            max_retries = 0 if self.config.fault_mode else 1
+            return {"mode": "fallback", "max_retries": max_retries, "fallback_agent": "coder_b"}
         return {"mode": "retry", "max_retries": 0}
+
+
+def _strip_runtime_error_prefix(output: str) -> str:
+    text = output.strip()
+    prefix = "[错误]"
+    if text.startswith(prefix):
+        text = text[len(prefix) :].strip()
+    return text

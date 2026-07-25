@@ -629,6 +629,19 @@ def _record_trace_event(task: TaskSpec, name: str, detail: dict | None = None) -
     state_store.save_trace_event(task.trace_id, task.task_id, name, detail or {})
 
 
+def _backend_trace_name_and_detail(agent_name: str, data: dict) -> tuple[str, dict]:
+    detail = {k: v for k, v in data.items() if k != "type"}
+    event = data.get("event")
+    if isinstance(event, dict):
+        event_name = str(event.get("name") or "").strip()
+        detail.update(event)
+        detail.setdefault("agent_name", agent_name)
+        if event_name:
+            return event_name, detail
+    detail.setdefault("agent_name", agent_name)
+    return str(data.get("type") or "backend_event"), detail
+
+
 def _attempt_agent(task: TaskSpec, attempt: TaskAttempt | None = None) -> str:
     return attempt.agent_name if attempt is not None else task.agent_name
 
@@ -925,8 +938,15 @@ async def debug_sigkill_worker(agent_name: str):
     proc = agent_workers.get(agent_name)
     if proc is None or proc.poll() is not None:
         raise HTTPException(status_code=404, detail="worker not running")
-    os.kill(proc.pid, 9)
-    return {"agent_name": agent_name, "pid": proc.pid, "status": "SIGKILL_SENT"}
+    task = tasks.get(agents[agent_name].current_task_id or "")
+    backend_pid = None
+    if task is not None:
+        attempt = task.active_attempt
+        if attempt is not None and attempt.backend_pid is not None:
+            backend_pid = int(attempt.backend_pid)
+    target_pid = backend_pid or proc.pid
+    os.kill(target_pid, 9)
+    return {"agent_name": agent_name, "pid": target_pid, "worker_pid": proc.pid, "backend_pid": backend_pid, "status": "SIGKILL_SENT"}
 
 @app.post("/tasks")
 async def submit_task(req: SubmitTaskRequest):
@@ -1274,6 +1294,23 @@ async def get_run_summary(root_task_id: str):
 @app.get("/runs/{root_task_id}/events")
 async def get_run_events(root_task_id: str, after_id: int = 0):
     return {"events": state_store.list_trace_events_after_id(root_task_id, after_id)}
+
+
+@app.get("/runs/{root_task_id}/tasks")
+async def get_run_tasks(root_task_id: str):
+    items = []
+    for row in state_store.list_tasks_for_run(root_task_id):
+        data = json.loads(row["data"])
+        items.append(
+            {
+                "task_id": data.get("task_id"),
+                "root_task_id": data.get("root_task_id"),
+                "agent_name": data.get("agent_name"),
+                "status": data.get("status"),
+                "attempts": data.get("attempts") or [],
+            }
+        )
+    return {"tasks": items}
 
 
 @app.post("/demo/runs")
@@ -1951,15 +1988,15 @@ async def startup():
             if task is None:
                 return
             attempt = next((item for item in task.attempts if item.attempt_id == attempt_id), None)
-            if data.get("type") == "backend_started" and attempt is not None:
-                attempt.backend_type = str(data.get("backend_type") or attempt.backend_type)
-                if data.get("backend_pid") is not None:
-                    attempt.backend_pid = int(data["backend_pid"])
-                if data.get("backend_session_id"):
-                    attempt.backend_session_id = str(data["backend_session_id"])
+            name, detail = _backend_trace_name_and_detail(agent_name, data)
+            if name in {"backend.started", "backend_started"} and attempt is not None:
+                attempt.backend_type = str(detail.get("backend_type") or attempt.backend_type)
+                if detail.get("backend_pid") is not None:
+                    attempt.backend_pid = int(detail["backend_pid"])
+                if detail.get("backend_session_id"):
+                    attempt.backend_session_id = str(detail["backend_session_id"])
                 _persist_task(task)
-            detail = {k: v for k, v in data.items() if k not in {"type"}}
-            _record_trace_event(task, str(data.get("type") or "backend_event"), detail)
+            _record_trace_event(task, name, detail)
 
         uds_server = await start_uds_server(
             uds_path,
