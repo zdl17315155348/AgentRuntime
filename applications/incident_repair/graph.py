@@ -41,6 +41,12 @@ def route_after_coder(state: IncidentRepairState, runtime=None) -> str:
     return "integrate_coder"
 
 
+def route_after_repair(state: IncidentRepairState, runtime=None) -> str:
+    if state.get("workflow_status") == "FAILED":
+        return "failed"
+    return "integrate_repair"
+
+
 def build_graph(checkpointer=None):
     try:
         from langgraph.graph import END, START, StateGraph
@@ -63,7 +69,7 @@ def build_graph(checkpointer=None):
     builder.add_conditional_edges("coder", route_after_coder, {"integrate_coder": "integrate_coder", "failed": "failed"})
     builder.add_edge("integrate_coder", "select_coder")
     builder.add_conditional_edges("tester", route_after_test_with_context, {"repair": "repair", "reviewer": "reviewer", "failed": "failed"})
-    builder.add_edge("repair", "integrate_repair")
+    builder.add_conditional_edges("repair", route_after_repair, {"integrate_repair": "integrate_repair", "failed": "failed"})
     builder.add_edge("integrate_repair", "tester")
     builder.add_conditional_edges("reviewer", route_after_review_with_context, {"repair": "repair", "success": "success", "failed": "failed"})
     builder.add_edge("success", END)

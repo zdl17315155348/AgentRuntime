@@ -12,10 +12,12 @@ from applications.incident_repair.services.run_store import RunStore
 
 
 class FakeGraphProvider(ExecutionProvider):
-    def __init__(self, coder_patch: bool = True):
+    def __init__(self, coder_patch: bool = True, reviewer_approved: bool = True, repair_patch: bool = True):
         self.calls: list[AgentExecutionRequest] = []
         self.cancelled: list[str] = []
         self.coder_patch = coder_patch
+        self.reviewer_approved = reviewer_approved
+        self.repair_patch = repair_patch
 
     @property
     def mode(self) -> str:
@@ -54,7 +56,21 @@ class FakeGraphProvider(ExecutionProvider):
         if request.role == "tester":
             return AgentExecutionResult(status="SUCCESS", structured_result={"returncode": 0, "passed": 1, "failed": 0, "failed_tests": [], "report_artifact_id": None}, metrics=metrics)
         if request.role == "reviewer":
-            return AgentExecutionResult(status="SUCCESS", structured_result={"approved": True, "requirements_covered": ["x"], "issues": [], "artifact_id": None}, metrics=metrics)
+            return AgentExecutionResult(status="SUCCESS", structured_result={"approved": self.reviewer_approved, "requirements_covered": ["x"], "issues": [], "artifact_id": None}, metrics=metrics)
+        if request.role == "repair":
+            if not self.repair_patch:
+                return AgentExecutionResult(status="SUCCESS", metrics=metrics)
+            return AgentExecutionResult(
+                status="SUCCESS",
+                patch_ref={
+                    "task_local_id": "repair",
+                    "artifact_id": "repair",
+                    "patch_path": "/tmp/repair.patch",
+                    "sha256": "repair",
+                    "changed_files": ["app.py"],
+                },
+                metrics=metrics,
+            )
         return AgentExecutionResult(status="SUCCESS", structured_result={"commit": "HEAD"}, metrics=metrics)
 
     async def cancel_run(self, run_id: str) -> None:
@@ -163,3 +179,21 @@ async def test_coder_without_patch_fails_before_integration(tmp_path):
     assert "reviewer" not in roles
     assert result["summary"]["status"] == "FAILED"
     assert result["summary"]["error"] == "coder produced no patch"
+
+
+@pytest.mark.anyio
+async def test_repair_without_patch_fails_before_integration(tmp_path):
+    pytest.importorskip("langgraph")
+    pytest.importorskip("langgraph.checkpoint.sqlite")
+    provider = FakeGraphProvider(reviewer_approved=False, repair_patch=False)
+    service = IncidentRunService(store=RunStore(tmp_path / "live"))
+    service.runner.checkpoint_path = tmp_path / "checkpoints.sqlite"
+    config = IncidentRunConfig(execution_mode=ExecutionMode.DIRECT, run_id="run_no_repair_patch", thread_id="thread_no_repair_patch", source_repo=str(Path.cwd()), base_commit="HEAD")
+
+    result = await service.execute_run(config, "fix", {"provider": provider, "integration_service": _Integration()})
+
+    roles = [call.role for call in provider.calls]
+    assert roles.count("reviewer") == 1
+    assert roles.count("repair") == 1
+    assert result["summary"]["status"] == "FAILED"
+    assert result["summary"]["error"] == "repair produced no patch"
