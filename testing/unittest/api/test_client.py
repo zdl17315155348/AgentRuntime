@@ -1,4 +1,5 @@
 import pytest
+import httpx
 
 from aruntime.api.client import AgentRuntimeClient
 
@@ -178,6 +179,28 @@ def test_get_task_hits_task_endpoint():
     data = c.get_task("t1")
     assert data["status"] == "SUCCESS"
     assert http.last_get["url"] == "http://example/tasks/t1"
+
+
+def test_wait_task_retries_transient_poll_timeout():
+    class _FlakyHTTP(_HTTP):
+        def __init__(self):
+            super().__init__()
+            self.calls = 0
+
+        def get(self, url: str, params: dict | None = None):
+            self.calls += 1
+            if self.calls == 1:
+                raise httpx.ReadTimeout("poll timed out")
+            return super().get(url, params)
+
+    c = AgentRuntimeClient(base_url="http://example")
+    http = _FlakyHTTP()
+    c.client = http
+
+    data = c.wait_task("t1", timeout_s=1, poll_s=0)
+
+    assert data["status"] == "SUCCESS"
+    assert http.calls == 2
 
 
 def test_send_message_hits_messages_endpoint():

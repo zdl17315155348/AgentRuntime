@@ -100,12 +100,19 @@ class AgentRuntimeClient:
 
     def wait_task(self, task_id: str, timeout_s: float = 120.0, poll_s: float = 0.25) -> dict:
         deadline = time.time() + timeout_s
+        last_poll_timeout: Exception | None = None
         while time.time() < deadline:
-            data = self.get_task(task_id)
+            try:
+                data = self.get_task(task_id)
+            except httpx.TimeoutException as exc:
+                last_poll_timeout = exc
+                time.sleep(poll_s)
+                continue
             if data.get("status") in ("SUCCESS", "FAILED", "TIMEOUT", "CANCELLED"):
                 return data
             time.sleep(poll_s)
-        raise TimeoutError(f"task {task_id} did not finish within {timeout_s}s")
+        detail = f"; last poll timeout: {last_poll_timeout}" if last_poll_timeout is not None else ""
+        raise TimeoutError(f"task {task_id} did not finish within {timeout_s}s{detail}")
 
     def get_task_trace(self, task_id: str) -> dict:
         resp = self.client.get(f"{self.base_url}/tasks/{task_id}/trace")
