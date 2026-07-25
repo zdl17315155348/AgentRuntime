@@ -72,12 +72,19 @@ def _fallback_inspection_files(repo_tree: list[str], max_files: int) -> list[str
 
 async def _complete_json_model(llm: PlannerLLM, system_prompt: str, prompt: str, parse):
     last_error: Exception | None = None
-    for _ in range(2):
-        result = await llm.complete(system_prompt, prompt)
+    current_prompt = prompt
+    for _ in range(4):
+        result = await llm.complete(system_prompt, current_prompt)
         try:
             return parse(result.output)
         except (ValueError, ValidationError) as exc:
             last_error = exc
+            current_prompt = (
+                prompt
+                + "\n\nPrevious response was invalid JSON: "
+                + str(exc)
+                + "\nReturn one complete JSON object only. Do not truncate strings."
+            )
     if last_error is not None:
         raise last_error
     raise ValueError("empty planner response")

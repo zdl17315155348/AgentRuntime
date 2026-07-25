@@ -55,6 +55,33 @@ class _FlakyInspectionLLM(_LLM):
         return LLMResult(output=output, input_tokens=1, output_tokens=1, total_tokens=2, latency_ms=1)
 
 
+class _VeryFlakyInspectionLLM(_LLM):
+    def __init__(self):
+        super().__init__()
+        self.prompts: list[str] = []
+
+    async def complete(self, system_prompt: str, prompt: str) -> LLMResult:
+        self.calls += 1
+        self.prompts.append(prompt)
+        if self.calls < 4:
+            return LLMResult(output='{"files":["app/auth.py"],"summary":"unterminated', input_tokens=1, output_tokens=1, total_tokens=2, latency_ms=1)
+        if self.calls == 4:
+            output = json.dumps({"files": ["app/auth.py"], "searches": [], "summary": "inspect"})
+        else:
+            output = json.dumps(
+                {
+                    "version": "1.0",
+                    "summary": "plan",
+                    "tasks": [
+                        {"local_id": "fix", "role": "coder", "goal": "fix bug"},
+                        {"local_id": "test", "role": "tester", "goal": "run tests", "dependencies": ["fix"]},
+                        {"local_id": "review", "role": "reviewer", "goal": "review", "dependencies": ["test"]},
+                    ],
+                }
+            )
+        return LLMResult(output=output, input_tokens=1, output_tokens=1, total_tokens=2, latency_ms=1)
+
+
 @pytest.mark.anyio
 async def test_shared_planner_pipeline_scans_reads_searches_and_validates_plan(tmp_path):
     (tmp_path / "app").mkdir()
@@ -87,6 +114,26 @@ async def test_shared_planner_pipeline_retries_empty_json_response(tmp_path):
     )
 
     assert llm.calls == 3
+    assert result.inspection.files == ["app/auth.py"]
+    assert result.plan.tasks[0].local_id == "fix"
+
+
+@pytest.mark.anyio
+async def test_shared_planner_pipeline_retries_truncated_json_with_feedback(tmp_path):
+    (tmp_path / "app").mkdir()
+    (tmp_path / "app" / "auth.py").write_text("# bug\n", encoding="utf-8")
+    llm = _VeryFlakyInspectionLLM()
+
+    result = await PlannerPipeline().execute(
+        goal="fix bug",
+        system_prompt="plan",
+        inspector=LocalRepositoryInspector(str(tmp_path)),
+        llm=llm,
+        available_roles=["coder", "tester", "reviewer"],
+    )
+
+    assert llm.calls == 5
+    assert "Previous response was invalid JSON" in llm.prompts[1]
     assert result.inspection.files == ["app/auth.py"]
     assert result.plan.tasks[0].local_id == "fix"
 
