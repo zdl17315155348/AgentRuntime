@@ -50,6 +50,16 @@ async def coder_node(state: dict, runtime):
             "execution_records": [execution_record_from_result(request, result, context.provider.mode)],
         }
     if not result.patch_ref:
+        structured = result.structured_result or {}
+        if structured.get("completed") is True and not structured.get("remaining_issues"):
+            completed = set(state.get("completed_coder_task_ids", []))
+            completed.add(task["local_id"])
+            return {
+                "completed_coder_task_ids": sorted(completed),
+                "active_coder_task": None,
+                "runtime_task_ids": [result.runtime_task_id] if result.runtime_task_id else [],
+                "execution_records": [execution_record_from_result(request, result, context.provider.mode)],
+            }
         return {
             "workflow_status": "FAILED",
             "error": "coder produced no patch",

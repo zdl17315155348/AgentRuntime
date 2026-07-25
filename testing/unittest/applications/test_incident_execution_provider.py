@@ -127,6 +127,43 @@ async def test_direct_codex_provider_uses_pydantic_validation_without_cli_schema
     assert result.status == "SUCCESS"
 
 
+@pytest.mark.anyio
+async def test_direct_codex_provider_parses_coder_json_output(tmp_path, monkeypatch):
+    source = tmp_path / "source-codex-json"
+    source.mkdir()
+    (source / "config.toml").write_text("model = \"test\"\n", encoding="utf-8")
+    monkeypatch.setenv("CODEX_HOME", str(source))
+    final_json = '{"completed": true, "summary": "already fixed", "tests_run": [], "remaining_issues": []}'
+
+    class _WorkspaceManager:
+        def create_attempt_workspace(self, source_repo, task_id, attempt_id, base_ref, read_only, root_task_id=None):
+            path = tmp_path / "workspace"
+            path.mkdir()
+            return type("W", (), {"workspace_path": str(path)})()
+
+        def create_patch_artifact(self, workspace, task_id, attempt_id, root_task_id=None):
+            return None
+
+    class _Codex:
+        async def execute(self, *args, **kwargs):
+            output_last_message = kwargs["output_last_message"]
+            with open(output_last_message, "w", encoding="utf-8") as handle:
+                handle.write(final_json)
+            return 0, "", "", 123
+
+    provider = DirectExecutionProvider(_config(), {"workspace_manager": _WorkspaceManager(), "codex": _Codex()})
+    result = await provider.execute(_request("codex_cli", "coder"))
+
+    assert result.status == "SUCCESS"
+    assert result.patch_ref is None
+    assert result.structured_result == {
+        "completed": True,
+        "summary": "already fixed",
+        "tests_run": [],
+        "remaining_issues": [],
+    }
+
+
 def test_provider_factory_switches_modes():
     assert create_execution_provider(_config(ExecutionMode.DIRECT)).mode == "direct"
     assert create_execution_provider(_config(ExecutionMode.REPLAY)).mode == "replay"

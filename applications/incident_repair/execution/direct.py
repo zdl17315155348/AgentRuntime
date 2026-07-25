@@ -12,7 +12,7 @@ from applications.incident_repair.direct.tool import run_pytest_direct
 from applications.incident_repair.direct.workspace import DirectWorkspaceManager
 from applications.incident_repair.execution.base import AgentExecutionRequest, AgentExecutionResult, ExecutionProvider
 from applications.incident_repair.execution.instrumentation import ExecutionTimer
-from applications.incident_repair.schemas import ReviewSummaryModel
+from applications.incident_repair.schemas import CoderResultModel, ReviewSummaryModel
 
 
 class DirectExecutionProvider(ExecutionProvider):
@@ -134,12 +134,19 @@ class DirectExecutionProvider(ExecutionProvider):
                         "sha256": patch.sha256,
                         "changed_files": list(patch.metadata.get("changed_files", [])),
                     }
+                structured = {}
+                if request.role == "coder" and final_output.strip():
+                    try:
+                        structured = CoderResultModel.model_validate_json(final_output).model_dump()
+                    except Exception:
+                        structured = {}
                 return AgentExecutionResult(
                     status="SUCCESS" if rc == 0 else ("TIMEOUT" if rc is None else "FAILED"),
                     output=final_output,
                     error_message=error,
                     workspace_path=workspace.workspace_path,
                     patch_ref=patch_ref,
+                    structured_result=structured,
                     metrics=timer.finish(queue_wait_ms=queue_wait_ms),
                 )
             return AgentExecutionResult(status="FAILED", error_type="UnsupportedBackend", error_message=request.backend, metrics=timer.finish(queue_wait_ms=queue_wait_ms))

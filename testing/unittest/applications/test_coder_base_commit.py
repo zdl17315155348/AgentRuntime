@@ -5,10 +5,15 @@ from applications.incident_repair.execution.base import AgentExecutionRequest, A
 from applications.incident_repair.nodes.coder import coder_node
 
 
+_DEFAULT_PATCH = object()
+
+
 class _Provider(ExecutionProvider):
-    def __init__(self, status: str = "SUCCESS"):
+    def __init__(self, status: str = "SUCCESS", patch_ref=_DEFAULT_PATCH, structured_result: dict | None = None):
         self.request: AgentExecutionRequest | None = None
         self.status = status
+        self.patch_ref = patch_ref
+        self.structured_result = structured_result or {}
 
     @property
     def mode(self):
@@ -22,15 +27,19 @@ class _Provider(ExecutionProvider):
                 error_message="codex timeout",
                 metrics=ExecutionMetrics(submit_started_at=0, execution_started_at=0, execution_finished_at=0),
             )
-        return AgentExecutionResult(
-            status="SUCCESS",
-            patch_ref={
+        patch_ref = self.patch_ref
+        if patch_ref is _DEFAULT_PATCH:
+            patch_ref = {
                 "task_local_id": request.task_input["local_id"],
                 "artifact_id": "patch",
                 "patch_path": "/tmp/patch.diff",
                 "sha256": "sha",
                 "changed_files": ["app.py"],
-            },
+            }
+        return AgentExecutionResult(
+            status="SUCCESS",
+            patch_ref=patch_ref,
+            structured_result=self.structured_result,
             metrics=ExecutionMetrics(submit_started_at=0, execution_started_at=0, execution_finished_at=0),
         )
 
@@ -124,3 +133,46 @@ async def test_coder_failure_returns_failed_state_with_execution_record(anyio_ba
     assert update["workflow_status"] == "FAILED"
     assert update["error"] == "codex timeout"
     assert update["execution_records"][0]["role"] == "coder"
+
+
+async def test_coder_noop_completion_marks_task_complete(anyio_backend):
+    provider = _Provider(patch_ref=None, structured_result={"completed": True, "summary": "already fixed", "tests_run": [], "remaining_issues": []})
+
+    update = await coder_node(
+        {
+            "run_id": "run",
+            "thread_id": "thread",
+            "source_repo": "/repo",
+            "base_commit": "base0",
+            "integrated_commit": "base1",
+            "coder_step": 2,
+            "completed_coder_task_ids": ["a"],
+            "active_coder_task": {"local_id": "b", "role": "coder", "goal": "already fixed", "dependencies": ["a"]},
+        },
+        _context(provider),
+    )
+
+    assert update["completed_coder_task_ids"] == ["a", "b"]
+    assert update["active_coder_task"] is None
+    assert update["execution_records"][0]["role"] == "coder"
+
+
+async def test_coder_noop_with_remaining_issues_still_fails(anyio_backend):
+    provider = _Provider(patch_ref=None, structured_result={"completed": True, "summary": "not fixed", "tests_run": [], "remaining_issues": ["needs code"]})
+
+    update = await coder_node(
+        {
+            "run_id": "run",
+            "thread_id": "thread",
+            "source_repo": "/repo",
+            "base_commit": "base0",
+            "integrated_commit": "base1",
+            "coder_step": 2,
+            "completed_coder_task_ids": ["a"],
+            "active_coder_task": {"local_id": "b", "role": "coder", "goal": "fix", "dependencies": ["a"]},
+        },
+        _context(provider),
+    )
+
+    assert update["workflow_status"] == "FAILED"
+    assert update["error"] == "coder produced no patch"
