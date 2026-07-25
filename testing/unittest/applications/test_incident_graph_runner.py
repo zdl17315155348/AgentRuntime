@@ -12,9 +12,10 @@ from applications.incident_repair.services.run_store import RunStore
 
 
 class FakeGraphProvider(ExecutionProvider):
-    def __init__(self):
+    def __init__(self, coder_patch: bool = True):
         self.calls: list[AgentExecutionRequest] = []
         self.cancelled: list[str] = []
+        self.coder_patch = coder_patch
 
     @property
     def mode(self) -> str:
@@ -37,6 +38,8 @@ class FakeGraphProvider(ExecutionProvider):
                 metrics=metrics,
             )
         if request.role == "coder":
+            if not self.coder_patch:
+                return AgentExecutionResult(status="SUCCESS", metrics=metrics)
             return AgentExecutionResult(
                 status="SUCCESS",
                 patch_ref={
@@ -141,3 +144,22 @@ async def test_run_service_records_graph_node_updates(tmp_path):
     assert result["summary"]["status"] == "SUCCESS"
     assert any(event["name"] == "graph.node.updated" and event["graph_node"] == "planner" for event in events)
     assert any(event["name"] == "graph.node.updated" and event["graph_node"] == "reviewer" for event in events)
+
+
+@pytest.mark.anyio
+async def test_coder_without_patch_fails_before_integration(tmp_path):
+    pytest.importorskip("langgraph")
+    pytest.importorskip("langgraph.checkpoint.sqlite")
+    provider = FakeGraphProvider(coder_patch=False)
+    service = IncidentRunService(store=RunStore(tmp_path / "live"))
+    service.runner.checkpoint_path = tmp_path / "checkpoints.sqlite"
+    config = IncidentRunConfig(execution_mode=ExecutionMode.DIRECT, run_id="run_no_patch", thread_id="thread_no_patch", source_repo=str(Path.cwd()), base_commit="HEAD")
+
+    result = await service.execute_run(config, "fix", {"provider": provider, "integration_service": _Integration()})
+
+    roles = [call.role for call in provider.calls]
+    assert roles.count("coder") == 1
+    assert "tester" not in roles
+    assert "reviewer" not in roles
+    assert result["summary"]["status"] == "FAILED"
+    assert result["summary"]["error"] == "coder produced no patch"

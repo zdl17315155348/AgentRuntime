@@ -35,6 +35,12 @@ def route_after_review_with_context(state: IncidentRepairState, runtime=None) ->
     return route_after_review(state, context.run_config.max_repair_rounds)
 
 
+def route_after_coder(state: IncidentRepairState, runtime=None) -> str:
+    if state.get("workflow_status") == "FAILED":
+        return "failed"
+    return "integrate_coder"
+
+
 def build_graph(checkpointer=None):
     try:
         from langgraph.graph import END, START, StateGraph
@@ -54,7 +60,7 @@ def build_graph(checkpointer=None):
     builder.add_edge(START, "planner")
     builder.add_edge("planner", "select_coder")
     builder.add_conditional_edges("select_coder", route_after_select, {"coder": "coder", "tester": "tester", "failed": "failed"})
-    builder.add_edge("coder", "integrate_coder")
+    builder.add_conditional_edges("coder", route_after_coder, {"integrate_coder": "integrate_coder", "failed": "failed"})
     builder.add_edge("integrate_coder", "select_coder")
     builder.add_conditional_edges("tester", route_after_test_with_context, {"repair": "repair", "reviewer": "reviewer", "failed": "failed"})
     builder.add_edge("repair", "integrate_repair")
