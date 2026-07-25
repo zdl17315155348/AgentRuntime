@@ -8,11 +8,15 @@ from applications.incident_repair.nodes.repair import repair_node
 
 
 class _Provider(ExecutionProvider):
+    def __init__(self):
+        self.request: AgentExecutionRequest | None = None
+
     @property
     def mode(self):
         return "direct"
 
     async def execute(self, request: AgentExecutionRequest) -> AgentExecutionResult:
+        self.request = request
         return AgentExecutionResult(status="SUCCESS", metrics=ExecutionMetrics(submit_started_at=0, execution_started_at=0, execution_finished_at=0))
 
     async def cancel_run(self, run_id: str) -> None:
@@ -27,8 +31,9 @@ class _Provider(ExecutionProvider):
 
 @pytest.mark.anyio
 async def test_repair_without_patch_fails_workflow():
+    provider = _Provider()
     context = GraphRuntimeContext(
-        provider=_Provider(),
+        provider=provider,
         run_config=IncidentRunConfig(execution_mode=ExecutionMode.DIRECT, run_id="r", thread_id="t", source_repo=".", base_commit="HEAD"),
         event_bus=None,
     )
@@ -43,10 +48,13 @@ async def test_repair_without_patch_fails_workflow():
             "integrated_commit": None,
             "repair_round": 0,
             "test_summary": {"returncode": 1},
+            "review_summary": {"approved": False, "issues": ["blocking"]},
             "patch_refs": [],
         },
         context,
     )
 
+    assert provider.request is not None
+    assert provider.request.task_input["review_summary"] == {"approved": False, "issues": ["blocking"]}
     assert result["workflow_status"] == "FAILED"
     assert result["error"] == "repair produced no patch"

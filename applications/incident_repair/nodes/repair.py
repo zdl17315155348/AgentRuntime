@@ -18,7 +18,11 @@ async def repair_node(state: dict, runtime):
         backend="codex_cli",
         goal=state["user_request"],
         system_prompt=load_prompt("repair.md"),
-        task_input={"test_summary": state.get("test_summary"), "patch_refs": state.get("patch_refs", [])},
+        task_input={
+            "test_summary": state.get("test_summary"),
+            "review_summary": state.get("review_summary"),
+            "patch_refs": state.get("patch_refs", []),
+        },
         source_repo=state["source_repo"],
         base_commit=state.get("integrated_commit") or state["base_commit"],
         timeout_s=timeout_s,
