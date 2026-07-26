@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
+import asyncio
 
 from applications.incident_repair.config import ExecutionMode, IncidentRunConfig
 from applications.incident_repair.execution.base import AgentExecutionRequest, AgentExecutionResult, ExecutionMetrics
 from applications.incident_repair.execution.direct import DirectExecutionProvider
 from applications.incident_repair.execution.factory import create_execution_provider
-from applications.incident_repair.execution.runtime import RuntimeSystemError
+from applications.incident_repair.execution.runtime import RuntimeSystemError, _agentd_visible_path
 
 
 def _config(mode: ExecutionMode = ExecutionMode.DIRECT) -> IncidentRunConfig:
@@ -210,6 +213,33 @@ async def test_runtime_provider_reuses_client_and_maps_request_fields():
     assert client.submitted["workspace"]["base_commit"] == "HEAD"
     assert client.submitted["workspace"]["base_ref"] == "HEAD"
     assert client.submitted["workspace"]["read_only"] is True
+
+
+@pytest.mark.anyio
+async def test_runtime_provider_wait_task_does_not_block_event_loop():
+    class _SlowClient(_FakeClient):
+        def wait_task(self, task_id, timeout_s):
+            import time
+
+            time.sleep(0.05)
+            return super().wait_task(task_id, timeout_s)
+
+    provider = create_execution_provider(_config(ExecutionMode.RUNTIME), {"client": _SlowClient()})
+    task = asyncio.create_task(provider.execute(_request("direct_tool", "tester")))
+    await asyncio.sleep(0)
+
+    assert not task.done()
+    assert await asyncio.wait_for(asyncio.sleep(0, result="alive"), timeout=0.01) == "alive"
+    result = await task
+    assert result.status == "SUCCESS"
+
+
+def test_agentd_visible_path_maps_repo_run_data(monkeypatch):
+    monkeypatch.setenv("AGENTD_SHARED_RUN_DATA_CONTAINER", "/app/run-data")
+    source = Path.cwd() / "run-data/e2e-repos/run-1/repo"
+
+    assert _agentd_visible_path(str(source)) == "/app/run-data/e2e-repos/run-1/repo"
+    assert _agentd_visible_path("/tmp/repo") == "/tmp/repo"
 
 
 @pytest.mark.anyio

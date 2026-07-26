@@ -80,8 +80,11 @@ class IncidentRunService:
         bundle = bundle or await self.start_run(config, user_request, dependencies)
         context = bundle["context"]
         state = bundle["state"]
+        latest_state = state
         started = bundle["summary"]["started_at"]
         def _record_graph_update(node_name: str, updated_state: dict) -> None:
+            nonlocal latest_state
+            latest_state = updated_state
             self.store.write_json(config.run_id, "graph_state.json", updated_state)
             context.event_bus.emit("langgraph", "graph.node.updated", graph_node=node_name, attributes={"workflow_status": updated_state.get("workflow_status")})
 
@@ -89,21 +92,25 @@ class IncidentRunService:
             final_state = await asyncio.wait_for(self.runner.run(state, context, on_update=_record_graph_update), timeout=config.workflow_timeout_s)
             status = final_state.get("workflow_status") or "SUCCESS"
             error = final_state.get("error")
-        except (asyncio.TimeoutError, TimeoutError):
+        except (asyncio.TimeoutError, TimeoutError) as exc:
             provider = context.provider
             if hasattr(provider, "cancel_run"):
                 await provider.cancel_run(config.run_id)
-            final_state = {**state, "workflow_status": "FAILED", "error": f"workflow timeout after {config.workflow_timeout_s}s"}
+            error_text = str(exc)
+            if not error_text:
+                error_text = f"workflow timeout after {config.workflow_timeout_s}s"
+            final_state = {**latest_state, "workflow_status": "FAILED", "error": error_text}
             status = "FAILED"
             error = final_state["error"]
             context.event_bus.emit("langgraph", "graph.run.failed", attributes={"error": error})
         except Exception as exc:
-            final_state = state
+            final_state = {**latest_state, "workflow_status": "FAILED", "error": str(exc)}
             status = "FAILED"
             error = str(exc)
             context.event_bus.emit("langgraph", "graph.run.failed", attributes={"error": error})
         finished = time.time()
         context.event_bus.emit("langgraph", "graph.run.completed", attributes={"status": status})
+        self.store.write_json(config.run_id, "graph_state.json", final_state)
         events = self.store.load_events(config.run_id) if hasattr(self.store, "load_events") else []
         provider = context.provider
         summary = RunSummaryAggregator().build(
@@ -122,16 +129,18 @@ class IncidentRunService:
         )
         if error:
             summary["error"] = error
-        self.store.write_json(config.run_id, "graph_state.json", final_state)
         self.store.write_json(config.run_id, "summary.json", summary)
         return {"run_id": config.run_id, "thread_id": config.thread_id, "state": final_state, "summary": summary}
 
 
 async def _maybe_snapshot(provider) -> dict:
-    snapshot = provider.get_execution_snapshot("")
-    if hasattr(snapshot, "__await__"):
-        snapshot = await snapshot
-    return snapshot or {}
+    try:
+        snapshot = provider.get_execution_snapshot("")
+        if hasattr(snapshot, "__await__"):
+            snapshot = await snapshot
+        return snapshot or {}
+    except Exception as exc:
+        return {"snapshot_error": str(exc)}
 
 
 def new_run_config(**kwargs) -> IncidentRunConfig:

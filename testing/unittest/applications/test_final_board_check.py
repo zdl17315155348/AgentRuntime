@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import os
 
-from scripts.final_board_check import _last_two_success, _valid_e2e_summary
+from scripts.final_board_check import _last_two_success, _manifests_match_commit, _valid_e2e_summary
 
 
 def _write_run(root, name: str, status: str) -> None:
@@ -29,6 +29,24 @@ def _write_run(root, name: str, status: str) -> None:
     path.write_text(json.dumps(manifest), encoding="utf-8")
     index = int(name.removeprefix("run"))
     os.utime(path, (index, index))
+
+
+def _write_mode_run(root, mode: str, name: str, status: str, commit: str) -> None:
+    run_dir = root / "run-data" / name
+    run_dir.mkdir(parents=True, exist_ok=True)
+    summary = {
+        "status": status,
+        "result": {
+            "patch_non_empty": status == "SUCCESS",
+            "pytest_returncode": 0 if status == "SUCCESS" else 1,
+            "review_approved": status == "SUCCESS",
+        },
+    }
+    summary_path = run_dir / "summary.json"
+    summary_path.write_text(json.dumps(summary), encoding="utf-8")
+    path = root / "final-evidence" / f"{mode}-e2e" / f"{name}.log"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"status": status, "summary": str(summary_path), "git_commit": commit}), encoding="utf-8")
 
 
 def test_valid_e2e_summary_requires_patch_test_and_review():
@@ -57,3 +75,16 @@ def test_last_two_success_uses_time_order(tmp_path, monkeypatch):
 
     _write_run(tmp_path, "run4", "SUCCESS")
     assert _last_two_success(tmp_path / "final-evidence", "direct")
+
+
+def test_manifest_commit_match_requires_current_success_per_mode(tmp_path, monkeypatch):
+    import scripts.final_board_check as check
+
+    monkeypatch.setattr(check, "ROOT", tmp_path)
+    for mode in ("direct", "runtime", "fault"):
+        _write_mode_run(tmp_path, mode, f"{mode}_old", "SUCCESS", "old")
+        _write_mode_run(tmp_path, mode, f"{mode}_current", "SUCCESS", "current")
+    assert _manifests_match_commit(tmp_path / "final-evidence", "current")
+
+    _write_mode_run(tmp_path, "fault", "fault_current", "FAILED", "current")
+    assert not _manifests_match_commit(tmp_path / "final-evidence", "current")

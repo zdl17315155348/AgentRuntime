@@ -181,6 +181,13 @@ def test_get_task_hits_task_endpoint():
     assert http.last_get["url"] == "http://example/tasks/t1"
 
 
+def test_client_disables_read_timeout_for_long_polling_tasks():
+    c = AgentRuntimeClient(base_url="http://example")
+
+    assert c.client.timeout.read is None
+    assert c.client.timeout.connect == 30.0
+
+
 def test_wait_task_retries_transient_poll_timeout():
     class _FlakyHTTP(_HTTP):
         def __init__(self):

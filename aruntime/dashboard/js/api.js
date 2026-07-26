@@ -4,6 +4,15 @@ async function apiGet(path) {
   return resp.json();
 }
 
+async function apiGetOrDefault(path, fallback) {
+  try {
+    return await apiGet(path);
+  } catch (err) {
+    console.warn(`dashboard request failed: ${path}`, err);
+    return fallback;
+  }
+}
+
 async function apiPost(path, body) {
   const resp = await fetch(path, {
     method: "POST",

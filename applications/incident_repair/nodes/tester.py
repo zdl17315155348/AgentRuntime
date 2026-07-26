@@ -28,7 +28,28 @@ async def tester_node(state: dict, runtime):
         timeout_s=180,
         idempotency_key=build_idempotency_key(state["thread_id"], "tester", 3 + int(state.get("repair_round", 0)), "root"),
     )
-    result = await context.provider.execute(request)
+    try:
+        result = await context.provider.execute(request)
+    except TimeoutError as exc:
+        summary = TestSummaryModel(returncode=1, passed=0, failed=1, failed_tests=[{"name": "runtime_tester_timeout", "message": str(exc)}])
+        return {
+            "test_summary": summary.model_dump(),
+            "runtime_task_ids": [],
+            "execution_records": [],
+        }
+    if result.status != "SUCCESS":
+        summary = TestSummaryModel(
+            returncode=1,
+            passed=0,
+            failed=1,
+            failed_tests=[{"name": "runtime_tester_failed", "message": result.error_message or result.status}],
+            report_artifact_id=None,
+        )
+        return {
+            "test_summary": summary.model_dump(),
+            "runtime_task_ids": [result.runtime_task_id] if result.runtime_task_id else [],
+            "execution_records": [execution_record_from_result(request, result, context.provider.mode)],
+        }
     summary = TestSummaryModel.model_validate(result.structured_result)
     return {
         "test_summary": summary.model_dump(),

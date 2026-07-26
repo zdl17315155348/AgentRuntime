@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 
 import pytest
 from pathlib import Path
@@ -146,6 +147,67 @@ async def test_run_service_times_out_and_cancels_provider(tmp_path):
 
 
 @pytest.mark.anyio
+async def test_run_service_timeout_preserves_latest_graph_state(tmp_path):
+    class _UpdatingHangingRunner:
+        async def run(self, state, context, on_update=None):
+            updated = {
+                **state,
+                "plan": {"summary": "planned"},
+                "test_summary": {"returncode": 0, "passed": 3, "failed": 0},
+                "repair_round": 1,
+                "workflow_status": "RUNNING",
+            }
+            if on_update:
+                on_update("tester", updated)
+            await asyncio.sleep(30)
+
+    provider = FakeGraphProvider()
+    service = IncidentRunService(store=RunStore(tmp_path / "live"), runner=_UpdatingHangingRunner())
+    config = IncidentRunConfig(
+        execution_mode=ExecutionMode.DIRECT,
+        run_id="run_timeout_latest_state",
+        thread_id="thread_timeout_latest_state",
+        source_repo=str(Path.cwd()),
+        base_commit="HEAD",
+        workflow_timeout_s=1,
+    )
+
+    result = await service.execute_run(config, "fix", {"provider": provider, "integration_service": _Integration()})
+    graph_state = json.loads((tmp_path / "live" / "run_timeout_latest_state" / "graph_state.json").read_text(encoding="utf-8"))
+
+    assert result["summary"]["status"] == "FAILED"
+    assert graph_state["workflow_status"] == "FAILED"
+    assert graph_state["error"] == "workflow timeout after 1s"
+    assert graph_state["plan"] == {"summary": "planned"}
+    assert graph_state["test_summary"]["returncode"] == 0
+    assert graph_state["repair_round"] == 1
+
+
+@pytest.mark.anyio
+async def test_run_service_preserves_runtime_wait_timeout_error(tmp_path):
+    class _RuntimeWaitRunner:
+        async def run(self, state, context, on_update=None):
+            raise TimeoutError("task task_1 did not finish within 330s")
+
+    provider = FakeGraphProvider()
+    service = IncidentRunService(store=RunStore(tmp_path / "live"), runner=_RuntimeWaitRunner())
+    config = IncidentRunConfig(
+        execution_mode=ExecutionMode.RUNTIME,
+        run_id="run_runtime_timeout",
+        thread_id="thread_runtime_timeout",
+        source_repo=str(Path.cwd()),
+        base_commit="HEAD",
+        workflow_timeout_s=900,
+    )
+
+    result = await service.execute_run(config, "fix", {"provider": provider, "integration_service": _Integration()})
+
+    assert result["summary"]["status"] == "FAILED"
+    assert result["summary"]["error"] == "task task_1 did not finish within 330s"
+    assert json.loads((tmp_path / "live" / "run_runtime_timeout" / "summary.json").read_text(encoding="utf-8"))["error"] == "task task_1 did not finish within 330s"
+
+
+@pytest.mark.anyio
 async def test_run_service_records_graph_node_updates(tmp_path):
     pytest.importorskip("langgraph")
     pytest.importorskip("langgraph.checkpoint.sqlite")
@@ -197,3 +259,25 @@ async def test_repair_without_patch_fails_before_integration(tmp_path):
     assert roles.count("repair") == 1
     assert result["summary"]["status"] == "FAILED"
     assert result["summary"]["error"] == "repair produced no patch"
+
+
+@pytest.mark.anyio
+async def test_run_service_writes_final_summary_when_snapshot_fails(tmp_path):
+    pytest.importorskip("langgraph")
+    pytest.importorskip("langgraph.checkpoint.sqlite")
+
+    class _SnapshotFailProvider(FakeGraphProvider):
+        async def get_execution_snapshot(self, run_id: str) -> dict:
+            raise RuntimeError("metrics unavailable")
+
+    provider = _SnapshotFailProvider(reviewer_approved=False, repair_patch=False)
+    service = IncidentRunService(store=RunStore(tmp_path / "live"))
+    service.runner.checkpoint_path = tmp_path / "checkpoints.sqlite"
+    config = IncidentRunConfig(execution_mode=ExecutionMode.RUNTIME, run_id="run_snapshot_fail", thread_id="thread_snapshot_fail", source_repo=str(Path.cwd()), base_commit="HEAD")
+
+    result = await service.execute_run(config, "fix", {"provider": provider, "integration_service": _Integration()})
+    summary = json.loads((tmp_path / "live" / "run_snapshot_fail" / "summary.json").read_text(encoding="utf-8"))
+
+    assert result["summary"]["status"] == "FAILED"
+    assert summary["status"] == "FAILED"
+    assert summary["error"] == "repair produced no patch"

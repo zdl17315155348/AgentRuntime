@@ -4,24 +4,59 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Incident Repair Demo</title>
-    <link rel="stylesheet" href="/dashboard/styles.css">
+    <link rel="stylesheet" href="/dashboard/styles.css?v=0.1.169">
   </head>
   <body>
-    <header>
-      <strong>Incident Repair</strong>
-      <span id="mode">LIVE</span>
-      <button id="runtime">Start Runtime</button>
-      <button id="direct">Start Direct</button>
-      <button id="replay">Open Replay</button>
-      <button id="cancel">Cancel</button>
-    </header>
-    <main>
-      <section id="summary"></section>
-      <section><h2>LangGraph</h2><div id="graph"></div></section>
-      <section><h2>Execution Timeline</h2><div id="events"></div></section>
-      <section><h2>Artifacts</h2><div id="artifacts"></div></section>
-    </main>
-    <script src="/dashboard/js/api.js"></script>
-    <script src="/dashboard/js/demo.js"></script>
+    <div class="dashboard-shell">
+      <header class="app-header">
+        <div class="brand">
+          <span class="brand-mark">A</span>
+          <strong>AgentRuntime OS</strong>
+          <span class="version-pill">v2.0</span>
+        </div>
+        <div class="header-status">
+          <span class="live-dot"></span>
+          <span id="system-status">系统运行中</span>
+          <span id="updated-at"></span>
+        </div>
+      </header>
+      <div class="control-bar">
+        <span id="mode">LIVE</span>
+        <span id="run-id"></span>
+        <button id="runtime">Start Runtime</button>
+        <button id="direct">Start Direct</button>
+        <button id="replay">Open Replay</button>
+        <button id="cancel">Cancel</button>
+      </div>
+      <main>
+        <section class="panel flow-panel">
+          <div class="section-title">
+            <span>LangGraph 执行拓扑</span>
+            <small id="active-brief">等待启动</small>
+          </div>
+          <div id="graph"></div>
+        </section>
+        <section class="status-grid">
+          <div class="panel agent-panel">
+            <div class="section-title">
+              <span>当前智能体</span>
+              <small id="agent-role">-</small>
+            </div>
+            <div id="agent-focus"></div>
+          </div>
+          <div class="panel monitor-panel">
+            <div class="section-title">
+              <span>监控 & 任务队列</span>
+              <small id="queue-brief">-</small>
+            </div>
+            <div id="runtime-layer"></div>
+          </div>
+        </section>
+        <section class="footer-stats" id="summary"></section>
+        <div id="topology" hidden></div>
+      </main>
+    </div>
+    <script src="/dashboard/js/api.js?v=0.1.169"></script>
+    <script src="/dashboard/js/demo.js?v=0.1.169"></script>
   </body>
 </html>

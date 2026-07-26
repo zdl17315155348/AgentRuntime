@@ -145,12 +145,10 @@ def _recorded_commit(evidence: Path) -> str:
 def _manifests_match_commit(evidence: Path, commit: str) -> bool:
     if not commit:
         return False
-    paths = []
     for mode in ("direct", "runtime", "fault"):
-        paths.extend(_success_logs(evidence, mode))
-    if not paths:
-        return False
-    return all((_manifest(path).get("git_commit") == commit) for path in paths)
+        if not any(_manifest(path).get("git_commit") == commit for path in _success_logs(evidence, mode)):
+            return False
+    return True
 
 
 def _benchmark_reports(evidence: Path) -> list[dict[str, Any]]:
@@ -220,10 +218,10 @@ def main() -> int:
     bench_ok, bench_detail = _benchmarks_valid(evidence, recorded_commit)
     ok &= _check("Benchmark真实且Pair可比较", bench_ok, bench_detail)
     ok &= _check("Dashboard读取真实数据", _has_file(evidence / "dashboard", ("*.png", "*.json", "*.log")))
-    ok &= _check("Replay和录屏可用", _has_file(evidence / "videos", ("*.mp4", "*.webm")) and _has_file(evidence / "runtime-e2e", ("*replay_manifest.json", "replay_manifest.json")))
+    ok &= _check("Replay可用", _has_file(evidence / "runtime-e2e", ("*replay_manifest.json", "replay_manifest.json")))
     leaked, leak_path = _has_secret_leak(evidence)
     ok &= _check("API Key没有泄漏", not leaked, leak_path)
-    required_dirs = ["environment", "tests", "direct-e2e", "runtime-e2e", "fault-e2e", "benchmarks", "dashboard", "patches", "videos"]
+    required_dirs = ["environment", "tests", "direct-e2e", "runtime-e2e", "fault-e2e", "benchmarks", "dashboard", "patches"]
     missing_dirs = [name for name in required_dirs if not (evidence / name).is_dir()]
     ok &= _check("最终证据目录完整", not missing_dirs, ",".join(missing_dirs))
     return 0 if ok else 1

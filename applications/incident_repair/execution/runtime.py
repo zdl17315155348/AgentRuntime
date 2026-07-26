@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import json
+import os
 import time
+import asyncio
 from collections import defaultdict
+from pathlib import Path
 from typing import Any
 
 from aruntime.api.client import AgentRuntimeClient
@@ -35,10 +38,12 @@ class AgentRuntimeExecutionProvider(ExecutionProvider):
 
     async def execute(self, request: AgentExecutionRequest) -> AgentExecutionResult:
         timer = ExecutionTimer()
+        agentd_source_repo = _agentd_visible_path(request.source_repo)
+        agentd_workspace_path = _agentd_visible_path(request.workspace_path) if request.workspace_path else request.workspace_path
         payload = {
             "goal": request.goal,
             "system_prompt": request.system_prompt,
-            "source_repo": request.source_repo,
+            "source_repo": agentd_source_repo,
             "base_commit": request.base_commit,
             "context_refs": request.context_refs,
             "artifact_refs": request.artifact_refs,
@@ -51,7 +56,8 @@ class AgentRuntimeExecutionProvider(ExecutionProvider):
             "graph_managed": True,
         }
         payload.update(request.task_input)
-        task = self.client.submit_task(
+        task = await asyncio.to_thread(
+            self.client.submit_task,
             self._agent_for_role(request.role),
             payload,
             context_id=request.idempotency_key if self.config.recovery_context_enabled else "",
@@ -65,10 +71,10 @@ class AgentRuntimeExecutionProvider(ExecutionProvider):
             idempotency_key=request.idempotency_key,
             failure_policy=self._failure_policy_for_role(request.role),
             workspace=WorkspaceSpec(
-                source_repo=request.source_repo,
+                source_repo=agentd_source_repo,
                 base_ref=request.base_commit,
                 base_commit=request.base_commit,
-                workspace_path=request.workspace_path,
+                workspace_path=agentd_workspace_path,
                 read_only=request.role in ("tester", "reviewer"),
             ).model_dump(mode="json", exclude_none=True),
         )
@@ -79,7 +85,7 @@ class AgentRuntimeExecutionProvider(ExecutionProvider):
             wait_timeout_s = request.timeout_s + 30
             if self.config.fault_mode and request.role in ("coder", "repair"):
                 wait_timeout_s = request.timeout_s * 2 + 90
-            result = self.client.wait_task(task_id, wait_timeout_s)
+            result = await asyncio.to_thread(self.client.wait_task, task_id, wait_timeout_s)
             return self._convert_result(request, result, timer)
         finally:
             self._run_task_ids[request.run_id].discard(task_id)
@@ -268,3 +274,17 @@ def _strip_runtime_error_prefix(output: str) -> str:
     if text.startswith(prefix):
         text = text[len(prefix) :].strip()
     return text
+
+
+def _agentd_visible_path(path: str) -> str:
+    if not path:
+        return path
+    try:
+        resolved = Path(path).resolve()
+        root = Path(__file__).resolve().parents[3]
+        run_data = root / "run-data"
+        relative = resolved.relative_to(run_data)
+    except (OSError, ValueError):
+        return path
+    container_root = os.getenv("AGENTD_SHARED_RUN_DATA_CONTAINER", "/app/run-data").rstrip("/")
+    return str(Path(container_root) / relative)

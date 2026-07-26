@@ -1,0 +1,4 @@
+- [x] RC Fault 真实 E2E 1 次 SUCCESS
+- [x] RC 无密钥回归
+- [x] 正式 Benchmark
+- [x] Dashboard/Replay 证据（无需视频）

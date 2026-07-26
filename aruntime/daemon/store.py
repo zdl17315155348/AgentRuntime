@@ -203,6 +203,24 @@ class SQLiteStateStore:
             ).fetchall()
             return [dict(row) for row in rows]
 
+    def delete_tasks_for_run(self, root_task_id: str) -> int:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT task_id FROM tasks WHERE json_extract(data, '$.root_task_id') = ? OR task_id = ?",
+                (root_task_id, root_task_id),
+            ).fetchall()
+            task_ids = [str(row["task_id"]) for row in rows]
+            if not task_ids:
+                return 0
+            placeholders = ",".join("?" for _ in task_ids)
+            self._conn.execute(f"DELETE FROM artifacts WHERE task_id IN ({placeholders}) OR root_task_id = ?", (*task_ids, root_task_id))
+            self._conn.execute(f"DELETE FROM task_attempts WHERE task_id IN ({placeholders})", task_ids)
+            self._conn.execute(f"DELETE FROM trace_events WHERE task_id IN ({placeholders})", task_ids)
+            self._conn.execute(f"DELETE FROM resource_leases WHERE task_id IN ({placeholders})", task_ids)
+            self._conn.execute(f"DELETE FROM tasks WHERE task_id IN ({placeholders})", task_ids)
+            self._conn.commit()
+            return len(task_ids)
+
     def list_trace_events_after_id(self, root_task_id: str, after_id: int = 0) -> list[dict[str, Any]]:
         with self._lock:
             task_rows = self._conn.execute(

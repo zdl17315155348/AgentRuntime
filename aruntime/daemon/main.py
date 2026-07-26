@@ -5,7 +5,9 @@ from datetime import datetime
 from typing import Dict, Optional
 import subprocess
 import secrets
+import shutil
 import signal
+import time
 from uuid import uuid4
 from pathlib import Path
 
@@ -41,6 +43,7 @@ from aruntime.workflow import WorkflowService
 from aruntime.workflow.recovery import RecoveryContext
 from applications.incident_repair.config import ExecutionMode
 from applications.incident_repair.services.run_service import IncidentRunService, new_run_config
+import yaml
 
 import json
 
@@ -208,6 +211,100 @@ def _persist_agent(agent_name: str) -> None:
 def _persist_task(task: TaskSpec | None) -> None:
     if task is not None:
         state_store.save_task(task)
+
+
+async def _cancel_runtime_task(task_id: str, reason: str = "cancel.request") -> bool:
+    task = tasks.get(task_id)
+    if task is None:
+        return False
+    if task.status in (TaskStatus.SUCCESS, TaskStatus.FAILED, TaskStatus.TIMEOUT, TaskStatus.CANCELLED):
+        return True
+    task.transition_to(TaskStatus.CANCELLED, reason)
+    task.error = "cancelled"
+    scheduler.fail_task(task.task_id)
+    await resource_monitor.release_async(task.task_id)
+    state_store.release_leases_for_task(task.task_id, reason="task.cancelled")
+    _record_trace_event(task, "task.cancelled", {"reason": reason})
+    _persist_task(task)
+    agent_inflight_tasks[task.agent_name] = max(agent_inflight_tasks.get(task.agent_name, 0) - 1, 0)
+    _set_current_task(task.agent_name, None)
+    _wake_scheduler()
+    return True
+
+
+def _delete_runtime_paths_for_run(run_id: str, task_ids: list[str]) -> None:
+    for root in (workspace_manager.workspace_root, artifact_store.root):
+        shutil.rmtree(root / run_id, ignore_errors=True)
+        for task_id in task_ids:
+            shutil.rmtree(root / task_id, ignore_errors=True)
+
+
+def _ensure_worker_started(agent_name: str) -> None:
+    proc = agent_workers.get(agent_name)
+    if proc is None or proc.poll() is not None:
+        _stop_worker(agent_name)
+        _start_worker(agent_name)
+
+
+def _ensure_demo_agents_registered() -> None:
+    agents_path = Path(__file__).resolve().parents[2] / "examples" / "production_incident_demo" / "agents.yaml"
+    if not agents_path.exists():
+        return
+    data = yaml.safe_load(agents_path.read_text(encoding="utf-8")) or {}
+    for item in data.get("agents", []):
+        agent_name = str(item.get("name") or "").strip()
+        if not agent_name:
+            continue
+        if agent_name in agents:
+            _ensure_worker_started(agent_name)
+            if agents[agent_name].status == AgentStatus.CREATED:
+                _transition_agent(agent_name, AgentStatus.READY, reason="demo.agent_registered")
+            continue
+        kwargs = {
+            "agent_name": agent_name,
+            "role": item.get("role", agent_name),
+            "system_prompt": item.get("system_prompt", ""),
+            "capability": item.get("capability", {}),
+            "backend": item.get("backend", {"type": "legacy_llm"}),
+        }
+        if item.get("failure_policy") is not None:
+            kwargs["failure_policy"] = item["failure_policy"]
+        agent = AgentSpec(**kwargs)
+        agents[agent_name] = agent
+        agent_controls[agent_name] = AgentControlBlock.from_agent_spec(agent)
+        fault_states[agent_name] = WorkerFaultState(agent_name=agent_name, fault_domain=agent_name)
+        try:
+            _start_worker(agent_name)
+            _transition_agent(agent_name, AgentStatus.READY, reason="demo.agent_registered")
+            _persist_agent(agent_name)
+        except Exception:
+            agents.pop(agent_name, None)
+            agent_controls.pop(agent_name, None)
+            fault_states.pop(agent_name, None)
+            agent_auth_tokens.pop(agent_name, None)
+            cgroup_bindings.pop(agent_name, None)
+            raise
+
+
+def _merge_demo_summary_with_graph_state(summary_data: dict, graph_state: dict) -> dict:
+    graph_status = str(graph_state.get("workflow_status") or "").upper()
+    if graph_status not in {"SUCCESS", "FAILED", "TIMEOUT", "CANCELLED", "INTERRUPTED"}:
+        return summary_data
+    merged = dict(summary_data)
+    merged["status"] = graph_status
+    if graph_state.get("error"):
+        merged["error"] = graph_state["error"]
+    result = dict(merged.get("result") or {})
+    test_summary = graph_state.get("test_summary") or {}
+    review_summary = graph_state.get("review_summary") or {}
+    if "returncode" in test_summary:
+        result["pytest_returncode"] = test_summary.get("returncode")
+        result["tests_passed"] = int(test_summary.get("passed") or 0)
+        result["tests_failed"] = int(test_summary.get("failed") or 0)
+    if "approved" in review_summary:
+        result["review_approved"] = bool(review_summary.get("approved"))
+    merged["result"] = result
+    return merged
 
 
 def _sync_agent_from_acb(agent_name: str) -> None:
@@ -1243,6 +1340,14 @@ async def get_task(task_id: str):
     }
 
 
+@app.post("/tasks/{task_id}/cancel")
+async def cancel_task(task_id: str):
+    if task_id not in tasks:
+        raise HTTPException(status_code=404, detail="Task not found")
+    await _cancel_runtime_task(task_id)
+    return {"task_id": task_id, "status": tasks[task_id].status}
+
+
 @app.get("/tasks/{task_id}/trace")
 async def get_task_trace(task_id: str):
     if task_id not in tasks:
@@ -1315,6 +1420,7 @@ async def get_run_tasks(root_task_id: str):
 
 @app.post("/demo/runs")
 async def create_demo_run(req: CreateDemoRunRequest):
+    _ensure_demo_agents_registered()
     config = new_run_config(
         execution_mode=req.execution_mode,
         source_repo=req.source_repo,
@@ -1355,18 +1461,55 @@ async def get_demo_run(run_id: str):
     summary = run_dir / "summary.json"
     if not summary.exists():
         raise HTTPException(status_code=404, detail="Demo run not found")
-    return json.loads(summary.read_text(encoding="utf-8"))
+    raw_data = json.loads(summary.read_text(encoding="utf-8"))
+    data = raw_data
+    graph_path = run_dir / "graph_state.json"
+    graph_state = json.loads(graph_path.read_text(encoding="utf-8")) if graph_path.exists() else {}
+    data = _merge_demo_summary_with_graph_state(data, graph_state)
+    if data != raw_data:
+        demo_run_service.store.write_json(run_id, "summary.json", data)
+    task = demo_run_tasks.get(run_id)
+    status = str(data.get("status") or "")
+    if status in {"CREATED", "PENDING"} and (task is None or task.done()):
+        events = demo_run_service.store.load_events(run_id)
+        if any(event.get("name") == "graph.run.started" for event in events):
+            graph_state["workflow_status"] = "INTERRUPTED"
+            graph_state["error"] = "demo run interrupted; agentd process stopped before completion"
+            data["status"] = "INTERRUPTED"
+            data["finished_at"] = data.get("finished_at") or time.time()
+            data["duration_ms"] = round((data["finished_at"] - float(data.get("started_at") or data["finished_at"])) * 1000, 3)
+            data["error"] = graph_state["error"]
+            demo_run_service.store.write_json(run_id, "graph_state.json", graph_state)
+            demo_run_service.store.write_json(run_id, "summary.json", data)
+    return data
 
 
 @app.post("/demo/runs/{run_id}/cancel")
 async def cancel_demo_run(run_id: str):
-    if run_id not in demo_runs:
+    run_dir = demo_run_service.store.run_dir(run_id)
+    summary_path = run_dir / "summary.json"
+    if run_id not in demo_runs and not summary_path.exists():
         raise HTTPException(status_code=404, detail="Demo run not found")
     task = demo_run_tasks.get(run_id)
     if task is not None and not task.done():
         task.cancel()
-    demo_runs[run_id]["status"] = "CANCELLED"
-    return {"run_id": run_id, "status": "CANCELLED"}
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            pass
+    runtime_rows = state_store.list_tasks_for_run(run_id)
+    runtime_task_ids = [str(row["task_id"]) for row in runtime_rows]
+    for task_id in runtime_task_ids:
+        await _cancel_runtime_task(task_id, reason="demo.cancel")
+        tasks.pop(task_id, None)
+    state_store.delete_tasks_for_run(run_id)
+    _delete_runtime_paths_for_run(run_id, runtime_task_ids)
+    demo_run_tasks.pop(run_id, None)
+    demo_runs.pop(run_id, None)
+    shutil.rmtree(run_dir, ignore_errors=True)
+    return {"run_id": run_id, "status": "DELETED", "runtime_tasks_cancelled": len(runtime_task_ids)}
 
 
 @app.post("/demo/runs/{run_id}/faults")
@@ -1380,7 +1523,7 @@ async def inject_demo_fault(run_id: str, target: dict):
 async def get_demo_events(run_id: str, after_id: int = 0):
     path = demo_run_service.store.run_dir(run_id) / "unified_events.jsonl"
     if not path.exists():
-        raise HTTPException(status_code=404, detail="Demo run events not found")
+        return {"events": []}
     events = []
     for line in path.read_text(encoding="utf-8").splitlines():
         event = json.loads(line)
@@ -1419,6 +1562,23 @@ async def get_demo_graph(run_id: str):
 async def get_demo_artifacts(run_id: str):
     artifact_dir = demo_run_service.store.run_dir(run_id) / "artifacts"
     return {"artifacts": [str(path.relative_to(artifact_dir)) for path in artifact_dir.rglob("*") if path.is_file()]}
+
+
+@app.get("/demo/runs/{run_id}/runtime-tasks")
+async def get_demo_runtime_tasks(run_id: str):
+    items = []
+    for row in state_store.list_tasks_for_run(run_id):
+        data = json.loads(row["data"])
+        items.append(
+            {
+                "task_id": data.get("task_id"),
+                "root_task_id": data.get("root_task_id"),
+                "agent_name": data.get("agent_name"),
+                "status": data.get("status"),
+                "attempts": data.get("attempts") or [],
+            }
+        )
+    return {"tasks": items}
 
 
 @app.get("/demo/runs/{run_id}/replay")
@@ -1571,6 +1731,10 @@ async def _run_task_once(
             proc = agent_workers.get(agent_name)
             if proc is not None and proc.poll() is not None:
                 raise RuntimeError("agent worker crashed")
+            _record_trace_event(task, "worker.restart_for_connect_timeout", {"agent_name": agent_name})
+            _ensure_worker_started(agent_name)
+            ok = await message_router.wait_connected(agent_name, timeout_s=5.0)
+        if not ok:
             raise RuntimeError("agent worker not connected")
 
         if lease is not None:
@@ -1801,6 +1965,9 @@ async def _execute_task(task: TaskSpec) -> None:
         logger.info(f"调度：任务 {task.task_id} → Agent '{task.agent_name}'")
 
         ok, output_or_error = await _run_task_with_policy(task)
+        if task.status == TaskStatus.CANCELLED:
+            _persist_task(task)
+            return
         agent = agents.get(task.agent_name)
         if ok:
             task.transition_to(TaskStatus.SUCCESS, "task.success")
@@ -1829,6 +1996,9 @@ async def _execute_task(task: TaskSpec) -> None:
             if workflow_service is not None:
                 workflow_service.handle_task_failure(task)
     except Exception as e:
+        if task.status == TaskStatus.CANCELLED:
+            _persist_task(task)
+            return
         task.transition_to(TaskStatus.FAILED, "task.exception")
         task.error = str(e)
         agent = agents.get(task.agent_name)

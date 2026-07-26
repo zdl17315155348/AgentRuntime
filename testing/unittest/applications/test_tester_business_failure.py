@@ -93,3 +93,27 @@ async def test_tester_node_submits_run_pytest_tool_payload():
     assert provider.request.task_input["__tool"]["arguments"]["paths"] == ["tests"]
     assert provider.request.base_commit == "deadbeef"
     assert update["test_summary"]["returncode"] == 0
+
+
+@pytest.mark.anyio
+async def test_tester_node_converts_runtime_timeout_to_test_failure():
+    class _Provider:
+        mode = "runtime"
+
+        async def execute(self, request):
+            raise TimeoutError("task task_tester did not finish within 330s")
+
+    state = {
+        "run_id": "run",
+        "thread_id": "thread",
+        "source_repo": "/repo",
+        "base_commit": "base",
+        "integrated_commit": "deadbeef",
+    }
+    config = IncidentRunConfig(execution_mode=ExecutionMode.RUNTIME, run_id="run", thread_id="thread", source_repo="/repo", base_commit="base")
+    context = GraphRuntimeContext(provider=_Provider(), run_config=config, event_bus=None)
+
+    update = await run_tester_node(state, context)
+
+    assert update["test_summary"]["returncode"] == 1
+    assert update["test_summary"]["failed_tests"][0]["name"] == "runtime_tester_timeout"

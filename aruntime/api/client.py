@@ -7,7 +7,7 @@ from typing import Optional
 class AgentRuntimeClient:
     def __init__(self, base_url: str = "http://127.0.0.1:8234"):
         self.base_url = base_url
-        self.client = httpx.Client(timeout=30)
+        self.client = httpx.Client(timeout=httpx.Timeout(30.0, read=None))
 
     def create_agent(
         self,

@@ -71,6 +71,8 @@ class LLMGateway:
 
     def _call_deepseek(self, system_prompt: str, user_message: str, started: float, prefix_cache_hit: bool) -> LLMResult:
         """调用 DeepSeek API"""
+        if not self.api_key.strip():
+            raise RuntimeError("LLM_API_KEY 或 DEEPSEEK_API_KEY 未设置，无法调用 DeepSeek")
         url = "https://api.deepseek.com/v1/chat/completions"
         headers = {
             "Authorization": f"Bearer {self.api_key}",
@@ -109,6 +111,8 @@ class LLMGateway:
         except httpx.HTTPStatusError as e:
             raise RuntimeError(f"LLM API 返回错误: {e.response.status_code}, {e.response.text}")
         except Exception as e:
+            if isinstance(e, RuntimeError):
+                raise
             raise RuntimeError(f"LLM 调用失败: {str(e)}")
 
     def _result(self, output: str, system_prompt: str, user_message: str, started: float, prefix_cache_hit: bool) -> LLMResult:

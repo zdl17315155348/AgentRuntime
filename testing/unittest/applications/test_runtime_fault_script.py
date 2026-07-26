@@ -105,6 +105,24 @@ def test_store_lists_tasks_by_root_task_id(tmp_path, monkeypatch):
         store.close()
 
 
+def test_store_deletes_tasks_by_root_task_id(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENTD_STATE_DB", str(tmp_path / "state.db"))
+    store = SQLiteStateStore()
+    try:
+        run_task = TaskSpec(agent_name="coder_a", task_input={}, root_task_id="run-1", status=TaskStatus.READY)
+        other_task = TaskSpec(agent_name="coder_a", task_input={}, root_task_id="run-2", status=TaskStatus.READY)
+        store.save_task(run_task)
+        store.save_task(other_task)
+
+        deleted = store.delete_tasks_for_run("run-1")
+
+        assert deleted == 1
+        assert store.list_tasks_for_run("run-1") == []
+        assert [row["task_id"] for row in store.list_tasks_for_run("run-2")] == [other_task.task_id]
+    finally:
+        store.close()
+
+
 def test_task_backend_pid_detects_running_coder_a():
     assert _task_backend_pid(
         {

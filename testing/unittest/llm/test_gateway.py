@@ -1,4 +1,5 @@
 from aruntime.llm.gateway import LLMGateway
+import pytest
 
 
 def test_mock_gateway_returns_token_usage_and_latency():
@@ -34,3 +35,12 @@ def test_deepseek_gateway_uses_configured_model(monkeypatch):
     gateway.chat_with_stats("system", "hello")
 
     assert captured["json"]["model"] == "deepseek-v4-flash"
+
+
+def test_deepseek_gateway_rejects_empty_api_key(monkeypatch):
+    monkeypatch.delenv("LLM_API_KEY", raising=False)
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    gateway = LLMGateway(backend="deepseek", api_key="", model="deepseek-v4-flash")
+
+    with pytest.raises(RuntimeError, match="LLM_API_KEY 或 DEEPSEEK_API_KEY 未设置"):
+        gateway.chat_with_stats("system", "hello")
